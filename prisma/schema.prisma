@@ -1,0 +1,6 @@
+// Cashping Prisma schema.
+//
+// Intentionally a placeholder at Step 2: the datasource, generator and the
+// first models (User, OtpVerification) are written in Step 5 (Prisma setup)
+// via `npx prisma init`, then extended per feature so migrations stay tied to
+// the module that needs them.

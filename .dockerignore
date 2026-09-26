@@ -1,0 +1,17 @@
+# Keep the build context small: never ship dependencies, git history or secrets.
+
+node_modules
+.git
+.env
+
+# Build artifacts & local noise (rebuilt inside the image)
+dist
+coverage
+*.log
+.DS_Store
+
+# TypeScript incremental-build state. Never ship this: `tsconfig.json` sets
+# "incremental": true and `nest-cli.json` sets deleteOutDir, so a stale
+# tsbuildinfo copied from the host can make `nest build` skip emitting while
+# dist/ has just been deleted — producing an empty dist and a broken image.
+*.tsbuildinfo
