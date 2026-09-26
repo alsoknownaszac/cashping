@@ -6,12 +6,13 @@ import { AppService } from './app.service.js';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 import configuration from './config/configuration.js';
 import { validate } from './config/validation.schema.js';
+import { HealthModule } from './health/health.module.js';
 import { IdentityModule } from './identity/identity.module.js';
 import { WalletModule } from './wallet/wallet.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
 import { NotificationsModule } from './notifications/notifications.module.js';
 import { LedgerModule } from './ledger/ledger.module.js';
-import { PrismaService } from './prisma/prisma.service.js';
+import { PrismaModule } from './prisma/prisma.module.js';
 
 @Module({
   imports: [
@@ -23,6 +24,12 @@ import { PrismaService } from './prisma/prisma.service.js';
       load: [configuration],
       validate,
     }),
+    // Liveness endpoint the frontend can poll (side addition: frontend hand-off).
+    HealthModule,
+    // Step 7b: the Prisma client now has an owner. Imported here so `main.ts`
+    // can still reach it for the boot-time reachability check; feature modules
+    // import it themselves rather than receiving it through this module.
+    PrismaModule,
     IdentityModule,
     WalletModule,
     PaymentsModule,
@@ -32,17 +39,9 @@ import { PrismaService } from './prisma/prisma.service.js';
   controllers: [AppController],
   providers: [
     AppService,
-    // Step 5: the Prisma client. The Step 2 tree puts it in `src/prisma/` as a
-    // service only, so it is provided here; once the identity module starts
-    // injecting it (Day 1), it moves behind a module of its own rather than
-    // being reached across the graph.
-    PrismaService,
     // Step 6: one global filter - shapes every error response and reports
     // unexpected failures to Sentry.
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
   ],
 })
 export class AppModule {}
-
-
-

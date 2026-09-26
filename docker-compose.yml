@@ -11,6 +11,19 @@ services:
       # DATABASE_URL would point at localhost, which is the container itself).
       DATABASE_URL: postgresql://cashping:cashping@postgres:5432/cashping?schema=public
       REDIS_URL: redis://redis:6379
+      # Optional in the Step 4 env schema, so it needs a fallback here: compose
+      # only forwards the variables named in this file, and without this line a
+      # value set in ./.env would never reach the container. The fallback matches
+      # the default built into the code.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      # Optional in the Step 4 env schema, so it needs a line here for the same
+      # reason as CORS_ALLOWED_ORIGINS: compose only forwards the variables named
+      # in this file, so a value set in ./.env would otherwise never reach the
+      # container. The fallback is `false` (rather than the code's `true`)
+      # because this service runs with NODE_ENV=production - the Swagger UI is
+      # off unless a value is supplied explicitly. Set ENABLE_SWAGGER=true in
+      # ./.env when the docs are wanted in the stack.
+      ENABLE_SWAGGER: ${ENABLE_SWAGGER:-false}
       # Everything below is required by the Step 4 env schema. Values fall back
       # to placeholders so `docker compose up` works on a fresh clone with no
       # .env; Compose picks the real values up from ./.env when it exists.
@@ -32,7 +45,10 @@ services:
     healthcheck:
       # busybox wget ships with node:24-alpine, so no extra tooling is needed.
       # This catches a container that is up but not actually serving.
-      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:3000/']
+      # The path carries the /v1 route prefix (`app.setGlobalPrefix` in main.ts) -
+      # without it this polls a route that does not exist and the container is
+      # reported unhealthy while answering perfectly.
+      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:3000/v1']
       interval: 10s
       timeout: 5s
       retries: 5

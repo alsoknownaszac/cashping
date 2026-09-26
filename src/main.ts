@@ -1,10 +1,13 @@
 import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import * as Sentry from '@sentry/nestjs';
-import { nodeProfilingIntegration } from '@sentry/profiling-node';
 import { Redis } from 'ioredis';
 import { AppModule } from './app.module.js';
-import configuration from './config/configuration.js';
+import { configureCors } from './common/http/cors.js';
+import { GLOBAL_PREFIX } from './common/http/prefix.js';
+import { createValidationPipe } from './common/pipes/validation.pipe.js';
+import { SWAGGER_PATH, setupSwagger } from './common/http/swagger.js';
+import configuration, { type AppConfig } from './config/configuration.js';
 import { NodeEnvironment } from './config/validation.schema.js';
 import { PrismaService } from './prisma/prisma.service.js';
 
@@ -15,8 +18,6 @@ const logger = new Logger('Bootstrap');
  * cannot stall startup.
  */
 const CONNECT_TIMEOUT_MS = 5_000;
-
-type AppConfig = ReturnType<typeof configuration>;
 
 /**
  * Loads `.env` before anything reads `process.env`.
@@ -54,12 +55,11 @@ function initializeSentry(config: AppConfig): void {
     dsn: config.sentry.dsn,
     environment: config.sentry.environment,
     tracesSampleRate: isProduction ? 0.1 : 1,
-    // Profiling in Sentry v11 is a session, sampled once at SDK initialisation,
-    // and `'trace'` is what starts it alongside a root span - so the profile
-    // sample rate follows the trace sample rate rather than diverging from it.
-    profileSessionSampleRate: isProduction ? 0.1 : 1,
-    profileLifecycle: 'trace',
-    integrations: [nodeProfilingIntegration()],
+    // Error and trace reporting only - no profiling. The Sentry v11 profiling
+    // options (`profileSessionSampleRate`, `profileLifecycle`) do nothing without
+    // `nodeProfilingIntegration()`, and `@sentry/profiling-node` is no longer a
+    // dependency, so there is deliberately nothing profile-related to configure
+    // here. Re-adding the integration is what would bring the options back.
   });
 
   logger.log(`Sentry initialised (environment: ${config.sentry.environment})`);
@@ -80,9 +80,13 @@ async function verifyPostgres(prisma: PrismaService): Promise<void> {
       prisma.user.findFirst({ select: { id: true } }),
       prisma.otpVerification.findFirst({ select: { id: true } }),
     ]);
-    logger.log('Postgres reachable via Prisma (queried users, otp_verifications)');
+    logger.log(
+      'Postgres reachable via Prisma (queried users, otp_verifications)',
+    );
   } catch (error) {
-    logger.error(`Postgres unreachable via Prisma - ${(error as Error).message}`);
+    logger.error(
+      `Postgres unreachable via Prisma - ${(error as Error).message}`,
+    );
   }
 }
 
@@ -131,7 +135,10 @@ async function verifyRedis(url: string): Promise<void> {
  * container into a restart loop (Step 3). The compose healthcheck is what marks
  * the container unhealthy.
  */
-async function verifyDependencies(app: INestApplication, config: AppConfig): Promise<void> {
+async function verifyDependencies(
+  app: INestApplication,
+  config: AppConfig,
+): Promise<void> {
   await verifyPostgres(app.get(PrismaService));
   await verifyRedis(config.redis.url);
 }
@@ -147,10 +154,36 @@ async function bootstrap(): Promise<void> {
   // process being cut off with connections still open.
   app.enableShutdownHooks();
 
+  // Every route is mounted under the version prefix. This has to run before
+  // `setupSwagger`, which publishes the prefixed paths (`/v1/health`) in the
+  // OpenAPI document. The docs keep their unprefixed URL, so the address handed
+  // to the frontend does not move when the API version does.
+  app.setGlobalPrefix(GLOBAL_PREFIX);
+
+  // Step 10: request bodies are validated from here on. Applied globally rather
+  // than per-route so a future endpoint cannot opt out of input validation by
+  // forgetting a decorator, and so the failure shape is one shape.
+  app.useGlobalPipes(createValidationPipe());
+
+  // Frontend hand-off: let the dev servers call the API from a browser (explicit
+  // origin list, never a wildcard - see `configureCors`) and serve the interactive
+  // docs unless they have been switched off. Both read the same validated config
+  // as everything else.
+  configureCors(app, config.cors.allowedOrigins);
+  const docsMounted = setupSwagger(app, config.swagger.enabled);
+
   await verifyDependencies(app, config);
 
   await app.listen(config.port);
-  logger.log(`API listening on http://localhost:${config.port}`);
+  logger.log(
+    `API listening on http://localhost:${config.port} (routes under /${GLOBAL_PREFIX})`,
+  );
+
+  if (docsMounted) {
+    logger.log(
+      `API docs (Swagger UI) at http://localhost:${config.port}/${SWAGGER_PATH}`,
+    );
+  }
 }
 
 await bootstrap();

@@ -28,18 +28,32 @@ datasource db {
 
 /// A Cashping end user.
 ///
-/// Registration is phone-first: the row is created in PENDING as soon as an OTP
-/// is issued, and the profile fields are filled in during onboarding, which is
-/// why `handle` and `displayName` are nullable. `handle` is the recipient
-/// identifier used for payments, so it is unique.
+/// Registration is phone-first: the row is created in PENDING_VERIFICATION as
+/// soon as an OTP is issued, and the profile fields are filled in during
+/// onboarding, which is why `handle` and `displayName` are nullable. `handle` is
+/// the recipient identifier used for payments, so it is unique.
+///
+/// `phoneNumber` holds strict E.164 only (normalized by
+/// `src/common/phone/phone-number.ts` before every read and write). Uniqueness
+/// is only meaningful if there is one spelling per number: `024 123 4567`,
+/// `+233241234567` and `2330241234567` all reach the column as `+233241234567`,
+/// which is why normalization happens before the lookup rather than after.
+///
+/// `phoneVerifiedAt` is the timestamp Day 2 keys off - Stellar account
+/// provisioning triggers on it - so it is set in the same write that flips the
+/// status to ACTIVE, and never cleared.
 model User {
-  id          String     @id @default(uuid()) @db.Uuid
-  phoneNumber String     @unique @map("phone_number")
-  handle      String?    @unique
-  displayName String?    @map("display_name")
-  status      UserStatus @default(PENDING)
-  createdAt   DateTime   @default(now()) @map("created_at")
-  updatedAt   DateTime   @updatedAt @map("updated_at")
+  id              String     @id @default(uuid()) @db.Uuid
+  phoneNumber     String     @unique @map("phone_number")
+  phoneVerifiedAt DateTime?  @map("phone_verified_at")
+  handle          String?    @unique
+  displayName     String?    @map("display_name")
+  /// Nullable: MVP registration is OTP-only, so a user has no password until
+  /// (and unless) password login is added. A non-null value is always a hash.
+  passwordHash    String?    @map("password_hash")
+  status          UserStatus @default(PENDING_VERIFICATION)
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
 
   otpVerifications OtpVerification[]
 
@@ -69,10 +83,18 @@ model OtpVerification {
   @@map("otp_verifications")
 }
 
-/// Account lifecycle. SUSPENDED exists from the start because freezing an
+/// Account lifecycle.
+///
+/// `PENDING_VERIFICATION` is the state registration creates: the row exists and
+/// an OTP has been issued, but the phone number is unproven. Verification moves
+/// it to ACTIVE (Step 14). SUSPENDED exists from the start because freezing an
 /// account is a compliance action, not something to bolt on later.
+///
+/// The default is deliberately PENDING_VERIFICATION rather than ACTIVE: a user
+/// created by any path that forgets to prove the number is created locked, which
+/// fails closed.
 enum UserStatus {
-  PENDING
+  PENDING_VERIFICATION
   ACTIVE
   SUSPENDED
 }

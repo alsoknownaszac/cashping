@@ -123,6 +123,38 @@ describe('environment validation', () => {
     expect(() => validate({ ...VALID_ENV, PORT: 'not-a-port' })).toThrowError(/PORT/);
   });
 
+  // --- Interactive docs (Swagger UI) ---------------------------------------
+
+  it('defaults ENABLE_SWAGGER to true when unset', () => {
+    const withoutFlag = { ...VALID_ENV };
+    delete withoutFlag['ENABLE_SWAGGER'];
+
+    expect(validate(withoutFlag).ENABLE_SWAGGER).toBe(true);
+  });
+
+  // `process.env` only holds strings, so both literals have to survive the
+  // journey as booleans - `Boolean('false')` is `true`, which would silently
+  // leave the docs published in production.
+  const BOOLEAN_LITERALS: ReadonlyArray<readonly [string, boolean]> = [
+    ['true', true],
+    ['false', false],
+    [' FALSE ', false],
+  ];
+
+  for (const [value, expected] of BOOLEAN_LITERALS) {
+    it(`coerces ENABLE_SWAGGER=${JSON.stringify(value)} to ${expected}`, () => {
+      expect(validate({ ...VALID_ENV, ENABLE_SWAGGER: value }).ENABLE_SWAGGER).toBe(expected);
+    });
+  }
+
+  for (const value of ['yes', '1', 'flase', '']) {
+    it(`rejects ENABLE_SWAGGER=${JSON.stringify(value)}, naming the variable`, () => {
+      expect(() => validate({ ...VALID_ENV, ENABLE_SWAGGER: value })).toThrowError(
+        /ENABLE_SWAGGER/,
+      );
+    });
+  }
+
   it('rejects an unknown STELLAR_NETWORK', () => {
     expect(() => validate({ ...VALID_ENV, STELLAR_NETWORK: 'MAINNET' })).toThrowError(
       /STELLAR_NETWORK/,
@@ -134,4 +166,63 @@ describe('environment validation', () => {
       /DATABASE_URL/,
     );
   });
+
+  // --- Phone numbers -------------------------------------------------------
+
+  // `PHONE_DEFAULT_REGION` is what makes a national-format number like
+  // `024 123 4567` parseable, so a value libphonenumber has no metadata for is a
+  // boot-time failure rather than a surprise at the registration endpoint.
+  it('accepts a supported PHONE_DEFAULT_REGION, in any case', () => {
+    expect(validate({ ...VALID_ENV, PHONE_DEFAULT_REGION: 'gh' }).PHONE_DEFAULT_REGION).toBe(
+      'gh',
+    );
+  });
+
+  it('leaves PHONE_DEFAULT_REGION undefined when unset, so the factory default (GH) applies', () => {
+    expect(validate({ ...VALID_ENV }).PHONE_DEFAULT_REGION).toBeUndefined();
+  });
+
+  // The shape of a country code is not the test: `XX` is two letters and would
+  // pass a regex, then hand the parser a region it has nothing for.
+  for (const value of ['XX', 'ZZ', 'Ghana', 'G', '1', '']) {
+    it(`rejects PHONE_DEFAULT_REGION=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, PHONE_DEFAULT_REGION: value })).toThrowError(
+        /PHONE_DEFAULT_REGION/,
+      );
+    });
+  }
+
+  // --- CORS ----------------------------------------------------------------
+
+  it('accepts a comma-separated CORS_ALLOWED_ORIGINS list', () => {
+    const origins = 'http://localhost:3000, https://app.cashping.co';
+    const result = validate({ ...VALID_ENV, CORS_ALLOWED_ORIGINS: origins });
+
+    expect(result.CORS_ALLOWED_ORIGINS).toBe(origins);
+  });
+
+  it('leaves CORS_ALLOWED_ORIGINS undefined when unset, so the factory default applies', () => {
+    expect(validate({ ...VALID_ENV }).CORS_ALLOWED_ORIGINS).toBeUndefined();
+  });
+
+  // The CORS middleware compares these entries literally against the `Origin`
+  // header a browser sends, so a value a browser never sends has to fail at boot
+  // rather than turn into an opaque CORS error in the frontend's console.
+  const INVALID_CORS_VALUES: ReadonlyArray<readonly [string, string]> = [
+    ['a trailing slash', 'http://localhost:5173/'],
+    ['a missing scheme', 'localhost:5173'],
+    ['a path', 'http://localhost:5173/app'],
+    ['a wildcard', '*'],
+    ['a wildcard host', 'https://*.cashping.co'],
+    ['an empty value', ''],
+    ['an empty entry', 'http://localhost:3000,'],
+  ];
+
+  for (const [description, value] of INVALID_CORS_VALUES) {
+    it(`rejects CORS_ALLOWED_ORIGINS with ${description}`, () => {
+      expect(() => validate({ ...VALID_ENV, CORS_ALLOWED_ORIGINS: value })).toThrowError(
+        /CORS_ALLOWED_ORIGINS must be a comma-separated list of origins/,
+      );
+    });
+  }
 });

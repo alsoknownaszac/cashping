@@ -57,6 +57,128 @@ $ npm run test:e2e
 $ npm run test:cov
 ```
 
+## API docs and CORS
+
+Every route is mounted under a version prefix - `/v1`, set with `app.setGlobalPrefix` in
+`main.ts` (`src/common/http/prefix.ts` holds the single definition) - so a breaking change
+can later ship as `/v2` while `/v1` keeps answering the clients already in the field. The
+docs are served *outside* that prefix, so the address handed to the frontend does not move
+when the API version does:
+
+```bash
+http://localhost:<PORT>/api/docs       # Swagger UI: every endpoint, with "Try it out"
+http://localhost:<PORT>/api/docs-json  # the OpenAPI 3 document itself (client generation)
+http://localhost:<PORT>/v1/health      # liveness - I/O-free, so a poller can hit it often
+```
+
+`<PORT>` is `PORT` from `.env` (3000 by default). The documented paths carry the prefix
+(`/v1/health`), so "Try it out" from `/api/docs` calls the URL a client really has to call.
+The document is generated from the controllers registered on the app, so a new controller
+appears there without editing the setup; `test/api-docs.e2e-spec.ts` fails if one is
+missing.
+
+### Switching the docs off (they are off in production)
+
+`ENABLE_SWAGGER` (default `true`) gates the UI *and* the document: with
+`ENABLE_SWAGGER=false` neither `/api/docs` nor `/api/docs-json` is mounted (both 404) while
+every API route keeps working. Production sets it to `false` - the API surface is not a
+secret from the team, but publishing every endpoint plus a live "Try it out" console on a
+public host is an invitation nobody needs. `docker-compose.yml` falls back to `false` for
+the same reason (that service runs with `NODE_ENV=production`); set `ENABLE_SWAGGER=true`
+in `.env` to keep the docs in the stack. A value that is not `true`/`false` fails startup
+with the variable named, rather than quietly leaving the docs in the wrong state.
+
+### How the documented shapes are produced
+
+Every field comes from the decorators on the controller or DTO, which has two
+consequences worth knowing before adding an endpoint:
+
+- **`@ApiProperty()` is required on every DTO field.** No Swagger CLI plugin is
+  configured in `nest-cli.json`, so an undecorated field is published as an empty
+  object - worse than no docs, because the shape looks real and says nothing.
+  `src/common/http/swagger.spec.ts` fails the suite if any DTO in the document has no
+  fields at all.
+- **class-validator constraints are not reflected.** `@nestjs/swagger` v12 maps
+  `@IsEmail()`/`@MaxLength()`/`@Min()` onto `format`/`maxLength`/`minimum` only through
+  its compile-time plugin, which this project does not enable (it also would not run
+  under vitest, so tests and `dist` would disagree about the same DTO). Describe the
+  constraint explicitly instead: `@ApiProperty({ description: '…', maxLength: 40 })`.
+
+Failures are documented once, in `ErrorResponseDto`: the global exception filter answers
+every endpoint with that shape, so a client renders errors from one definition.
+
+### CORS
+
+`CORS_ALLOWED_ORIGINS` is the comma-separated list of origins allowed to call the API
+from a browser. It defaults to the two local dev servers (`http://localhost:3000`,
+`http://localhost:5173`) and is validated at boot: a value a browser would never send - a
+wildcard, a bare host, a trailing slash or a path - fails startup instead of turning into
+an opaque CORS error in the frontend's console. There is no wildcard mode.
+
+An origin that is not on the list is not rejected: the request is answered normally,
+without the `Access-Control-Allow-Origin` header, and the browser then refuses to hand
+the response to the calling script. CORS is a browser-side control, not authorisation -
+it is no substitute for auth on an endpoint. A request with no `Origin` header at all
+(curl, the container healthcheck, server-to-server) is not a CORS request and is passed
+through untouched.
+
+## Registration and phone verification (Day 1)
+
+The identity flow is two calls. Both take the number in whatever form the user typed it,
+normalize it to strict E.164 before it reaches a query or a write, and are documented in
+`/api/docs` (`src/identity/auth.controller.ts`, `src/identity/dto/`).
+
+```bash
+POST /v1/auth/register      # { phoneNumber }            -> 201 { userId, phoneNumber, status, expiresAt, codeLength }
+POST /v1/auth/otp/verify    # { phoneNumber, code }       -> 200 { userId, phoneNumber, status, phoneVerifiedAt }
+```
+
+| Situation | Answer |
+| --- | --- |
+| Number is already `ACTIVE` | `409` - verify with a code, or use another number |
+| Number is `SUSPENDED` | `403` |
+| Number is `PENDING_VERIFICATION` | `201` - the row is reused, the previous code is invalidated (this is the resend path) |
+| No user for the number (verify) | `404` |
+| Wrong code | `400`, with the attempts left in the message |
+| Expired code | `400` - the code is consumed, so it cannot be retried |
+| Attempts used up | `429` - request a new code |
+| Over the send allowance | `429` - "try again in N minutes", from the counter's own TTL |
+| SMS provider or Redis unavailable | `503` - nothing was sent |
+
+The policy lives in `src/config/configuration.ts` as constants rather than environment
+variables, because these are product rules rather than per-environment settings: a
+6-digit code (`OTP_CODE_LENGTH`), valid for 10 minutes (`OTP_TTL_MINUTES`), 5 wrong
+guesses (`OTP_MAX_ATTEMPTS`), and 3 sends per number per 15 minutes
+(`OTP_REQUESTS_PER_WINDOW` / `OTP_REQUEST_WINDOW_MINUTES`). Every one of them is
+asserted by a test.
+
+Where the pieces live, and why:
+
+- **`src/common/phone/phone-number.ts`** - normalization (`normalizePhoneNumber`) and
+  `maskPhoneNumber`, the only form of a number allowed in a log line. `PHONE_DEFAULT_REGION`
+  (default `GH`) is validated against libphonenumber's own metadata at boot, so a region
+  the parser knows nothing about fails startup instead of every registration.
+- **`src/identity/otp/otp-crypto.ts`** - code generation (CSPRNG), scrypt hashing
+  (`scrypt$N$r$p$salt$hash`) and the constant-time comparison. The plaintext code is
+  never stored and never logged; it exists only in the SMS.
+- **`src/identity/otp/otp.service.ts`** - issuing (`issue`) and checking (`check`) codes.
+  At most one live code per user: a resend spends the previous one inside the same
+  transaction as the insert. Verification consumes the code in the same transaction that
+  activates the user, so a crash cannot leave an active account whose code still works.
+- **`src/identity/otp/otp-rate-limiter.service.ts`** - the per-number send cap, in Redis
+  under `otp:requests:<sha256(phoneNumber)>` (hashed, so a `KEYS` dump does not print
+  customers' numbers). It **fails closed**: if Redis cannot answer, no SMS is sent.
+- **`src/notifications/notifications.service.ts`** - the message itself. The provider sits
+  behind the `SMS_SENDER` token (`src/notifications/sms/`), which is the one line to change
+  to swap Africa's Talking for something else, and the seam tests replace.
+
+`test/auth.e2e-spec.ts` runs the whole flow over HTTP against the real database and Redis
+(register, read the code from a captured message, verify, then the wrong-code, lockout,
+expiry and rate-limit paths). It needs the compose stack - `docker compose up -d postgres
+redis` - and a `.env`, so it is deliberately not part of the CI job, which has no database
+service. It registers random numbers and deletes them again in `afterAll`, so repeated runs
+are safe.
+
 ## Deployment
 
 When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
