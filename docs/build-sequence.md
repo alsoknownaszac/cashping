@@ -178,15 +178,19 @@ Done when: a newly registered, phone-verified user automatically has a funded St
 - [ ] **Step 16:** access tokens genuinely expire at 15 minutes (not just configured to — verify with a token issued in the past or a clock-shifted test); refresh tokens are stored hashed, not plaintext, in the database; a revoked refresh token is actually rejected on reuse.
 
 <!-- ============================================================
-     ⚠️  TRANSCRIPTION TRUNCATED HERE — the paste that supplied Day 2
-     ended mid-item, at "**Step 17:** two rapid, concurrent
-     transaction-build". That half-sentence is not reproduced as a
-     checklist item (it would render as a broken one), and the Step
-     18, 19 and 20 items never arrived at all. They are deliberately
-     left out rather than reconstructed or guessed at. Step 17's
-     specification above is complete and verbatim; only this
-     checklist tail is outstanding — re-paste it to close the gap.
+     ⚠️  ONE ITEM STILL INCOMPLETE — the step 18, 19 and 20 items
+     arrived in a later paste and are below, verbatim. The step 17
+     item did not: it came through as "**Step 17:** two rapid,
+     concurrent transaction-build" and stopped there. It is left out
+     of the list rather than guessed at, so this checklist reads 15,
+     16, 18, 19, 20 until that item is re-pasted.
      ============================================================ -->
+
+- [ ] **Step 18 (highest scrutiny of the whole build):** inspect the actual database row for a provisioned account — the secret key must be unreadable without the KMS call; confirm no raw secret key ever appears in application logs (grep logs after a provisioning run); confirm the encrypted blob differs per account (not reusing one data key silently).
+- [ ] **Step 19:** a freshly registered and phone-verified user has, without further action, a Testnet account that is both funded (real XLM balance, not zero) and trustline-active for USDC — check both conditions independently, since "funded but no trustline" is a distinct failure mode from "trustline set but never funded."
+- [ ] **Step 20:** balance endpoint reflects the real Horizon-reported USDC balance, not a cached/stale/default value — verify by comparing directly against a Horizon query for the same account.
+
+**If anything fails:** Step 18 failing is a stop-everything issue, not a fix-later one — do not proceed to Day 3 with any doubt about key material safety, even against Testnet.
 
 <!-- ============================================================
      STILL MISSING — Days 3 through 5 (Steps 21–34). Day 2 (Steps
