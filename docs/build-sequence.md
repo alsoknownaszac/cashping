@@ -148,16 +148,53 @@ Done when: a full register → receive OTP (check Africa's Talking sandbox/logs)
 
 **If anything fails:** fix it before proceeding to Day 2 — Day 2's Stellar account provisioning triggers directly off `phoneVerifiedAt`, so a broken verification flow blocks everything downstream.
 
+## Day 2 — Identity Finish & Stellar Wallet Provisioning
+
+**Step 15 — @handle creation with validation**
+Add `handle` uniqueness (case-insensitive) to the schema/query. Basic validation rules: allowed characters (alphanumeric + underscore), length bounds (e.g. 3–20 chars), and a small reserved-word blocklist (`admin`, `support`, `cashping`, and obvious variants) — cheap now, expensive to retrofit once real users have already claimed impersonation-adjacent handles.
+
+**Step 16 — Auth module: JWT issuance & refresh**
+`@nestjs/jwt` + `@nestjs/passport` — short-lived access token (15 min), longer-lived refresh token stored (hashed) server-side so it can be revoked. `POST /v1/auth/login`, `POST /v1/auth/refresh`.
+
+**Step 17 — Stellar SDK wrapper service**
+Before touching account creation, build a thin `StellarService` wrapping `@stellar/stellar-sdk`: network config (Testnet Horizon URL, with a fallback URL slot even if unused yet), keypair generation, and a serialized-per-account transaction builder (a per-account mutex/queue, since concurrent transaction building for the same source account will fail on sequence-number conflicts).
+
+**Step 18 — Key encryption at rest**
+Wire up AWS KMS (or Vault) envelope encryption before generating a single real key: encrypt each account's secret key with a per-account data key, encrypt the data key with the KMS master key. Store only the encrypted blob + KMS key reference in `StellarAccount.encryptedSecretKey`. This is the step where cutting corners under time pressure would be the most expensive mistake in the whole build — do not store a raw secret key even temporarily during development against Testnet.
+
+**Standing rule for this step and any future step like it:** before writing code, describe the intended approach and wait for explicit confirmation before implementing. This applies to Step 18 and to any later step involving key material, credentials, or an action that would be costly or irreversible if built wrong the first time — the build-then-audit pattern used everywhere else in this document is deliberately not used here; the review happens before the code exists, not just after.
+
+**Step 19 — Stellar account provisioning on registration completion**
+Triggered once `phoneVerifiedAt` is set: generate a Stellar keypair, encrypt and store it, fund the new account with XLM from a funded "treasury" account (Testnet friendbot for local dev, a real funded account for staging), and immediately establish the USDC trustline in the same provisioning flow — don't leave the account in a "funded but untrusted" limbo state.
+
+**Step 20 — `GET /v1/wallet/balance` and `GET /v1/wallet/account`**
+Query Horizon for the account's current balances, filtered to the USDC line.
+
+Done when: a newly registered, phone-verified user automatically has a funded Stellar Testnet account with an active USDC trustline, visible via the balance endpoint, with the encrypted key confirmed unreadable directly from the database.
+
+### Audit Checklist — Day 2 (Steps 15–20)
+
+- [ ] **Step 15:** handle uniqueness is case-insensitive (`@Miriam` and `@miriam` conflict); reserved words are actually rejected, not just documented; length/character bounds enforced and tested.
+- [ ] **Step 16:** access tokens genuinely expire at 15 minutes (not just configured to — verify with a token issued in the past or a clock-shifted test); refresh tokens are stored hashed, not plaintext, in the database; a revoked refresh token is actually rejected on reuse.
+
 <!-- ============================================================
-     ⚠️  PARTIAL DOCUMENT — ONE REGION STILL MISSING
-     Steps 4–7 and "Audit Checklist — Steps 4–7" were restored
-     above from a follow-up paste and are verbatim. Day 1 (Steps
-     7b–14, including "Audit Checklist — Day 1") was restored from
-     a later paste and is verbatim too. The original transmission
-     also dropped Days 2 through 5 (Steps 15–34); that region is
-     still absent. That is why the orphaned line
-     below ("when: every item in Section 5 …") has no opening —
-     it is the tail of a "Done when:" sentence from within the
+     ⚠️  TRANSCRIPTION TRUNCATED HERE — the paste that supplied Day 2
+     ended mid-item, at "**Step 17:** two rapid, concurrent
+     transaction-build". That half-sentence is not reproduced as a
+     checklist item (it would render as a broken one), and the Step
+     18, 19 and 20 items never arrived at all. They are deliberately
+     left out rather than reconstructed or guessed at. Step 17's
+     specification above is complete and verbatim; only this
+     checklist tail is outstanding — re-paste it to close the gap.
+     ============================================================ -->
+
+<!-- ============================================================
+     STILL MISSING — Days 3 through 5 (Steps 21–34). Day 2 (Steps
+     15–20, including the Step 18 standing rule and the "Audit
+     Checklist — Day 2" above) was restored from a later paste and is
+     verbatim. Days 3–5 are still absent, which is why the orphaned
+     line below ("when: every item in Section 5 …") has no opening —
+     it is the tail of a "Done when:" sentence from within that
      still-missing region, not a transcription error.
      ============================================================ -->
 
