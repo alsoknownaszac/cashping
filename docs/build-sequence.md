@@ -73,22 +73,45 @@ If anything fails: fix it before proceeding — do not carry a failed Step 1–3
 Step 4 — Environment configuration
 
 .env.example listing every required variable (DB URL, Redis URL, JWT secret, Africa's Talking API key, Sentry DSN, AWS credentials/KMS key ID, Stellar network config).
-@ne
+@nestjs/config wired with a validation schema — the app should refuse to boot if a required env var is missing, not fail mysteriously later.
+Done when: removing any required variable from .env causes a clear boot-time error, not a runtime crash three requests in.
+
+Step 5 — Prisma setup
+
+npm i prisma @prisma/client
+npx prisma init
+Write the initial schema (User, OtpVerification models only for now — the rest come as their modules are built, so migrations stay tied to the feature that needs them).
+
+Done when: npx prisma migrate dev runs clean against the Dockerized Postgres and generates a working client.
+
+Step 6 — Sentry wired in before any feature code
+
+npm i @sentry/nestjs @sentry/profiling-node
+Initialize in main.ts before the Nest app boots, with the DSN read from config. Add the global exception filter so unhandled errors are both returned to the client as a clean error shape and reported to Sentry.
+
+Done when: a deliberately-thrown test error in a throwaway endpoint shows up in the Sentry dashboard.
+
+Step 7 — Basic CI GitHub Actions workflow: install deps, run lint, run unit tests, build. No deploy step yet — that comes at the end once there's something worth deploying.
+
+Done when: a PR triggers the workflow and fails the build if lint or tests fail.
+
+Audit Checklist — Steps 4–7
+ Step 4: deliberately removing a required env var causes the app to fail at boot with a clear, specific error — not a silent default, not a runtime crash several requests in.
+ Step 5: npx prisma migrate dev runs clean against the Dockerized Postgres; the generated Prisma client can perform a trivial query against User/OtpVerification without error.
+ Step 6: a deliberately-thrown test error (in a throwaway endpoint, removed after verification) appears in the Sentry dashboard with a usable stack trace.
+ Step 7: a PR with a deliberately broken lint rule or failing test causes the GitHub Actions workflow to fail red — not silently pass.
+ The temporary TCP-probe health-check logic from Steps 1–3's audit (raw Postgres/Redis wire-protocol checks in main.ts) has been replaced with real Prisma-client and Redis-client based checks now that those clients exist — confirm no dual/inconsistent health-check paths remain in the codebase.
+If anything fails: fix it before proceeding to Day 1.
 
 <!-- ============================================================
-     ⚠️  TRUNCATION POINT — TEXT LOST IN TRANSMISSION
-     The source paste was cut here, mid-sentence, at "@ne" (i.e.
-     "@nestjs/config"). 12,031 characters are missing from this
-     point until the marker below, including:
-       - the remainder of Step 4 — Environment configuration
-       - Step 5 (Prisma setup) — ENTIRELY
-       - Step 6 (Sentry) — ENTIRELY
-       - Step 7 (Basic CI) — ENTIRELY
-       - "Audit Checklist — Steps 4–7" — ENTIRELY
-       - Day 1 through Day 5 (Steps 8–34) — ENTIRELY
-     Steps 4–7 CANNOT be implemented "exactly as written" or
-     audited until this region is supplied. The text on either
-     side of this marker is verbatim as received.
+     ⚠️  PARTIAL DOCUMENT — ONE REGION STILL MISSING
+     Steps 4–7 and "Audit Checklist — Steps 4–7" were restored
+     above from a follow-up paste and are verbatim. The original
+     transmission also dropped Day 1 through Day 5 (Steps 8–34);
+     that region is still absent. That is why the orphaned line
+     below ("when: every item in Section 5 …") has no opening —
+     it is the tail of a "Done when:" sentence from within the
+     still-missing region, not a transcription error.
      ============================================================ -->
 
 when: every item in Section 5 of the architecture plan has a concrete answer in the codebase, not just an intention.
