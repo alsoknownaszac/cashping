@@ -103,12 +103,59 @@ Audit Checklist — Steps 4–7
  The temporary TCP-probe health-check logic from Steps 1–3's audit (raw Postgres/Redis wire-protocol checks in main.ts) has been replaced with real Prisma-client and Redis-client based checks now that those clients exist — confirm no dual/inconsistent health-check paths remain in the codebase.
 If anything fails: fix it before proceeding to Day 1.
 
+Day 1 — Identity: Registration & OTP
+
+**Step 7b — PrismaModule refactor (prerequisite)**
+Move `PrismaService` out of `AppModule`'s provider list into its own `src/prisma/prisma.module.ts`, exported so any feature module can import it. This was a deliberate Step 5 shortcut — Identity, Wallet, and Payments modules all need database access starting this day, and a provider registered directly in `AppModule` doesn't scale cleanly across them.
+
+Done when: `PrismaService` is no longer listed as a provider in `app.module.ts`; `PrismaModule` is imported wherever it's needed instead; full test suite and build still pass unchanged.
+
+**Step 8 — User model finalized**
+Add the full `User` model to `schema.prisma`: `phoneNumber` (unique, will store normalized E.164 format only), `phoneVerifiedAt`, `handle`, `passwordHash` (nullable if OTP-only auth), `status` enum. Run the migration.
+
+**Step 9 — Phone number normalization utility (MVP-blocking item)**
+Before the registration endpoint exists, build the normalization function it depends on: accept any reasonable input format (`024...`, `+233024...`, `233024...`) and convert to strict E.164 before it ever touches the database or a lookup query. Use `libphonenumber-js` rather than hand-rolled regex — phone number formatting has more edge cases than it looks like. Unit test this in isolation with a table of input formats before wiring it into any endpoint.
+
+Done when: a test suite covering at least 5 input format variants all normalize to the same E.164 string.
+
+**Step 10 — `POST /v1/auth/register`**
+DTO validates a raw phone number input, passes it through the Step 9 normalizer, checks for an existing user, creates a `PENDING_VERIFICATION` user record, triggers OTP send.
+
+**Step 11 — Africa's Talking integration**
+Wrap Africa's Talking's SMS API in a `NotificationsService` method (`sendOtp(phoneNumber, code)`), isolated behind an interface so the provider can be swapped later without touching calling code.
+
+**Step 12 — OTP generation & storage**
+6-digit code, hashed (never stored plaintext) in `OtpVerification`, 5–10 minute expiry, attempt counter starting at 0.
+
+**Step 13 — OTP request rate limiting (folds in AIT/SMS-pumping protection at minimal cost)**
+Even a basic version now saves a rewrite later: cap OTP requests per phone number (e.g. 3 per 15 minutes) using `@nestjs/throttler` or a Redis counter. This is cheap to add at the same time as the endpoint itself and expensive to bolt on after the fact.
+
+**Step 14 — `POST /v1/auth/otp/verify`**
+Validates code against stored hash, checks expiry and attempt count, marks `phoneVerifiedAt`, increments attempts on failure, invalidates the OTP row on success.
+
+Done when: a full register → receive OTP (check Africa's Talking sandbox/logs) → verify flow works end to end against the Dockerized local environment, including the rate-limit and expiry paths tested with deliberately wrong/expired codes.
+
+### Audit Checklist — Day 1 (Steps 7b–14)
+
+- [ ] **Step 7b:** `app.module.ts` no longer lists `PrismaService` as a provider; `PrismaModule` is properly exported/imported; existing suite still passes unchanged.
+- [ ] **Step 8:** `User` model migration applied cleanly; a query against it via Prisma succeeds.
+- [ ] **Step 9:** the normalization utility, tested in isolation, correctly converts at least 5 distinct input formats to the same E.164 output — verify with a real test run, not a read-through of the code.
+- [ ] **Step 10:** registering with a valid phone number creates a `PENDING_VERIFICATION` user with a normalized (E.164) stored number, regardless of what format was submitted.
+- [ ] **Step 11:** an actual OTP SMS is observably sent (Africa's Talking sandbox log or equivalent), not just a mocked call in a unit test.
+- [ ] **Step 12:** the stored OTP is hashed, not plaintext — confirm by inspecting the actual database row.
+- [ ] **Step 13:** exceeding the OTP request rate limit for a single phone number is actually blocked — verified by making the requests, not by reading the rate-limit config.
+- [ ] **Step 14:** full register → verify flow works end to end; a wrong code, an expired code, and an exceeded-attempts scenario all fail correctly with clear responses rather than silently succeeding or crashing.
+
+**If anything fails:** fix it before proceeding to Day 2 — Day 2's Stellar account provisioning triggers directly off `phoneVerifiedAt`, so a broken verification flow blocks everything downstream.
+
 <!-- ============================================================
      ⚠️  PARTIAL DOCUMENT — ONE REGION STILL MISSING
      Steps 4–7 and "Audit Checklist — Steps 4–7" were restored
-     above from a follow-up paste and are verbatim. The original
-     transmission also dropped Day 1 through Day 5 (Steps 8–34);
-     that region is still absent. That is why the orphaned line
+     above from a follow-up paste and are verbatim. Day 1 (Steps
+     7b–14, including "Audit Checklist — Day 1") was restored from
+     a later paste and is verbatim too. The original transmission
+     also dropped Days 2 through 5 (Steps 15–34); that region is
+     still absent. That is why the orphaned line
      below ("when: every item in Section 5 …") has no opening —
      it is the tail of a "Done when:" sentence from within the
      still-missing region, not a transcription error.
