@@ -62,8 +62,7 @@ export class AfricasTalkingSmsSender implements SmsSender {
 
     const payload = await this.readPayload(response, message.to);
     const data = payload?.['SMSMessageData'] as
-      | { Message?: string; Recipients?: Array<Record<string, unknown>> }
-      | undefined;
+      { Message?: string; Recipients?: Array<Record<string, unknown>> } | undefined;
 
     if (!response.ok) {
       throw new SmsDeliveryError(
@@ -92,8 +91,7 @@ export class AfricasTalkingSmsSender implements SmsSender {
     to: string,
   ): { status?: string; statusCode?: number; messageId?: string } | undefined {
     const recipient = data?.Recipients?.[0] as
-      | { status?: string; statusCode?: number; messageId?: string }
-      | undefined;
+      { status?: string; statusCode?: number; messageId?: string } | undefined;
 
     if (recipient?.status !== undefined && recipient.status !== 'Success') {
       throw new SmsDeliveryError(

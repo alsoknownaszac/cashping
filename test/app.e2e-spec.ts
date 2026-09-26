@@ -21,10 +21,7 @@ describe('AppController (e2e)', () => {
   });
 
   it(`/${GLOBAL_PREFIX} (GET)`, () => {
-    return request(app.getHttpServer())
-      .get(`/${GLOBAL_PREFIX}`)
-      .expect(200)
-      .expect('Hello World!');
+    return request(app.getHttpServer()).get(`/${GLOBAL_PREFIX}`).expect(200).expect('Hello World!');
   });
 
   afterEach(async () => {

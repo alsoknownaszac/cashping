@@ -50,9 +50,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const request = context.getRequest();
 
     const statusCode =
-      exception instanceof HttpException
-        ? exception.getStatus()
-        : HttpStatus.INTERNAL_SERVER_ERROR;
+      exception instanceof HttpException ? exception.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
 
     const method = httpAdapter.getRequestMethod(request);
     const path = httpAdapter.getRequestUrl(request);
@@ -77,19 +75,12 @@ export class AllExceptionsFilter implements ExceptionFilter {
   /**
    * Maps an exception onto the response body, never exposing internals for a 5xx.
    */
-  private toErrorBody(
-    exception: unknown,
-    statusCode: number,
-    path: string,
-  ): ErrorResponseBody {
+  private toErrorBody(exception: unknown, statusCode: number, path: string): ErrorResponseBody {
     const timestamp = new Date().toISOString();
 
     // The second half of the condition is what narrows `exception` for TypeScript:
     // anything that is not an `HttpException` was floored to a 500 above.
-    if (
-      statusCode >= HttpStatus.INTERNAL_SERVER_ERROR ||
-      !(exception instanceof HttpException)
-    ) {
+    if (statusCode >= HttpStatus.INTERNAL_SERVER_ERROR || !(exception instanceof HttpException)) {
       return {
         statusCode,
         error: 'Internal Server Error',

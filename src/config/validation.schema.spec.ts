@@ -90,9 +90,7 @@ describe('environment validation', () => {
 
       // Exact phrasing matters: the operator must be told the variable is
       // missing, not that some unrelated constraint on it failed.
-      expect(() => validate(incomplete)).toThrowError(
-        new RegExp(`${key} should not be empty`),
-      );
+      expect(() => validate(incomplete)).toThrowError(new RegExp(`${key} should not be empty`));
     });
   }
 
@@ -112,9 +110,7 @@ describe('environment validation', () => {
     delete incomplete['DATABASE_URL'];
 
     const error = captureError(() => validate(incomplete));
-    const mentions = error.message
-      .split('\n')
-      .filter((line) => line.includes('DATABASE_URL'));
+    const mentions = error.message.split('\n').filter((line) => line.includes('DATABASE_URL'));
 
     expect(mentions).toHaveLength(1);
   });
@@ -173,9 +169,7 @@ describe('environment validation', () => {
   // `024 123 4567` parseable, so a value libphonenumber has no metadata for is a
   // boot-time failure rather than a surprise at the registration endpoint.
   it('accepts a supported PHONE_DEFAULT_REGION, in any case', () => {
-    expect(validate({ ...VALID_ENV, PHONE_DEFAULT_REGION: 'gh' }).PHONE_DEFAULT_REGION).toBe(
-      'gh',
-    );
+    expect(validate({ ...VALID_ENV, PHONE_DEFAULT_REGION: 'gh' }).PHONE_DEFAULT_REGION).toBe('gh');
   });
 
   it('leaves PHONE_DEFAULT_REGION undefined when unset, so the factory default (GH) applies', () => {

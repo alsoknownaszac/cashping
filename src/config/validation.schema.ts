@@ -251,9 +251,7 @@ function describe(error: ValidationError, parent?: string): string[] {
  * Renders validation failures as a multi-line, human-readable report.
  */
 export function formatValidationErrors(errors: ValidationError[]): string {
-  const lines = errors
-    .flatMap((error) => describe(error))
-    .map((message) => `  - ${message}`);
+  const lines = errors.flatMap((error) => describe(error)).map((message) => `  - ${message}`);
 
   return [
     'Invalid environment configuration - the API refused to start.',

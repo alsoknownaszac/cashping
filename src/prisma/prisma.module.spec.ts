@@ -81,9 +81,7 @@ describe('PrismaModule', () => {
       imports: [importConfig(), ConsumerModule],
     }).compile();
 
-    expect(moduleRef.get(ConsumerService).prisma).toBe(
-      moduleRef.get(PrismaService),
-    );
+    expect(moduleRef.get(ConsumerService).prisma).toBe(moduleRef.get(PrismaService));
   });
 
   it('is not global: injecting the client without importing it fails loudly', async () => {
@@ -91,8 +89,8 @@ describe('PrismaModule', () => {
     // refactor's point is that the module graph records who talks to the
     // database, so the missing import has to be an error - and one that names
     // the unresolved provider, not a runtime `undefined` on the first query.
-    await expect(
-      Test.createTestingModule({ imports: [UnwiredModule] }).compile(),
-    ).rejects.toThrow(/PrismaService/);
+    await expect(Test.createTestingModule({ imports: [UnwiredModule] }).compile()).rejects.toThrow(
+      /PrismaService/,
+    );
   });
 });

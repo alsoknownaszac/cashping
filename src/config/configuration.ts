@@ -86,8 +86,7 @@ export const OTP_REQUEST_WINDOW_MINUTES = 15;
  * with a 401 on the live host, so picking the wrong one is a hard failure at the
  * first registration, not a silent one.
  */
-export const AFRICASTALKING_SANDBOX_BASE_URL =
-  'https://api.sandbox.africastalking.com';
+export const AFRICASTALKING_SANDBOX_BASE_URL = 'https://api.sandbox.africastalking.com';
 export const AFRICASTALKING_LIVE_BASE_URL = 'https://api.africastalking.com';
 
 /**
@@ -156,9 +155,7 @@ export default function configuration() {
      * opaque CORS error at request time instead of at boot.
      */
     cors: {
-      allowedOrigins: (
-        process.env.CORS_ALLOWED_ORIGINS ?? DEFAULT_CORS_ALLOWED_ORIGINS.join(',')
-      )
+      allowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? DEFAULT_CORS_ALLOWED_ORIGINS.join(','))
         .split(',')
         .map((origin) => origin.trim())
         .filter((origin) => origin !== ''),
@@ -173,10 +170,7 @@ export default function configuration() {
      * it out" console is an invitation nobody needs on a public host.
      */
     swagger: {
-      enabled: readBooleanFlag(
-        process.env.ENABLE_SWAGGER,
-        DEFAULT_SWAGGER_ENABLED,
-      ),
+      enabled: readBooleanFlag(process.env.ENABLE_SWAGGER, DEFAULT_SWAGGER_ENABLED),
     },
 
     /** PostgreSQL connection string consumed by Prisma. */
@@ -205,9 +199,7 @@ export default function configuration() {
      * code the metadata does not contain.
      */
     phone: {
-      defaultRegion: (
-        process.env.PHONE_DEFAULT_REGION ?? DEFAULT_PHONE_REGION
-      )
+      defaultRegion: (process.env.PHONE_DEFAULT_REGION ?? DEFAULT_PHONE_REGION)
         .trim()
         .toUpperCase(),
     },
@@ -247,8 +239,7 @@ export default function configuration() {
     /** Error reporting. */
     sentry: {
       dsn: process.env.SENTRY_DSN as string,
-      environment:
-        process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV ?? 'development',
+      environment: process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV ?? 'development',
     },
 
     /** AWS credentials + KMS key used to wrap Stellar secret seeds. */
@@ -273,4 +264,3 @@ export default function configuration() {
  * drift.
  */
 export type AppConfig = ReturnType<typeof configuration>;
-

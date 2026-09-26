@@ -16,11 +16,7 @@ import { SMS_SENDER } from './sms/sms-sender.js';
  * (WhatsApp, email), it is added to the service and every caller keeps working.
  */
 @Module({
-  providers: [
-    NotificationsService,
-    { provide: SMS_SENDER, useClass: AfricasTalkingSmsSender },
-  ],
+  providers: [NotificationsService, { provide: SMS_SENDER, useClass: AfricasTalkingSmsSender }],
   exports: [NotificationsService],
 })
 export class NotificationsModule {}
-

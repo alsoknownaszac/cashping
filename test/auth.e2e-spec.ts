@@ -65,7 +65,9 @@ const smsSender = new CapturingSmsSender();
  * run, so a fixed number would make the second run fail for the wrong reason.
  */
 function uniqueLocalNumber(): string {
-  return `024${randomInt(0, 10 ** 7).toString().padStart(7, '0')}`;
+  return `024${randomInt(0, 10 ** 7)
+    .toString()
+    .padStart(7, '0')}`;
 }
 
 /**
@@ -249,7 +251,10 @@ describe('Registration and OTP verification (e2e)', () => {
     await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
     const code = latestCodeFor(e164);
 
-    await request(app.getHttpServer()).post(VERIFY_PATH).send({ phoneNumber: local, code }).expect(200);
+    await request(app.getHttpServer())
+      .post(VERIFY_PATH)
+      .send({ phoneNumber: local, code })
+      .expect(200);
 
     const response = await request(app.getHttpServer())
       .post(VERIFY_PATH)
@@ -352,7 +357,10 @@ describe('Registration and OTP verification (e2e)', () => {
 
     // Three sends are the allowance, and each one replaces the previous code.
     for (let send = 0; send < REQUESTS_PER_WINDOW; send += 1) {
-      await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+      await request(app.getHttpServer())
+        .post(REGISTER_PATH)
+        .send({ phoneNumber: local })
+        .expect(201);
     }
 
     expect(smsSender.for(e164)).toHaveLength(REQUESTS_PER_WINDOW);

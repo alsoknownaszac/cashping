@@ -1,10 +1,5 @@
 import { Logger, applyDecorators, type INestApplication } from '@nestjs/common';
-import {
-  ApiResponse,
-  DocumentBuilder,
-  SwaggerModule,
-  type OpenAPIObject,
-} from '@nestjs/swagger';
+import { ApiResponse, DocumentBuilder, SwaggerModule, type OpenAPIObject } from '@nestjs/swagger';
 import { ErrorResponseDto } from '../dto/error-response.dto.js';
 
 const logger = new Logger('Swagger');
@@ -105,16 +100,12 @@ export function ApiErrorResponses(
  */
 export function setupSwagger(app: INestApplication, enabled: boolean): boolean {
   if (!enabled) {
-    logger.warn(
-      `Swagger UI disabled (ENABLE_SWAGGER=false) - /${SWAGGER_PATH} is not mounted`,
-    );
+    logger.warn(`Swagger UI disabled (ENABLE_SWAGGER=false) - /${SWAGGER_PATH} is not mounted`);
     return false;
   }
 
   SwaggerModule.setup(SWAGGER_PATH, app, createOpenApiDocument(app));
-  logger.log(
-    `Swagger UI mounted at /${SWAGGER_PATH} (document: /${SWAGGER_PATH}-json)`,
-  );
+  logger.log(`Swagger UI mounted at /${SWAGGER_PATH} (document: /${SWAGGER_PATH}-json)`);
 
   return true;
 }

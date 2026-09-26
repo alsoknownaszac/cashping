@@ -72,9 +72,7 @@ class FakePrisma {
       }): Promise<FakeUser> => {
         this.calls.push('tx.activate');
 
-        const user = [...this.users.values()].find(
-          (candidate) => candidate.id === args.where.id,
-        );
+        const user = [...this.users.values()].find((candidate) => candidate.id === args.where.id);
 
         if (user === undefined) {
           throw new Error(`no user with id ${args.where.id}`);
@@ -429,7 +427,12 @@ describe('AuthService.verifyOtp', () => {
   const FAILED_CHECKS: ReadonlyArray<
     readonly [string, Extract<OtpCheckOutcome, { ok: false }>, number, RegExp]
   > = [
-    ['no live code', { ok: false, reason: 'not_found' }, 400, /No verification code is outstanding/],
+    [
+      'no live code',
+      { ok: false, reason: 'not_found' },
+      400,
+      /No verification code is outstanding/,
+    ],
     ['an expired code', { ok: false, reason: 'expired' }, 400, /expired/],
     [
       'an out-of-attempts code',

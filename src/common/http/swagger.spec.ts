@@ -51,7 +51,8 @@ function responseSchema(
   status: string,
   mediaType: string,
 ): unknown {
-  const response = operationFor(document, path, 'get').responses[status] as ResponseLike | undefined;
+  const response = operationFor(document, path, 'get').responses[status] as
+    ResponseLike | undefined;
 
   return response?.content?.[mediaType]?.schema;
 }
@@ -287,15 +288,11 @@ describe('setupSwagger', () => {
       // `SwaggerModule.setup(..., { useGlobalPrefix: true })` would mount the UI
       // at /v1/api/docs and break the URL the frontend was handed, so the option
       // is deliberately left off. This pins that decision.
-      await request(app.getHttpServer())
-        .get(`/${GLOBAL_PREFIX}/${SWAGGER_PATH}`)
-        .expect(404);
+      await request(app.getHttpServer()).get(`/${GLOBAL_PREFIX}/${SWAGGER_PATH}`).expect(404);
     });
 
     it(`serves the document at /${SWAGGER_PATH}-json, with the prefix inside every path`, async () => {
-      const response = await request(app.getHttpServer())
-        .get(`/${SWAGGER_PATH}-json`)
-        .expect(200);
+      const response = await request(app.getHttpServer()).get(`/${SWAGGER_PATH}-json`).expect(200);
 
       expect(Object.keys(response.body.paths as Record<string, unknown>).sort()).toEqual([
         ROOT_PATH,

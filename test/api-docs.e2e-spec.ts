@@ -75,9 +75,7 @@ describe('Frontend hand-off (e2e)', () => {
   });
 
   it('lists every documented path and method as a request the app really serves', async () => {
-    const document = await request(app.getHttpServer())
-      .get(`/${SWAGGER_PATH}-json`)
-      .expect(200);
+    const document = await request(app.getHttpServer()).get(`/${SWAGGER_PATH}-json`).expect(200);
 
     const paths = document.body.paths as Record<string, Record<string, unknown>>;
 
@@ -120,9 +118,7 @@ describe('Frontend hand-off (e2e)', () => {
 
     expect(response.body).toMatchObject({ status: 'ok' });
     expect(typeof response.body.uptimeSeconds).toBe('number');
-    expect(new Date(response.body.timestamp as string).toISOString()).toBe(
-      response.body.timestamp,
-    );
+    expect(new Date(response.body.timestamp as string).toISOString()).toBe(response.body.timestamp);
   });
 
   it('adds the CORS header for an origin from the configured allow-list', async () => {

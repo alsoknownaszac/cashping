@@ -1,10 +1,5 @@
 import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
-import {
-  ApiCreatedResponse,
-  ApiOkResponse,
-  ApiOperation,
-  ApiTags,
-} from '@nestjs/swagger';
+import { ApiCreatedResponse, ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ApiErrorResponses } from '../common/http/swagger.js';
 import { AuthService } from './auth.service.js';
 import { RegisterResponseDto } from './dto/register-response.dto.js';
@@ -29,14 +24,13 @@ export class AuthController {
   @Post('register')
   @ApiOperation({
     summary: 'Start registration and text a verification code',
-    description:
-      [
-        'Creates the account (or restarts one that is still awaiting verification) and sends a code by SMS.',
-        '',
-        'The number is accepted in any reasonable format - `024 123 4567`, `+233241234567`, `+2330241234567`, `00233241234567` - and stored as E.164.',
-        '',
-        'The response never contains the code: the SMS is its only route to the user. Calling this again for an unverified number is the resend path and invalidates the previous code.',
-      ].join('\n'),
+    description: [
+      'Creates the account (or restarts one that is still awaiting verification) and sends a code by SMS.',
+      '',
+      'The number is accepted in any reasonable format - `024 123 4567`, `+233241234567`, `+2330241234567`, `00233241234567` - and stored as E.164.',
+      '',
+      'The response never contains the code: the SMS is its only route to the user. Calling this again for an unverified number is the resend path and invalidates the previous code.',
+    ].join('\n'),
   })
   @ApiCreatedResponse({
     type: RegisterResponseDto,
@@ -45,8 +39,7 @@ export class AuthController {
   @ApiErrorResponses([
     {
       status: 400,
-      description:
-        'The body is missing `phoneNumber`, or the number is not a valid phone number.',
+      description: 'The body is missing `phoneNumber`, or the number is not a valid phone number.',
     },
     {
       status: 403,
@@ -111,13 +104,11 @@ export class AuthController {
     },
     {
       status: 429,
-      description:
-        'The code has no attempts left. It cannot be retried - request a new one.',
+      description: 'The code has no attempts left. It cannot be retried - request a new one.',
     },
     {
       status: 503,
-      description:
-        'Verification is temporarily unavailable (a dependency could not be reached).',
+      description: 'Verification is temporarily unavailable (a dependency could not be reached).',
     },
     {
       status: 500,

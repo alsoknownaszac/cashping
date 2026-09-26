@@ -70,10 +70,7 @@ export interface SmsSender {
  * answers a 5xx with a generic message for exactly that reason.
  */
 export class SmsDeliveryError extends Error {
-  constructor(
-    message: string,
-    options?: { cause?: unknown },
-  ) {
+  constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = 'SmsDeliveryError';
   }

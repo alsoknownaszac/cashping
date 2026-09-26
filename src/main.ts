@@ -80,13 +80,9 @@ async function verifyPostgres(prisma: PrismaService): Promise<void> {
       prisma.user.findFirst({ select: { id: true } }),
       prisma.otpVerification.findFirst({ select: { id: true } }),
     ]);
-    logger.log(
-      'Postgres reachable via Prisma (queried users, otp_verifications)',
-    );
+    logger.log('Postgres reachable via Prisma (queried users, otp_verifications)');
   } catch (error) {
-    logger.error(
-      `Postgres unreachable via Prisma - ${(error as Error).message}`,
-    );
+    logger.error(`Postgres unreachable via Prisma - ${(error as Error).message}`);
   }
 }
 
@@ -135,10 +131,7 @@ async function verifyRedis(url: string): Promise<void> {
  * container into a restart loop (Step 3). The compose healthcheck is what marks
  * the container unhealthy.
  */
-async function verifyDependencies(
-  app: INestApplication,
-  config: AppConfig,
-): Promise<void> {
+async function verifyDependencies(app: INestApplication, config: AppConfig): Promise<void> {
   await verifyPostgres(app.get(PrismaService));
   await verifyRedis(config.redis.url);
 }
@@ -175,14 +168,10 @@ async function bootstrap(): Promise<void> {
   await verifyDependencies(app, config);
 
   await app.listen(config.port);
-  logger.log(
-    `API listening on http://localhost:${config.port} (routes under /${GLOBAL_PREFIX})`,
-  );
+  logger.log(`API listening on http://localhost:${config.port} (routes under /${GLOBAL_PREFIX})`);
 
   if (docsMounted) {
-    logger.log(
-      `API docs (Swagger UI) at http://localhost:${config.port}/${SWAGGER_PATH}`,
-    );
+    logger.log(`API docs (Swagger UI) at http://localhost:${config.port}/${SWAGGER_PATH}`);
   }
 }
 

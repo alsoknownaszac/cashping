@@ -39,11 +39,7 @@ function captured(reply: ReturnType<typeof vi.fn>): {
   body: ErrorResponseBody;
   statusCode: number;
 } {
-  const [, body, statusCode] = reply.mock.calls[0] as [
-    unknown,
-    ErrorResponseBody,
-    number,
-  ];
+  const [, body, statusCode] = reply.mock.calls[0] as [unknown, ErrorResponseBody, number];
 
   return { body, statusCode };
 }

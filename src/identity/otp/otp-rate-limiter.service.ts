@@ -72,8 +72,7 @@ export class OtpRateLimiterService {
    */
   async consume(phoneNumber: string): Promise<void> {
     const requestsPerWindow = this.config.getOrThrow<number>('otp.requestsPerWindow');
-    const windowSeconds =
-      this.config.getOrThrow<number>('otp.requestWindowMinutes') * 60;
+    const windowSeconds = this.config.getOrThrow<number>('otp.requestWindowMinutes') * 60;
 
     const key = this.keyFor(phoneNumber);
     // The only form of the number allowed in a log line. Computed once, so no
