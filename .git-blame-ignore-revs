@@ -1,0 +1,13 @@
+# Revisions that are pure reformatting - ignore them in git blame.
+#
+# Requires one of:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs   (per clone)
+# GitHub's blame view honours this file automatically.
+#
+# ce9d165 - chore(format): normalise src and test with prettier (printWidth 100)
+# The repo was written to a ~100-column style while .prettierrc left printWidth
+# at its 80 default, so the one-time normalisation re-joined lines that had been
+# split by hand. Blame skips them with this file; without it, prettier's line
+# joins take attribution away from the commits that wrote the code (git blame -w
+# does NOT cover a line join - only whitespace within a line).
+ce9d165d3c34aac5f24e31f3d2604f129d3aa08d
