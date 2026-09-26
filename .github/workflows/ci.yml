@@ -1,0 +1,50 @@
+name: CI
+
+# Step 7: install deps, lint, unit tests, build. No deploy step yet - that comes
+# once there is something worth deploying (Step 41).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same branch makes the previous run obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # src/generated/prisma is gitignored, so the client must be generated before
+      # anything type-checks or compiles against it. --no-install keeps the run on
+      # the version pinned in package-lock.json: if the local CLI is missing it
+      # fails loudly, instead of quietly fetching whatever `latest` points at (at
+      # the time of writing that is an 8.x release candidate).
+      - name: Generate Prisma client
+        run: npx --no-install prisma generate
+
+      # --deny-warnings (in the lint script) is what makes this step meaningful.
+      # oxlint 1.x reports its default rule set as warnings and still exits 0, so
+      # without that flag a pull request with a broken rule passes green here.
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build

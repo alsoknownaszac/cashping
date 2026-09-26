@@ -50,7 +50,13 @@ services:
       POSTGRES_PASSWORD: cashping
       POSTGRES_DB: cashping
     ports:
-      - '5432:5432'
+      # Host port is overridable for the same reason as API_HOST_PORT: a machine
+      # that already runs its own Postgres on 5432 keeps the more specific
+      # 127.0.0.1 binding, shadowing this container, so host-side tools (the
+      # Prisma CLI) would silently talk to the wrong server and fail with a
+      # confusing P1010. Set POSTGRES_HOST_PORT in .env (and match it in
+      # DATABASE_URL) when that happens.
+      - '${POSTGRES_HOST_PORT:-5432}:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -62,7 +68,8 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - '6379:6379'
+      # See POSTGRES_HOST_PORT above - same reason, same fix.
+      - '${REDIS_HOST_PORT:-6379}:6379'
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s

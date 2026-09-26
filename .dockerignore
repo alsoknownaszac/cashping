@@ -10,6 +10,11 @@ coverage
 *.log
 .DS_Store
 
+# The generated Prisma client is rebuilt inside the image by `prisma generate`
+# (see the Dockerfile). Excluding it means a stale client left over on the host
+# cannot be copied into the image and compiled instead of a fresh one.
+src/generated
+
 # TypeScript incremental-build state. Never ship this: `tsconfig.json` sets
 # "incremental": true and `nest-cli.json` sets deleteOutDir, so a stale
 # tsbuildinfo copied from the host can make `nest build` skip emitting while

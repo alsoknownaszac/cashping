@@ -1,6 +1,78 @@
 // Cashping Prisma schema.
 //
-// Intentionally a placeholder at Step 2: the datasource, generator and the
-// first models (User, OtpVerification) are written in Step 5 (Prisma setup)
-// via `npx prisma init`, then extended per feature so migrations stay tied to
-// the module that needs them.
+// Step 5 of the build sequence: the datasource + generator below were written
+// by `npx prisma init`, plus the first two models. Everything else is added by
+// the module that needs it, so each migration stays tied to the feature that
+// introduced it.
+//
+// Two things Prisma 7 changed that are worth knowing before editing this file:
+//   1. The client is generated into `src/generated/prisma` (an explicit
+//      `output` is now mandatory, and it has to sit under `src/` because
+//      `nest build` compiles `src/` only). That directory is gitignored, so run
+//      `npx prisma generate` after a fresh clone and in CI/Docker before build.
+//   2. There is no `url = env("DATABASE_URL")` here. Prisma 7 reads the
+//      datasource url from `prisma7.config.ts` instead.
+//
+// Column names are snake_case via @map/@@map. That is the Postgres convention
+// and it keeps the raw reconciliation SQL in the ledger module (Steps 31-32)
+// readable without quoting every identifier.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// A Cashping end user.
+///
+/// Registration is phone-first: the row is created in PENDING as soon as an OTP
+/// is issued, and the profile fields are filled in during onboarding, which is
+/// why `handle` and `displayName` are nullable. `handle` is the recipient
+/// identifier used for payments, so it is unique.
+model User {
+  id          String     @id @default(uuid()) @db.Uuid
+  phoneNumber String     @unique @map("phone_number")
+  handle      String?    @unique
+  displayName String?    @map("display_name")
+  status      UserStatus @default(PENDING)
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  otpVerifications OtpVerification[]
+
+  @@map("users")
+}
+
+/// One SMS one-time password issued to a user.
+///
+/// `codeHash` holds a hash, never the OTP itself - an OTP is a bearer
+/// credential, so a database leak must not hand over live codes. `consumedAt`
+/// makes a code single-use, `attempts` lets the verify path lock out after
+/// repeated wrong guesses, and `expiresAt` turns the expired-OTP edge case
+/// (Days 6-7) into a timestamp comparison rather than a cleanup job.
+model OtpVerification {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  codeHash   String    @map("code_hash")
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Supports "latest OTP for this user" lookups and per-user rate limiting.
+  @@index([userId, createdAt])
+  @@map("otp_verifications")
+}
+
+/// Account lifecycle. SUSPENDED exists from the start because freezing an
+/// account is a compliance action, not something to bolt on later.
+enum UserStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
