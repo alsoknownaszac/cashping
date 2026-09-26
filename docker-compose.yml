@@ -6,10 +6,25 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      # Inside the compose network Postgres/Redis are reached by service name, so
+      # these two are built here rather than read from the host .env (a host
+      # DATABASE_URL would point at localhost, which is the container itself).
+      DATABASE_URL: postgresql://cashping:cashping@postgres:5432/cashping?schema=public
+      REDIS_URL: redis://redis:6379
+      # Everything below is required by the Step 4 env schema. Values fall back
+      # to placeholders so `docker compose up` works on a fresh clone with no
+      # .env; Compose picks the real values up from ./.env when it exists.
+      JWT_SECRET: ${JWT_SECRET:-local-compose-placeholder-secret}
+      AFRICASTALKING_API_KEY: ${AFRICASTALKING_API_KEY:-local-compose-placeholder-key}
+      AFRICASTALKING_USERNAME: ${AFRICASTALKING_USERNAME:-sandbox}
+      SENTRY_DSN: ${SENTRY_DSN:-https://placeholder@example.com/0}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-development}
+      AWS_REGION: ${AWS_REGION:-eu-west-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-local-compose-placeholder}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-local-compose-placeholder}
+      AWS_KMS_KEY_ID: ${AWS_KMS_KEY_ID:-local-compose-placeholder}
+      STELLAR_NETWORK: ${STELLAR_NETWORK:-TESTNET}
+      STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
     ports:
       # Host port defaults to 3000; override with API_HOST_PORT when 3000 is
       # already taken on the host (e.g. by another local dev server).
