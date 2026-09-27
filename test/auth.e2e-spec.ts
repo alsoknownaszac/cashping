@@ -96,6 +96,41 @@ function uniqueLocalNumber(): string {
 }
 
 /**
+ * How many numbers this run reserves.
+ *
+ * Seventeen are drawn today - one per registration flow, and one for the
+ * never-registered case - so the pool is deliberately roomy: a test added later should
+ * not have to remember to resize it, and `takeReservedNumber` fails loudly if it does.
+ */
+const RESERVED_NUMBERS = 40;
+
+/**
+ * The numbers this run may use, filled in `beforeAll` *before* the first one is handed
+ * out, so that whatever a previous run left behind for them can be deleted first.
+ *
+ * Reserved up front rather than drawn on demand, because "this number has never been
+ * registered" is a precondition a random draw does not actually give you: the database
+ * is the compose one and it outlives the run, and a run that was interrupted - Ctrl-C,
+ * a crash, a killed test process - never reaches the `afterAll` below that removes its
+ * rows. The file already depends on having no leftovers (see that hook); this is the
+ * other half of it, for the leftovers it cannot know about.
+ */
+let availableNumbers: string[] = [];
+
+/** Takes the next reserved number, failing if the pool was sized too small. */
+function takeReservedNumber(): string {
+  const local = availableNumbers.shift();
+
+  if (local === undefined) {
+    throw new Error(
+      `This file drew more than its ${RESERVED_NUMBERS} reserved numbers. Raise RESERVED_NUMBERS.`,
+    );
+  }
+
+  return local;
+}
+
+/**
  * Every number this run registered, in the E.164 form the database stores, so
  * `afterAll` can remove exactly what this file created.
  */
@@ -118,7 +153,7 @@ function toE164(localNumber: string): string {
  * leaves the unique index populated for the next run.
  */
 function freshNumber(): { local: string; e164: string } {
-  const local = uniqueLocalNumber();
+  const local = takeReservedNumber();
   const e164 = toE164(local);
 
   registered.push(e164);
@@ -182,7 +217,23 @@ async function registerAndVerify(
   local: string,
   e164: string,
 ): Promise<SessionBody> {
-  await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+  /**
+   * Captured rather than `.expect(201)`, for a reason worth the extra lines: this
+   * assertion has been seen to fail with a 401 - a status no registration route can
+   * produce, since `POST /auth/register` carries no guard at all - on a machine whose
+   * wall clock jumps and whose event loop freezes for minutes at a time. Whatever the
+   * answer really was, the failure now carries it.
+   */
+  const registration = await request(app.getHttpServer())
+    .post(REGISTER_PATH)
+    .send({ phoneNumber: local });
+
+  expect(
+    registration.status,
+    `expected 201 from ${REGISTER_PATH} for a reserved number, got ${
+      registration.status
+    } ${JSON.stringify(registration.body)}`,
+  ).toBe(201);
 
   const code = latestCodeFor(e164);
 
@@ -249,7 +300,40 @@ describe('Registration, verification and sessions (e2e)', () => {
     await app.init();
 
     prisma = app.get(PrismaService);
+
+    /**
+     * The numbers this run will use, drawn here so they can be checked for leftovers
+     * before any test depends on them being unregistered. `deleteMany` rather than
+     * `delete`, because having no row is the normal case; the point is that a number
+     * left behind by an interrupted run cannot make a first registration a 409 or a
+     * never-registered number something other than a 404.
+     */
+    availableNumbers = Array.from({ length: RESERVED_NUMBERS }, uniqueLocalNumber);
+
+    await prisma.user.deleteMany({
+      where: { phoneNumber: { in: availableNumbers.map(toE164) } },
+    });
   });
+
+  /**
+   * What a failed token assertion should report: the claims the token was sent with, and
+   * the clock the API is judging them by.
+   *
+   * Added because a 401 was seen for a token this API had issued seconds earlier, in a run
+   * whose own durations were normal - on a machine whose wall clock jumps: one run reported
+   * a `Duration` of 17,516 seconds, six consecutive runs spanned 02:29:41 to 07:40:28, and
+   * Prisma refused a commit with "873435 ms passed since the start of the transaction"
+   * against its 5,000 ms timeout. A lifetime is `iat + 900`, so a jump is exactly how a
+   * fresh token becomes an expired one; printing `exp` next to `now` is what tells the two
+   * apart next time.
+   */
+  function tokenState(accessToken: string): string {
+    const claims = app
+      .get(JwtService, { strict: false })
+      .decode<{ iat?: number; exp?: number }>(accessToken);
+
+    return `claims=${JSON.stringify(claims)} now=${Math.floor(Date.now() / 1_000)}`;
+  }
 
   afterAll(async () => {
     // Leftovers would make the *next* run fail: the unique index on `phone_number`
@@ -276,14 +360,25 @@ describe('Registration, verification and sessions (e2e)', () => {
       (phoneNumber) => `otp:requests:${createHash('sha256').update(phoneNumber).digest('hex')}`,
     );
 
-    // Every one of these is deleted whether or not it exists, which is what makes
-    // this safe to run after a test that failed before it ever sent a code.
-    await app.get(RedisService).client.del(...counterKeys);
+    /**
+     * Every one of these is deleted whether or not it exists, which is what makes
+     * this safe to run after a test that failed before it ever sent a code.
+     *
+     * Guarded on a non-empty list, because "deletes whether or not it exists" is not
+     * true of a *zero-key* `DEL`/`EXISTS`: Redis answers `ERR wrong number of arguments
+     * for 'del' command`, which reported this hook as the failure and hid the hook that
+     * had actually failed (`beforeAll` timing out, seen on a machine whose clock jumps).
+     */
+    if (counterKeys.length > 0) {
+      const redis = app.get(RedisService).client;
 
-    expect(
-      await app.get(RedisService).client.exists(...counterKeys),
-      'the OTP request counters for this run should have been removed',
-    ).toBe(0);
+      await redis.del(...counterKeys);
+
+      expect(
+        await redis.exists(...counterKeys),
+        'the OTP request counters for this run should have been removed',
+      ).toBe(0);
+    }
 
     await app.close();
   });
@@ -387,13 +482,29 @@ describe('Registration, verification and sessions (e2e)', () => {
   });
 
   it('answers 404 for a number that never registered, creating nothing', async () => {
-    const local = uniqueLocalNumber();
+    const local = takeReservedNumber();
+    const e164 = toE164(local);
 
     const response = await request(app.getHttpServer())
       .post(VERIFY_PATH)
-      .send({ phoneNumber: local, code: '123456' })
-      .expect(404);
+      .send({ phoneNumber: local, code: '123456' });
 
+    /**
+     * The message carries what a failure needs to be diagnosable, because this assertion
+     * has failed once without being reproducible: an unregistered number was answered
+     * 400 - the answer `verifyOtp` gives when a row *does* exist and its code is wrong,
+     * expired or already gone - instead of 404. The row count is in the message for that
+     * reason, and this number is reserved rather than drawn here (`takeReservedNumber`)
+     * so that "never registered" is a fact the `beforeAll` hook established.
+     */
+    expect(
+      response.status,
+      `expected 404 from ${VERIFY_PATH} for an unregistered number, got ${
+        response.status
+      } ${JSON.stringify(response.body)} (rows with this number: ${await prisma.user.count({
+        where: { phoneNumber: e164 },
+      })})`,
+    ).toBe(404);
     expect(response.body.message).toContain('No registration found');
     expect(await prisma.user.count({ where: { phoneNumber: toE164(local) } })).toBe(0);
   });
@@ -785,11 +896,21 @@ describe('Registration, verification and sessions (e2e)', () => {
     expect(claims.exp).toBeLessThan(Math.floor(Date.now() / 1_000));
 
     // The same user on the same route with a token that has not run out: 200. So the 401
-    // below is about this token, not about the account or the route.
-    await request(app.getHttpServer())
+    // below is about this token, not about the account or the route. The failure carries
+    // the response and the token's lifetime against the clock, because this assertion
+    // once failed with a 401 for a token that was valid by signature, issuer, audience
+    // and (by every reading of the code) lifetime, and "expected 200, got 401" alone says
+    // nothing about which part of the token the API refused.
+    const stillValid = await request(app.getHttpServer())
       .get(SESSION_PATH)
-      .set('Authorization', bearer(session.accessToken))
-      .expect(200);
+      .set('Authorization', bearer(session.accessToken));
+
+    expect(
+      stillValid.status,
+      `expected 200 from ${SESSION_PATH} with the access token just issued, got ${
+        stillValid.status
+      } ${JSON.stringify(stillValid.body)} (${tokenState(session.accessToken)})`,
+    ).toBe(200);
 
     const refused = await request(app.getHttpServer())
       .get(SESSION_PATH)
@@ -844,8 +965,20 @@ describe('Registration, verification and sessions (e2e)', () => {
     // wait - the reason the token cannot be trusted on its own.
     const profile = await request(app.getHttpServer())
       .get(SESSION_PATH)
-      .set('Authorization', bearer(session.accessToken))
-      .expect(403);
+      .set('Authorization', bearer(session.accessToken));
+
+    /**
+     * 401 here would mean the token was refused before the suspension was ever read, so
+     * the failure carries both halves: what the API answered, and the token's own lifetime
+     * against the current clock (see `tokenState` - a 403 was once answered with a 401 in
+     * an 18-second run).
+     */
+    expect(
+      profile.status,
+      `expected 403 (suspended) from ${SESSION_PATH}, got ${
+        profile.status
+      } ${JSON.stringify(profile.body)} (${tokenState(session.accessToken)})`,
+    ).toBe(403);
 
     expect(profile.body.message).toContain('suspended');
 
