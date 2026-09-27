@@ -1,6 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsString, Matches, MaxLength } from 'class-validator';
+import { IsString, Matches } from 'class-validator';
 import { OTP_CODE_LENGTH } from '../../config/configuration.js';
+import { SubmittedPhoneNumberDto } from './phone-number.dto.js';
 
 /**
  * The code is exactly `OTP_CODE_LENGTH` digits, and the pattern is built from
@@ -11,26 +12,18 @@ import { OTP_CODE_LENGTH } from '../../config/configuration.js';
 const CODE_PATTERN = new RegExp(`^\\d{${OTP_CODE_LENGTH}}$`);
 
 /**
- * Body of `POST /v1/auth/otp/verify` (Step 14).
+ * Body of `POST /v1/auth/otp/verify` (Step 14), and - through `LoginDto` - of
+ * `POST /v1/auth/login` (Step 16).
  *
  * The phone number is submitted again, in the same free format as registration:
  * the code alone would be ambiguous, and re-deriving the number from a code would
  * mean looking a user up by something that is not unique to them. Normalization
  * runs on this side too, so `024 123 4567` here finds the row created by
  * `+233241234567` there - which is the whole reason Step 9 exists.
+ *
+ * The number itself comes from `SubmittedPhoneNumberDto`; this class adds the code.
  */
-export class VerifyOtpDto {
-  @ApiProperty({
-    description:
-      'The number that was registered, in any reasonable format. Normalized before lookup, so it does not have to match the format submitted to /auth/register.',
-    example: '024 123 4567',
-    maxLength: 32,
-  })
-  @IsString()
-  @IsNotEmpty()
-  @MaxLength(32)
-  phoneNumber!: string;
-
+export class VerifyOtpDto extends SubmittedPhoneNumberDto {
   @ApiProperty({
     description: `The ${OTP_CODE_LENGTH}-digit code from the SMS.`,
     example: '123456',

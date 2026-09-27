@@ -1,5 +1,6 @@
-import { randomInt } from 'node:crypto';
+import { createHash, randomInt } from 'node:crypto';
 import { type INestApplication } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { Test, type TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { type App } from 'supertest/types';
@@ -15,10 +16,16 @@ import {
   type SmsSender,
 } from './../src/notifications/sms/sms-sender.js';
 import { PrismaService } from './../src/prisma/prisma.service.js';
+import { RedisService } from './../src/redis/redis.service.js';
 
 /**
  * The Day 1 exit criterion, over real HTTP against a real database and Redis:
  * register a number, receive a code, verify it, and end up with an ACTIVE user.
+ *
+ * Step 16's endpoints live here too, because they are the other half of the same
+ * flow: `login/otp`, `login`, `refresh`, `logout` and the guarded `session` are what
+ * a verified user does next, and they share this file's app, database and captured
+ * SMS sender rather than booting a second copy of all three.
  *
  * Local-only, and it needs the compose stack (`docker compose up -d postgres
  * redis`) plus a `.env` - the container ports are the ones `DATABASE_URL` and
@@ -33,11 +40,29 @@ import { PrismaService } from './../src/prisma/prisma.service.js';
 
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
 const VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/otp/verify`;
+const LOGIN_CODE_PATH = `/${GLOBAL_PREFIX}/auth/login/otp`;
+const LOGIN_PATH = `/${GLOBAL_PREFIX}/auth/login`;
+const REFRESH_PATH = `/${GLOBAL_PREFIX}/auth/refresh`;
+const LOGOUT_PATH = `/${GLOBAL_PREFIX}/auth/logout`;
+const SESSION_PATH = `/${GLOBAL_PREFIX}/auth/session`;
 
 /** The policy this file relies on, mirroring `configuration()`. */
 const REQUESTS_PER_WINDOW = 3;
 const MAX_ATTEMPTS = 5;
 const CODE_LENGTH = 6;
+
+/** The session lifetimes this file relies on, mirroring `configuration()`. */
+const ACCESS_TOKEN_TTL_MINUTES = 15;
+const REFRESH_TOKEN_TTL_DAYS = 30;
+const MINUTE_MS = 60_000;
+const DAY_MS = 24 * 60 * MINUTE_MS;
+
+/**
+ * Seconds in a minute, for the one place a lifetime is expressed in seconds: a token
+ * signed with a negative `expiresIn` (see the expiry test below), which is how a token
+ * issued in the past is minted without waiting for one.
+ */
+const SECONDS_PER_MINUTE = 60;
 
 /** Captures what would have been texted, so the code is readable in the test. */
 class CapturingSmsSender implements SmsSender {
@@ -132,7 +157,78 @@ function latestCodeFor(phoneNumber: string): string {
   return codeFrom(message.body);
 }
 
-describe('Registration and OTP verification (e2e)', () => {
+/** The half of a session response this file compares between requests. */
+interface SessionBody {
+  userId: string;
+  accessToken: string;
+  refreshToken: string;
+  accessTokenExpiresAt: string;
+  refreshExpiresAt: string;
+}
+
+/** `refresh_tokens.token_hash`'s value for a token, computed here rather than trusted. */
+function digestOf(refreshToken: string): string {
+  return createHash('sha256').update(refreshToken).digest('hex');
+}
+
+/** `Authorization: Bearer <token>`, the only way this API accepts an access token. */
+function bearer(accessToken: string): string {
+  return `Bearer ${accessToken}`;
+}
+
+/** Registers a number and verifies it, returning the session verification handed back. */
+async function registerAndVerify(
+  app: INestApplication<App>,
+  local: string,
+  e164: string,
+): Promise<SessionBody> {
+  await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+
+  const code = latestCodeFor(e164);
+
+  const response = await request(app.getHttpServer())
+    .post(VERIFY_PATH)
+    .send({ phoneNumber: local, code })
+    .expect(200);
+
+  return {
+    userId: response.body.userId as string,
+    accessToken: response.body.accessToken as string,
+    refreshToken: response.body.refreshToken as string,
+    accessTokenExpiresAt: response.body.accessTokenExpiresAt as string,
+    refreshExpiresAt: response.body.refreshExpiresAt as string,
+  };
+}
+
+/**
+ * Asks for a sign-in code and spends it, the way a second device signs in: the same
+ * two calls the app makes, with the code read from the captured SMS.
+ */
+async function signInWithCode(
+  app: INestApplication<App>,
+  local: string,
+  e164: string,
+): Promise<SessionBody & { handle: string | null }> {
+  await request(app.getHttpServer()).post(LOGIN_CODE_PATH).send({ phoneNumber: local }).expect(200);
+
+  const code = latestCodeFor(e164);
+
+  const response = await request(app.getHttpServer())
+    .post(LOGIN_PATH)
+    .send({ phoneNumber: local, code })
+    .expect(200);
+
+  return {
+    userId: response.body.userId as string,
+    accessToken: response.body.accessToken as string,
+    refreshToken: response.body.refreshToken as string,
+    accessTokenExpiresAt: response.body.accessTokenExpiresAt as string,
+    refreshExpiresAt: response.body.refreshExpiresAt as string,
+    handle: response.body.handle as string | null,
+  };
+}
+
+describe('Registration, verification and sessions (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: PrismaService;
 
@@ -162,6 +258,32 @@ describe('Registration and OTP verification (e2e)', () => {
     const { count } = await prisma.user.deleteMany({ where: { phoneNumber: { in: registered } } });
 
     expect(count, 'every number this run created should have been removed').toBe(registered.length);
+
+    /**
+     * ...and the counters have to go with them.
+     *
+     * The allowance is a fixed window keyed by the number (`otp:requests:<sha256>`,
+     * see `OtpRateLimiterService`), so it outlives the rows that were just deleted:
+     * without this, a number that hit the limit in one run starts the next run three
+     * sends down and the failure looks like a bug in the limiter rather than a
+     * leftover. The keys are derived exactly as the limiter derives them - the same
+     * "asserted without the helper's help" trick `toE164` uses for the normalizer -
+     * and deleting them by name rather than by pattern is deliberate: `KEYS
+     * otp:requests:*` is the O(N) call the limiter's own comment avoids, and a
+     * blanket `FLUSHDB` would wipe another suite's counters.
+     */
+    const counterKeys = registered.map(
+      (phoneNumber) => `otp:requests:${createHash('sha256').update(phoneNumber).digest('hex')}`,
+    );
+
+    // Every one of these is deleted whether or not it exists, which is what makes
+    // this safe to run after a test that failed before it ever sent a code.
+    await app.get(RedisService).client.del(...counterKeys);
+
+    expect(
+      await app.get(RedisService).client.exists(...counterKeys),
+      'the OTP request counters for this run should have been removed',
+    ).toBe(0);
 
     await app.close();
   });
@@ -383,5 +505,366 @@ describe('Registration and OTP verification (e2e)', () => {
     expect(await prisma.user.count({ where: { phoneNumber: e164 } })).toBe(1);
     // One code is live, so the allowance bought three sends and one usable code.
     expect(await prisma.otpVerification.count({ where: { userId, consumedAt: null } })).toBe(1);
+  });
+
+  it('starts a session when a number is verified, storing only the digest of its refresh token', async () => {
+    const { local, e164 } = freshNumber();
+
+    const session = await registerAndVerify(app, local, e164);
+
+    expect(new Date(session.accessTokenExpiresAt).toISOString()).toBe(session.accessTokenExpiresAt);
+    expect(new Date(session.refreshExpiresAt).toISOString()).toBe(session.refreshExpiresAt);
+
+    // The asymmetry the whole design rests on: an access token that dies in minutes and
+    // a refresh token that lives for a month, so the app refreshes rather than re-signs.
+    const accessTtl = new Date(session.accessTokenExpiresAt).getTime() - Date.now();
+
+    expect(accessTtl).toBeGreaterThan(ACCESS_TOKEN_TTL_MINUTES * MINUTE_MS - MINUTE_MS);
+    expect(accessTtl).toBeLessThanOrEqual(ACCESS_TOKEN_TTL_MINUTES * MINUTE_MS);
+
+    const stored = await prisma.refreshToken.findUnique({
+      where: { tokenHash: digestOf(session.refreshToken) },
+    });
+
+    expect(stored?.userId).toBe(session.userId);
+    expect(stored?.revokedAt).toBeNull();
+    expect(stored?.expiresAt.getTime() ?? 0).toBeGreaterThan(
+      Date.now() + (REFRESH_TOKEN_TTL_DAYS - 1) * DAY_MS,
+    );
+    // A plaintext session in the table would be a working credential for anyone who
+    // reads the database; the digest is what a presented token is matched against.
+    expect(stored?.tokenHash).not.toBe(session.refreshToken);
+
+    // ...and the access token opens the one guarded route in the API.
+    const profile = await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(session.accessToken))
+      .expect(200);
+
+    expect(profile.body).toEqual({
+      userId: session.userId,
+      phoneNumber: e164,
+      status: UserStatus.ACTIVE,
+      handle: null,
+    });
+  });
+
+  it('adds a second session when a code is used to sign in, without touching the first', async () => {
+    const { local, e164 } = freshNumber();
+
+    const firstDevice = await registerAndVerify(app, local, e164);
+    const secondDevice = await signInWithCode(app, local, e164);
+
+    expect(secondDevice.userId).toBe(firstDevice.userId);
+    expect(secondDevice.refreshToken).not.toBe(firstDevice.refreshToken);
+    // No handle was submitted at registration, and sign-in reports the row as it is.
+    expect(secondDevice.handle).toBeNull();
+
+    // Two live sessions: signing in on a new device is not a reason to end the one on
+    // the old one, and both tokens still open the guarded route.
+    expect(
+      await prisma.refreshToken.count({ where: { userId: firstDevice.userId, revokedAt: null } }),
+    ).toBe(2);
+    await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(secondDevice.accessToken))
+      .expect(200);
+    await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(firstDevice.accessToken))
+      .expect(200);
+  });
+
+  it('refuses a sign-in code that has already been used, starting no session for it', async () => {
+    const { local, e164 } = freshNumber();
+
+    const session = await registerAndVerify(app, local, e164);
+
+    await request(app.getHttpServer())
+      .post(LOGIN_CODE_PATH)
+      .send({ phoneNumber: local })
+      .expect(200);
+
+    const code = latestCodeFor(e164);
+
+    await request(app.getHttpServer())
+      .post(LOGIN_PATH)
+      .send({ phoneNumber: local, code })
+      .expect(200);
+
+    // One live code per number and one use per code, so the second attempt gets the
+    // answer verification gives a spent code: ask for a new one - which is the only way
+    // forward for the honest case (a double tap) as well.
+    const reused = await request(app.getHttpServer())
+      .post(LOGIN_PATH)
+      .send({ phoneNumber: local, code })
+      .expect(400);
+
+    expect(reused.body.message).toContain('No verification code is outstanding');
+    // The session from verification and the one from the successful sign-in, and
+    // nothing from the refused attempt.
+    expect(await prisma.refreshToken.count({ where: { userId: session.userId } })).toBe(2);
+  });
+
+  it('rotates on refresh, then treats the spent token as a compromise when it comes back', async () => {
+    const { local, e164 } = freshNumber();
+
+    const session = await registerAndVerify(app, local, e164);
+
+    const rotated = await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: session.refreshToken })
+      .expect(200);
+
+    expect(rotated.body.refreshToken).not.toBe(session.refreshToken);
+    // No profile on refresh: the client has a session already, and `GET /auth/session`
+    // is where a user is read - from the row, not from a token.
+    expect(rotated.body).not.toHaveProperty('userId');
+
+    // The token that was spent comes back. A replay, or a client that kept a copy it
+    // should have replaced: either way the value is out of our control.
+    const replayed = await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: session.refreshToken })
+      .expect(401);
+
+    expect(replayed.body.message).toContain('security reasons');
+
+    // The family went with it: the token issued in exchange is dead too, so every
+    // session for this user has to be rebuilt by signing in again.
+    await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: rotated.body.refreshToken as string })
+      .expect(401);
+
+    expect(
+      await prisma.refreshToken.count({ where: { userId: session.userId, revokedAt: null } }),
+    ).toBe(0);
+
+    // The access token handed out with the rotation still works - and that is the
+    // documented cost of the design, not a gap: it is signed rather than stored, so
+    // nothing can withdraw it before its 15 minutes are up. It is exactly why the
+    // refresh half is the one that is rotated, revoked and kept in the database.
+    await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(rotated.body.accessToken as string))
+      .expect(200);
+  });
+
+  it('logs out idempotently, ending only the session that was presented', async () => {
+    const { local, e164 } = freshNumber();
+
+    const phone = await registerAndVerify(app, local, e164);
+    const tablet = await signInWithCode(app, local, e164);
+
+    const loggedOut = await request(app.getHttpServer())
+      .post(LOGOUT_PATH)
+      .send({ refreshToken: tablet.refreshToken })
+      .expect(204);
+
+    expect(loggedOut.body).toEqual({});
+
+    // One session ended, and the row says so...
+    expect(
+      await prisma.refreshToken.count({ where: { userId: phone.userId, revokedAt: null } }),
+    ).toBe(1);
+
+    // ...so the other device carries on: a phone and a tablet are two sessions, and
+    // signing out on one must not sign the user out of the other.
+    await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: phone.refreshToken })
+      .expect(200);
+
+    // Logging out twice is not an error: the client asked for the same thing again, and
+    // a 401 here would leave it on a "logout failed" screen with nothing useful to do.
+    await request(app.getHttpServer())
+      .post(LOGOUT_PATH)
+      .send({ refreshToken: tablet.refreshToken })
+      .expect(204);
+  });
+
+  it('treats a refresh with a logged-out token as a compromise and retires the family', async () => {
+    const { local, e164 } = freshNumber();
+
+    const phone = await registerAndVerify(app, local, e164);
+    const tablet = await signInWithCode(app, local, e164);
+
+    await request(app.getHttpServer())
+      .post(LOGOUT_PATH)
+      .send({ refreshToken: tablet.refreshToken })
+      .expect(204);
+
+    /**
+     * The documented cost of reuse detection, and the honest reason for it: a token that
+     * has been revoked looks the same whether it was rotated away or logged out - the
+     * row says "already revoked" and nothing more - so presenting one is answered the
+     * way a replay is, and every live session for the user goes with it.
+     *
+     * The alternative is a `revokedReason` column (`ROTATED`/`LOGGED_OUT`) to tell the
+     * two apart, and the reason it is not here yet is what gets traded away: a stolen
+     * refresh token whose owner logged out would keep working. The client's side of the
+     * contract is that a logged-out token is never presented again - the app drops it -
+     * so this path is reached by a bug or by someone else's copy.
+     */
+    const replayed = await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: tablet.refreshToken })
+      .expect(401);
+
+    expect(replayed.body.message).toContain('security reasons');
+
+    // The other device had a perfectly good session a moment ago, and it is gone too.
+    expect(
+      await prisma.refreshToken.count({ where: { userId: phone.userId, revokedAt: null } }),
+    ).toBe(0);
+    await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: phone.refreshToken })
+      .expect(401);
+  });
+
+  it('refuses the guarded route without a token this API signed', async () => {
+    const missing = await request(app.getHttpServer()).get(SESSION_PATH).expect(401);
+
+    expect(missing.body.message).toContain('Invalid or expired access token');
+
+    // A value that is not a JWT at all, and a real one whose signature is broken by a
+    // single character. The client's next step is the same for both, so the answer is
+    // the same for both - and neither tells a prober which of the two it was.
+    const garbage = await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', 'Bearer not-a-jwt')
+      .expect(401);
+
+    expect(garbage.body.message).toBe(missing.body.message);
+
+    const { local, e164 } = freshNumber();
+    const session = await registerAndVerify(app, local, e164);
+    const tampered = `${session.accessToken.slice(0, -1)}${
+      session.accessToken.endsWith('A') ? 'B' : 'A'
+    }`;
+
+    const forged = await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(tampered))
+      .expect(401);
+
+    expect(forged.body.message).toBe(missing.body.message);
+  });
+
+  /**
+   * Step 16's audit item, taken literally: "access tokens genuinely expire at 15
+   * minutes (not just configured to - verify with a token issued in the past)".
+   *
+   * The token below is minted by the same `JwtService` that signs every real one - same
+   * secret, issuer, audience and algorithm - for a user who exists and whose session is
+   * live. The only thing wrong with it is `exp`, one minute in the past. That is what
+   * makes this a different test from the one above: the signature and the claims are
+   * perfect, so the 401 can only be the expiry check.
+   *
+   * It has to be a request rather than an assertion about `ACCESS_TOKEN_TTL_MINUTES`,
+   * because the configuration could be read and asserted while the API still accepted
+   * expired tokens: `ignoreExpiration: false` in `JwtStrategy` is the thing that
+   * actually enforces the lifetime, and this is the only test that would fail if
+   * somebody flipped it.
+   */
+  it('refuses an access token whose lifetime has already run out', async () => {
+    const { local, e164 } = freshNumber();
+
+    const session = await registerAndVerify(app, local, e164);
+
+    const jwt = app.get(JwtService, { strict: false });
+    const expired = jwt.sign({ sub: session.userId }, { expiresIn: -SECONDS_PER_MINUTE });
+
+    // Reading the payload is what rules out "this failed because the claims were wrong":
+    // the user id is the one the API signs, and `exp` is the only broken part.
+    const claims = jwt.decode<{ sub: string; exp: number }>(expired);
+
+    expect(claims.sub).toBe(session.userId);
+    expect(claims.exp).toBeLessThan(Math.floor(Date.now() / 1_000));
+
+    // The same user on the same route with a token that has not run out: 200. So the 401
+    // below is about this token, not about the account or the route.
+    await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(session.accessToken))
+      .expect(200);
+
+    const refused = await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(expired))
+      .expect(401);
+
+    // Expired, malformed and wrong-signature all get the one message: the client does
+    // the same thing in every case, so the API does not say which it was.
+    expect(refused.body.message).toContain('Invalid or expired access token');
+  });
+
+  it('answers a value that is not one of our refresh tokens as a 401 refresh and a 204 logout', async () => {
+    const bogus = 'this-is-not-one-of-our-refresh-tokens';
+
+    const refused = await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: bogus })
+      .expect(401);
+
+    expect(refused.body.message).toContain('Invalid or expired refresh token');
+
+    /**
+     * The same value, on the same body shape, answered with 204 - and the asymmetry is
+     * the design rather than an oversight. Refresh is a credential being presented as
+     * access, so a bad one is refused; logout is a credential being thrown away, and a
+     * value that was never a session has already been thrown away.
+     */
+    await request(app.getHttpServer()).post(LOGOUT_PATH).send({ refreshToken: bogus }).expect(204);
+  });
+
+  it('refuses a suspended account at every door it can be checked at', async () => {
+    const { local, e164 } = freshNumber();
+
+    const session = await registerAndVerify(app, local, e164);
+
+    // The code is requested *before* the suspension, so none of the refusals below can
+    // be about a missing code: they are about the account.
+    await request(app.getHttpServer())
+      .post(LOGIN_CODE_PATH)
+      .send({ phoneNumber: local })
+      .expect(200);
+
+    const code = latestCodeFor(e164);
+
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { status: UserStatus.SUSPENDED },
+    });
+
+    // Refused at the door rather than at its expiry: `JwtStrategy` re-reads the row on
+    // every request, which is what makes a suspension immediate instead of a 15-minute
+    // wait - the reason the token cannot be trusted on its own.
+    const profile = await request(app.getHttpServer())
+      .get(SESSION_PATH)
+      .set('Authorization', bearer(session.accessToken))
+      .expect(403);
+
+    expect(profile.body.message).toContain('suspended');
+
+    // Renewing is refused too, or a suspension would last only until the next refresh.
+    await request(app.getHttpServer())
+      .post(REFRESH_PATH)
+      .send({ refreshToken: session.refreshToken })
+      .expect(403);
+
+    // ...and both sign-in doors say the same thing, before any code is compared: a
+    // suspended user is not told their code was wrong and sent to request another one
+    // that cannot work either.
+    await request(app.getHttpServer())
+      .post(LOGIN_PATH)
+      .send({ phoneNumber: local, code })
+      .expect(403);
+    await request(app.getHttpServer())
+      .post(LOGIN_CODE_PATH)
+      .send({ phoneNumber: local })
+      .expect(403);
   });
 });

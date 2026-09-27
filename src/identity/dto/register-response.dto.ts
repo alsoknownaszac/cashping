@@ -41,4 +41,13 @@ export class RegisterResponseDto {
     example: 6,
   })
   codeLength!: number;
+
+  @ApiProperty({
+    description:
+      'The handle now held by the account, in canonical lower case, or `null` if none was submitted. A handle claimed at registration is already reserved for this account while it is still pending - nobody else can take it, and verifying the number does not change it.',
+    example: 'miriam_owusu',
+    nullable: true,
+    type: String,
+  })
+  handle!: string | null;
 }

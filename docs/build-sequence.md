@@ -177,14 +177,7 @@ Done when: a newly registered, phone-verified user automatically has a funded St
 - [ ] **Step 15:** handle uniqueness is case-insensitive (`@Miriam` and `@miriam` conflict); reserved words are actually rejected, not just documented; length/character bounds enforced and tested.
 - [ ] **Step 16:** access tokens genuinely expire at 15 minutes (not just configured to — verify with a token issued in the past or a clock-shifted test); refresh tokens are stored hashed, not plaintext, in the database; a revoked refresh token is actually rejected on reuse.
 
-<!-- ============================================================
-     ⚠️  ONE ITEM STILL INCOMPLETE — the step 18, 19 and 20 items
-     arrived in a later paste and are below, verbatim. The step 17
-     item did not: it came through as "**Step 17:** two rapid,
-     concurrent transaction-build" and stopped there. It is left out
-     of the list rather than guessed at, so this checklist reads 15,
-     16, 18, 19, 20 until that item is re-pasted.
-     ============================================================ -->
+- [ ] **Step 17:** two rapid, concurrent transaction-build requests for the *same* source account do not produce a sequence-number conflict — force this race deliberately, don't just trust the mutex/queue exists.
 
 - [ ] **Step 18 (highest scrutiny of the whole build):** inspect the actual database row for a provisioned account — the secret key must be unreadable without the KMS call; confirm no raw secret key ever appears in application logs (grep logs after a provisioning run); confirm the encrypted blob differs per account (not reusing one data key silently).
 - [ ] **Step 19:** a freshly registered and phone-verified user has, without further action, a Testnet account that is both funded (real XLM balance, not zero) and trustline-active for USDC — check both conditions independently, since "funded but no trustline" is a distinct failure mode from "trustline set but never funded."

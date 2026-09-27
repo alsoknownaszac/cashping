@@ -1,4 +1,4 @@
-import { HttpException } from '@nestjs/common';
+import { HttpException, UnauthorizedException } from '@nestjs/common';
 import { type ConfigService } from '@nestjs/config';
 import { describe, expect, it } from 'vitest';
 import { UserStatus } from '../generated/prisma/enums.js';
@@ -12,14 +12,16 @@ import {
   type OtpRateLimiterService,
 } from './otp/otp-rate-limiter.service.js';
 import { type IssuedOtp, type OtpCheckOutcome, type OtpService } from './otp/otp.service.js';
+import { type IssuedTokens, type SessionUser, type TokenService } from './token/token.service.js';
 
 /**
- * Steps 10 and 14: the decisions `AuthService` makes, in the order it makes them.
+ * Steps 10, 14 and 16: the decisions `AuthService` makes, in the order it makes them.
  *
  * Everything around it is faked, so each test names one behaviour - which status
  * code a given situation produces, and crucially *what must not have happened*
- * (no SMS on a 409, no row on a 429, no user created for an unparseable number).
- * The database and Redis are exercised for real in `test/auth.e2e-spec.ts`.
+ * (no SMS on a 409, no row on a 429, no user created for an unparseable number, no
+ * session started by a code that was already spent). The database and Redis are
+ * exercised for real in `test/auth.e2e-spec.ts`.
  */
 
 /** A Ghanaian mobile written the way a user types it, and how it must be stored. */
@@ -40,6 +42,7 @@ interface FakeUser {
   phoneNumber: string;
   status: UserStatus;
   phoneVerifiedAt: Date | null;
+  handle: string | null;
 }
 
 /** The two tables `AuthService` touches, plus a log of the calls it made. */
@@ -85,18 +88,33 @@ class FakePrisma {
     },
   };
 
+  /**
+   * The same table, outside a transaction: `verifyOtp` spends the code inside one,
+   * `login` spends it with a single write of its own.
+   */
+  readonly otpVerification = {
+    updateMany: async (): Promise<{ count: number }> => {
+      this.calls.push('consume');
+
+      return { count: this.consumeCount };
+    },
+  };
+
   readonly user = {
     findUnique: async (args: { where: { phoneNumber: string } }): Promise<FakeUser | null> => {
       this.calls.push('findUnique');
 
       return this.users.get(args.where.phoneNumber) ?? null;
     },
-    create: async (args: { data: { phoneNumber: string } }): Promise<FakeUser> => {
+    create: async (args: {
+      data: { phoneNumber: string; handle?: string | null };
+    }): Promise<FakeUser> => {
       this.calls.push('create');
 
       const user: FakeUser = {
         id: `user-${this.nextId++}`,
         phoneNumber: args.data.phoneNumber,
+        handle: args.data.handle ?? null,
         // The column default, not something the service restates.
         status: UserStatus.PENDING_VERIFICATION,
         phoneVerifiedAt: null,
@@ -169,11 +187,60 @@ class FakeNotifications {
   };
 }
 
+/**
+ * The token mint, recording every decision asked of it.
+ *
+ * `AuthService` is deliberately thin here: it hands the row over and passes the
+ * answer back, so what these tests assert is *which* user was handed over, *in
+ * what order* the code was spent, and that a rejection travels out unchanged.
+ */
+class FakeTokenService {
+  readonly issued: SessionUser[] = [];
+  readonly rotated: string[] = [];
+  readonly revoked: string[] = [];
+
+  issuedPair: IssuedTokens = {
+    accessToken: 'access-token-1',
+    accessTokenExpiresAt: new Date('2026-09-26T10:19:12.345Z'),
+    refreshToken: 'refresh-token-1',
+    refreshExpiresAt: new Date('2026-10-26T10:04:12.345Z'),
+  };
+
+  /** Set to make `rotate` throw the way a reused token does. */
+  rotateError: Error | null = null;
+
+  /** What `revoke` answers; `false` is the already-dead token. */
+  revokeResult = true;
+
+  issue = async (user: SessionUser): Promise<IssuedTokens> => {
+    this.issued.push(user);
+
+    return this.issuedPair;
+  };
+
+  rotate = async (presented: string): Promise<IssuedTokens> => {
+    if (this.rotateError !== null) {
+      throw this.rotateError;
+    }
+
+    this.rotated.push(presented);
+
+    return this.issuedPair;
+  };
+
+  revoke = async (presented: string): Promise<boolean> => {
+    this.revoked.push(presented);
+
+    return this.revokeResult;
+  };
+}
+
 interface Harness {
   prisma: FakePrisma;
   otp: FakeOtpService;
   limiter: FakeRateLimiter;
   notifications: FakeNotifications;
+  tokens: FakeTokenService;
   auth: AuthService;
 }
 
@@ -182,18 +249,21 @@ function createHarness(): Harness {
   const otp = new FakeOtpService();
   const limiter = new FakeRateLimiter();
   const notifications = new FakeNotifications();
+  const tokens = new FakeTokenService();
 
   return {
     prisma,
     otp,
     limiter,
     notifications,
+    tokens,
     auth: new AuthService(
       prisma as unknown as PrismaService,
       createConfig(),
       otp as unknown as OtpService,
       limiter as unknown as OtpRateLimiterService,
       notifications as unknown as NotificationsService,
+      tokens as unknown as TokenService,
     ),
   };
 }
@@ -205,6 +275,7 @@ function seedUser(prisma: FakePrisma, overrides: Partial<FakeUser> = {}): FakeUs
     phoneNumber: E164_NUMBER,
     status: UserStatus.PENDING_VERIFICATION,
     phoneVerifiedAt: null,
+    handle: null,
     ...overrides,
   };
 
@@ -469,8 +540,8 @@ describe('AuthService.verifyOtp', () => {
     });
   }
 
-  it('activates the user and consumes the code in one transaction', async () => {
-    const { auth, prisma, otp } = createHarness();
+  it('activates the user, spends the code and starts a session in one transaction', async () => {
+    const { auth, prisma, otp, tokens } = createHarness();
     const user = seedUser(prisma);
 
     const response = await auth.verifyOtp({ phoneNumber: LOCAL_NUMBER, code: '123456' });
@@ -490,6 +561,19 @@ describe('AuthService.verifyOtp', () => {
     expect(prisma.calls).toEqual(['findUnique', 'begin', 'tx.consume', 'tx.activate', 'commit']);
     expect(user.status).toBe(UserStatus.ACTIVE);
     expect(user.phoneVerifiedAt).not.toBeNull();
+
+    // The pair comes out of the same code: the proof that this is the user's phone is
+    // also the credential that starts their session, so a fresh install has no second
+    // sign-in step to make.
+    expect(response.accessToken).toBe('access-token-1');
+    expect(response.accessTokenExpiresAt).toBe('2026-09-26T10:19:12.345Z');
+    expect(response.refreshToken).toBe('refresh-token-1');
+    expect(response.refreshExpiresAt).toBe('2026-10-26T10:04:12.345Z');
+
+    // The row is handed over as `ACTIVE` - patched in memory rather than re-read - since
+    // `TokenService.issue` reads nothing but the id.
+    expect(tokens.issued).toHaveLength(1);
+    expect(tokens.issued[0]).toMatchObject({ id: user.id, status: UserStatus.ACTIVE });
   });
 
   it('accepts a number in any format, because it normalizes before looking it up', async () => {
@@ -521,5 +605,314 @@ describe('AuthService.verifyOtp', () => {
     expect(prisma.calls).not.toContain('tx.activate');
     expect(user.status).toBe(UserStatus.PENDING_VERIFICATION);
     expect(user.phoneVerifiedAt).toBeNull();
+  });
+});
+
+describe('AuthService.requestLoginCode', () => {
+  it('texts a code to a verified number and answers with what the code screen renders', async () => {
+    const { auth, prisma, otp, limiter, notifications } = createHarness();
+    const user = seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+
+    const response = await auth.requestLoginCode({ phoneNumber: LOCAL_NUMBER });
+
+    expect(response.phoneNumber).toBe(E164_NUMBER);
+    expect(response.codeLength).toBe(6);
+    expect(new Date(response.expiresAt).toISOString()).toBe(response.expiresAt);
+    // The row is found by its normalized number, the code is issued against that row's
+    // own id (so a resend invalidates whatever was sent before), and the SMS is the only
+    // route the code has to the user.
+    expect(otp.issued).toEqual([user.id]);
+    expect(limiter.consumed).toEqual([E164_NUMBER]);
+    expect(notifications.sent).toEqual([{ phoneNumber: E164_NUMBER, code: '654321' }]);
+  });
+
+  it('answers 404 for a number with no account, before spending the allowance', async () => {
+    const { auth, prisma, otp, limiter, notifications } = createHarness();
+
+    const { status } = await captureHttpError(() =>
+      auth.requestLoginCode({ phoneNumber: LOCAL_NUMBER }),
+    );
+
+    expect(status).toBe(404);
+    expect(prisma.calls).toEqual(['findUnique']);
+    // Registration's ordering rule, unchanged: a request that sends no SMS must not spend
+    // the number's allowance, or three mistyped numbers would lock the real user out.
+    expect(limiter.consumed).toEqual([]);
+    expect(otp.issued).toEqual([]);
+    expect(notifications.sent).toHaveLength(0);
+  });
+
+  it('answers 403 for a suspended account without issuing or sending anything', async () => {
+    const { auth, prisma, otp, notifications } = createHarness();
+    seedUser(prisma, { status: UserStatus.SUSPENDED });
+
+    const { status } = await captureHttpError(() =>
+      auth.requestLoginCode({ phoneNumber: LOCAL_NUMBER }),
+    );
+
+    expect(status).toBe(403);
+    expect(otp.issued).toEqual([]);
+    expect(notifications.sent).toHaveLength(0);
+  });
+
+  it('answers 409 while registration is unfinished, because sign-in needs a verified number', async () => {
+    const { auth, prisma, otp } = createHarness();
+    // PENDING_VERIFICATION: `register`'s resend path, not a sign-in candidate.
+    seedUser(prisma);
+
+    const { status, message } = await captureHttpError(() =>
+      auth.requestLoginCode({ phoneNumber: LOCAL_NUMBER }),
+    );
+
+    expect(status).toBe(409);
+    expect(message).toContain('not been verified');
+    // The screen they need is the verification one; a sign-in code would be a dead end.
+    expect(otp.issued).toEqual([]);
+  });
+
+  it('refuses the request past the rate limit, after the account checks', async () => {
+    const { auth, prisma, limiter, otp, notifications } = createHarness();
+    seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+    limiter.error = new OtpRateLimitExceededError(900);
+
+    const { status, message } = await captureHttpError(() =>
+      auth.requestLoginCode({ phoneNumber: LOCAL_NUMBER }),
+    );
+
+    expect(status).toBe(429);
+    expect(message).toContain('Try again in 15 minutes');
+    expect(otp.issued).toEqual([]);
+    expect(notifications.sent).toHaveLength(0);
+  });
+
+  it('answers 503 when the SMS provider refuses, leaving the code for a retry', async () => {
+    const { auth, prisma, otp, notifications } = createHarness();
+    seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+    notifications.error = new SmsDeliveryError('the provider rejected the message');
+
+    const { status } = await captureHttpError(() =>
+      auth.requestLoginCode({ phoneNumber: LOCAL_NUMBER }),
+    );
+
+    expect(status).toBe(503);
+    // The code was issued before the send failed, and that is harmless: the user never
+    // saw it, and asking again is another send - rate limited like any other.
+    expect(otp.issued).toHaveLength(1);
+    expect(notifications.sent).toHaveLength(0);
+  });
+});
+describe('AuthService.login', () => {
+  it('spends the code and starts a session, writing nothing to the user row', async () => {
+    const { auth, prisma, otp, tokens } = createHarness();
+    const verifiedAt = new Date('2026-09-01T08:30:00.000Z');
+    const user = seedUser(prisma, {
+      status: UserStatus.ACTIVE,
+      phoneVerifiedAt: verifiedAt,
+      handle: 'miriam_owusu',
+    });
+
+    const response = await auth.login({ phoneNumber: LOCAL_NUMBER, code: '123456' });
+
+    expect(response.userId).toBe(user.id);
+    expect(response.phoneNumber).toBe(E164_NUMBER);
+    expect(response.status).toBe(UserStatus.ACTIVE);
+    // The handle rides along with the session, so the app has a name to render without a
+    // second round trip to `GET /auth/session`.
+    expect(response.handle).toBe('miriam_owusu');
+    expect(response.accessToken).toBe('access-token-1');
+    expect(response.accessTokenExpiresAt).toBe('2026-09-26T10:19:12.345Z');
+    expect(response.refreshToken).toBe('refresh-token-1');
+    expect(response.refreshExpiresAt).toBe('2026-10-26T10:04:12.345Z');
+
+    // Checked against the stored row's id, with the code exactly as the user typed it.
+    expect(otp.checked).toEqual([{ userId: user.id, code: '123456' }]);
+
+    // One write - spending the code - and no transaction around it: signing in changes
+    // nothing about the account, which is the whole difference from verification.
+    expect(prisma.calls).toEqual(['findUnique', 'consume']);
+    expect(prisma.transactionCount).toBe(0);
+    // `phoneVerifiedAt` records when the *number* was proven; a sign-in that re-stamped it
+    // would be a lie about that.
+    expect(user.phoneVerifiedAt).toEqual(verifiedAt);
+
+    // The row as it was read, with no in-memory patch - because nothing was written.
+    expect(tokens.issued).toEqual([user]);
+  });
+
+  it('refuses a code that was already used, and starts no session for it', async () => {
+    const { auth, prisma, otp, tokens } = createHarness();
+    seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+    // Live when it was checked and gone by the time it is spent: the same person
+    // double-tapping "sign in", or two devices racing with one code.
+    prisma.consumeCount = 0;
+
+    const { status, message } = await captureHttpError(() =>
+      auth.login({ phoneNumber: LOCAL_NUMBER, code: '123456' }),
+    );
+
+    expect(status).toBe(409);
+    expect(message).toContain('already been used');
+    expect(otp.checked).toHaveLength(1);
+    // The order `login` defends: spend first, mint second. The other way round leaves a
+    // live session behind on a failed write, and a session nobody was handed is an open
+    // door - while a lost code costs one SMS to replace.
+    expect(tokens.issued).toEqual([]);
+  });
+
+  it('answers 404 for a number with no account, without checking any code', async () => {
+    const { auth, otp, tokens } = createHarness();
+
+    const { status } = await captureHttpError(() =>
+      auth.login({ phoneNumber: LOCAL_NUMBER, code: '123456' }),
+    );
+
+    expect(status).toBe(404);
+    expect(otp.checked).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+  });
+
+  it('answers 403 for a suspended account, before the code is even looked at', async () => {
+    const { auth, prisma, otp, tokens } = createHarness();
+    seedUser(prisma, { status: UserStatus.SUSPENDED });
+
+    const { status } = await captureHttpError(() =>
+      auth.login({ phoneNumber: LOCAL_NUMBER, code: '123456' }),
+    );
+
+    expect(status).toBe(403);
+    // Checked before the comparison, so a suspended user is not told their code was wrong
+    // and sent to request another one that cannot work either.
+    expect(otp.checked).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+    // One query, and it is the shared `findSignInAccount`: the same answer "text me a
+    // code" gives, rather than a second copy of the rules.
+    expect(prisma.calls).toEqual(['findUnique']);
+  });
+
+  it('answers 409 for a number whose registration is unfinished', async () => {
+    const { auth, prisma, otp, tokens } = createHarness();
+    seedUser(prisma);
+
+    const { status, message } = await captureHttpError(() =>
+      auth.login({ phoneNumber: LOCAL_NUMBER, code: '123456' }),
+    );
+
+    expect(status).toBe(409);
+    expect(message).toContain('not been verified');
+    expect(otp.checked).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+  });
+
+  it('maps a wrong code onto the answer verification gives, and starts no session', async () => {
+    const { auth, prisma, otp, tokens } = createHarness();
+    seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+    otp.outcome = { ok: false, reason: 'invalid_code', attemptsRemaining: 3 };
+
+    const { status, message } = await captureHttpError(() =>
+      auth.login({ phoneNumber: LOCAL_NUMBER, code: '000000' }),
+    );
+
+    expect(status).toBe(400);
+    expect(message).toContain('3 attempts remaining');
+    // A failed outcome never produced an `otpId`, so nothing was spent and no session
+    // exists to revoke.
+    expect(prisma.calls).toEqual(['findUnique']);
+    expect(tokens.issued).toEqual([]);
+  });
+});
+
+describe('AuthService.refresh', () => {
+  it('passes the presented token through and returns the rotated pair', async () => {
+    const { auth, tokens } = createHarness();
+
+    const response = await auth.refresh({ refreshToken: 'opaque-refresh-token' });
+
+    expect(response).toEqual({
+      accessToken: 'access-token-1',
+      accessTokenExpiresAt: '2026-09-26T10:19:12.345Z',
+      refreshToken: 'refresh-token-1',
+      refreshExpiresAt: '2026-10-26T10:04:12.345Z',
+    });
+    // No profile here, unlike login and verification: a client that is refreshing already
+    // knows who it is, and `GET /auth/session` reads the row itself.
+    expect(response).not.toHaveProperty('userId');
+    // Every decision - the digest lookup, reuse detection, expiry, rotation - belongs to
+    // `TokenService`; this is the mapping to the wire and nothing else.
+    expect(tokens.rotated).toEqual(['opaque-refresh-token']);
+  });
+
+  it('lets a refusal travel out unchanged, so each condition has one wording', async () => {
+    const { auth, tokens } = createHarness();
+    // What a replayed token produces: `TokenService` has already retired the family by the
+    // time this is thrown.
+    tokens.rotateError = new UnauthorizedException(
+      'Invalid or expired refresh token. Sign in again.',
+    );
+
+    const { status, message } = await captureHttpError(() =>
+      auth.refresh({ refreshToken: 'replayed-token' }),
+    );
+
+    expect(status).toBe(401);
+    expect(message).toBe('Invalid or expired refresh token. Sign in again.');
+  });
+});
+
+describe('AuthService.logout', () => {
+  it('revokes the presented token and answers with nothing', async () => {
+    const { auth, tokens } = createHarness();
+
+    await expect(auth.logout({ refreshToken: 'opaque-refresh-token' })).resolves.toBeUndefined();
+
+    expect(tokens.revoked).toEqual(['opaque-refresh-token']);
+  });
+
+  it('answers the same way for a token that was not live, because logout is idempotent', async () => {
+    const { auth, tokens } = createHarness();
+    // Already rotated away, expired, or never existed: a client that logs out twice gets
+    // the same empty answer either way, rather than a 401 it has to special-case - and a
+    // caller cannot use this endpoint to test whether a token was real.
+    tokens.revokeResult = false;
+
+    await expect(auth.logout({ refreshToken: 'already-gone' })).resolves.toBeUndefined();
+
+    expect(tokens.revoked).toEqual(['already-gone']);
+  });
+});
+
+describe('AuthService.session', () => {
+  it('maps the row the guard read, without querying anything', () => {
+    const { auth, prisma } = createHarness();
+
+    const response = auth.session({
+      id: 'user-9',
+      phoneNumber: E164_NUMBER,
+      status: UserStatus.ACTIVE,
+      handle: 'miriam_owusu',
+    });
+
+    expect(response).toEqual({
+      userId: 'user-9',
+      phoneNumber: E164_NUMBER,
+      status: UserStatus.ACTIVE,
+      handle: 'miriam_owusu',
+    });
+    // The read already happened in `JwtStrategy`: asking again here would be a second
+    // answer to a question that was just answered, and the two could disagree under a
+    // concurrent update.
+    expect(prisma.calls).toEqual([]);
+  });
+
+  it('reports a null handle rather than omitting it, so the client can render a blank name', () => {
+    const { auth } = createHarness();
+
+    const response = auth.session({
+      id: 'user-9',
+      phoneNumber: E164_NUMBER,
+      status: UserStatus.ACTIVE,
+      handle: null,
+    });
+
+    expect(response).toHaveProperty('handle', null);
   });
 });

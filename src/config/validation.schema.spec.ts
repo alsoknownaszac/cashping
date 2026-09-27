@@ -16,7 +16,7 @@ const VALID_ENV: Record<string, string> = {
   PORT: '3000',
   DATABASE_URL: 'postgresql://cashping:cashping@localhost:5432/cashping?schema=public',
   REDIS_URL: 'redis://localhost:6379',
-  JWT_SECRET: 'a-long-random-secret',
+  JWT_SECRET: 'not-a-real-secret-just-a-test-fixture-value',
   AFRICASTALKING_API_KEY: 'atsk_test_000000000000',
   AFRICASTALKING_USERNAME: 'sandbox',
   SENTRY_DSN: 'https://abc123@o0.ingest.sentry.io/0',
@@ -156,6 +156,33 @@ describe('environment validation', () => {
       /STELLAR_NETWORK/,
     );
   });
+
+  // --- Stellar Horizon fallback (Step 17) ----------------------------------
+
+  it('accepts a STELLAR_HORIZON_FALLBACK_URL that is a URL', () => {
+    const fallback = 'https://horizon.internal.cashping.co';
+
+    expect(validate({ ...VALID_ENV, STELLAR_HORIZON_FALLBACK_URL: fallback })).toMatchObject({
+      STELLAR_HORIZON_FALLBACK_URL: fallback,
+    });
+  });
+
+  it('leaves STELLAR_HORIZON_FALLBACK_URL undefined when unset, so the factory default applies', () => {
+    expect(validate({ ...VALID_ENV }).STELLAR_HORIZON_FALLBACK_URL).toBeUndefined();
+  });
+
+  // An optional variable that is *present but empty* is what `VAR=` in an .env
+  // file produces. The factory would paper over it with the local-node default, so
+  // the schema is the half that names it - the same belt-and-braces split as
+  // ENABLE_SWAGGER. The scheme-less value is here because the SDK parses this into
+  // a `URL`: it would boot and then fail at the first account load.
+  for (const value of ['', '   ', 'horizon-testnet.stellar.org']) {
+    it(`rejects STELLAR_HORIZON_FALLBACK_URL=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, STELLAR_HORIZON_FALLBACK_URL: value })).toThrowError(
+        /STELLAR_HORIZON_FALLBACK_URL/,
+      );
+    });
+  }
 
   it('rejects a DATABASE_URL that is not a Postgres URL', () => {
     expect(() => validate({ ...VALID_ENV, DATABASE_URL: 'mysql://localhost/db' })).toThrowError(

@@ -14,6 +14,14 @@ import configuration from './../src/config/configuration.js';
 const HEALTH_PATH = `/${GLOBAL_PREFIX}/health`;
 
 /**
+ * The documented paths that carry `JwtAuthGuard`, and therefore answer 401 to the
+ * tokenless request this file makes. Named rather than inferred: the point of the
+ * loop below is that a path is routed and behaves like its siblings, and a guarded
+ * GET answering 200 would mean the guard stopped being applied.
+ */
+const PROTECTED_GET_PATHS = new Set([`/${GLOBAL_PREFIX}/auth/session`]);
+
+/**
  * What the frontend engineer actually consumes, over real HTTP and wired exactly
  * the way `main.ts` wires it: the docs route, the document's coverage, CORS, and
  * the documented health shape.
@@ -68,8 +76,13 @@ describe('Frontend hand-off (e2e)', () => {
     // it really showed up in the docs (it is generated from the app, so it should).
     expect(Object.keys(response.body.paths as Record<string, unknown>).sort()).toEqual([
       `/${GLOBAL_PREFIX}`,
+      `/${GLOBAL_PREFIX}/auth/login`,
+      `/${GLOBAL_PREFIX}/auth/login/otp`,
+      `/${GLOBAL_PREFIX}/auth/logout`,
       `/${GLOBAL_PREFIX}/auth/otp/verify`,
+      `/${GLOBAL_PREFIX}/auth/refresh`,
       `/${GLOBAL_PREFIX}/auth/register`,
+      `/${GLOBAL_PREFIX}/auth/session`,
       HEALTH_PATH,
     ]);
   });
@@ -102,7 +115,12 @@ describe('Frontend hand-off (e2e)', () => {
         expect(response.status, `${where} is documented but not routed`).not.toBe(405);
 
         if (method === 'get') {
-          expect(response.status, `${where} should answer`).toBe(200);
+          // `/auth/session` is the one documented GET behind `JwtAuthGuard`, and its
+          // answer without a bearer token is 401 - which is still proof it is routed
+          // and that the guard is attached to it, the two things this loop checks for.
+          expect(response.status, `${where} should answer`).toBe(
+            PROTECTED_GET_PATHS.has(path) ? 401 : 200,
+          );
         } else {
           // Routed, and the body is refused: what the global validation pipe is
           // for, and proof it is wired into this app rather than only into

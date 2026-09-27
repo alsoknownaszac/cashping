@@ -78,6 +78,24 @@ export const OTP_REQUESTS_PER_WINDOW = 3;
 export const OTP_REQUEST_WINDOW_MINUTES = 15;
 
 /**
+ * Session policy (Step 16).
+ *
+ * The two lifetimes are a deliberate pair, and the split is what makes the JWT
+ * design work at all. An access token cannot be withdrawn: the API verifies its
+ * signature and never asks the database, so its 15 minutes *are* the mitigation for
+ * a leaked token. A refresh token can be withdrawn, because it is looked up in
+ * `refresh_tokens` on every use - so it is the one that gets to live for 30 days.
+ *
+ * 15 minutes is short enough to matter and long enough not to be a nuisance: a
+ * client that refreshes on 401 loses no more than a second per quarter hour, while
+ * a token stolen out of a log or a proxy is useful for minutes, not days.
+ */
+/** How long an access token (JWT) is accepted. */
+export const ACCESS_TOKEN_TTL_MINUTES = 15;
+/** How long a refresh token stays usable without being rotated. */
+export const REFRESH_TOKEN_TTL_DAYS = 30;
+
+/**
  * Africa's Talking API hosts.
  *
  * Two hosts, one API: the sandbox app is served by `api.sandbox...` and a live
@@ -140,6 +158,36 @@ function readBooleanFlag(raw: string | undefined, fallback: boolean): boolean {
   }
 }
 
+/**
+ * Horizon host for the fallback slot (Step 17).
+ *
+ * The primary endpoint is required and network-specific; this second one is
+ * optional and defaults to where a locally-run Stellar node answers -
+ * `stellar/quickstart` publishes Horizon on port 8000 - because a self-hosted
+ * Horizon is also the realistic production answer for a failover. Nothing queries
+ * it yet: it is a slot, so pointing the fallback at a real second host stays a
+ * deployment change rather than a code change.
+ */
+export const DEFAULT_FALLBACK_HORIZON_URL = 'http://localhost:8000';
+
+/**
+ * Resolves the fallback Horizon host.
+ *
+ * Unset (or blank, which is what `STELLAR_HORIZON_FALLBACK_URL=` in an `.env`
+ * file produces) means the local-node default - the same belt-and-braces split as
+ * `readBooleanFlag`: the factory keeps working on a surprising value, and
+ * `validation.schema.ts` refuses the boot, so nothing reaches a running app by
+ * accident. A trailing slash is stripped because the value is concatenated into
+ * URLs downstream.
+ */
+export function resolveFallbackHorizonUrl(override: string | undefined): string {
+  const explicit = override?.trim();
+  const resolved =
+    explicit === undefined || explicit === '' ? DEFAULT_FALLBACK_HORIZON_URL : explicit;
+
+  return resolved.replace(/\/+$/, '');
+}
+
 export default function configuration() {
   return {
     nodeEnv: process.env.NODE_ENV ?? 'development',
@@ -183,9 +231,22 @@ export default function configuration() {
       url: process.env.REDIS_URL as string,
     },
 
-    /** JWT signing configuration. */
+    /**
+     * JWT signing configuration (Step 16).
+     *
+     * The secret is the only environment variable here: it is per-environment and
+     * must never be shared, while the two lifetimes are product rules that belong in
+     * the code where a change shows up in review (the OTP block above makes the same
+     * argument). `validation.schema.ts` floors the secret at 32 characters, because
+     * an HMAC key shorter than its output is the one way to weaken HS256 while still
+     * looking configured.
+     */
     auth: {
       jwtSecret: process.env.JWT_SECRET as string,
+      /** Lifetime of an access token, in minutes. See `ACCESS_TOKEN_TTL_MINUTES`. */
+      accessTokenTtlMinutes: ACCESS_TOKEN_TTL_MINUTES,
+      /** Lifetime of a refresh token, in days. See `REFRESH_TOKEN_TTL_DAYS`. */
+      refreshTokenTtlDays: REFRESH_TOKEN_TTL_DAYS,
     },
 
     /**
@@ -254,6 +315,11 @@ export default function configuration() {
     stellar: {
       network: process.env.STELLAR_NETWORK as string,
       horizonUrl: process.env.STELLAR_HORIZON_URL as string,
+      /**
+       * Second Horizon host for the same network: the failover slot, unused as of
+       * Step 17 (see `DEFAULT_FALLBACK_HORIZON_URL`).
+       */
+      fallbackHorizonUrl: resolveFallbackHorizonUrl(process.env.STELLAR_HORIZON_FALLBACK_URL),
     },
   };
 }

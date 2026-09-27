@@ -38,6 +38,11 @@ services:
       AWS_KMS_KEY_ID: ${AWS_KMS_KEY_ID:-local-compose-placeholder}
       STELLAR_NETWORK: ${STELLAR_NETWORK:-TESTNET}
       STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
+      # [optional] Failover Horizon host (Step 17). Commented out because "${VAR:-}"
+      # would forward an *empty* string, which the env schema refuses; uncomment to
+      # point it at a second host. Note that a Horizon running on the host machine
+      # is not "localhost" from inside this container - use
+      # http://host.docker.internal:8000.
     ports:
       # Host port defaults to 3000; override with API_HOST_PORT when 3000 is
       # already taken on the host (e.g. by another local dev server).

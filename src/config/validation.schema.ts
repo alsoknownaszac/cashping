@@ -9,6 +9,7 @@ import {
   Matches,
   Max,
   Min,
+  MinLength,
   ValidateBy,
   validateSync,
   type ValidationError,
@@ -167,6 +168,21 @@ export class EnvironmentVariables {
   REDIS_URL!: string;
 
   // --- Auth ----------------------------------------------------------------
+  /**
+   * The HS256 signing key (Step 16).
+   *
+   * Floored at 32 characters, which is the length of the digest the algorithm
+   * produces: a shorter key is the one way to weaken the signature while still
+   * looking configured, and it is invisible at runtime - tokens would verify fine
+   * right up until someone brute-forces the key offline from a single captured
+   * token. `openssl rand -base64 32` is the intended way to fill it in.
+   *
+   * A floor and not a length *check*: base64 output is 44 characters, but any 32+
+   * character string is a legitimate high-entropy key, and rejecting a good key
+   * because it was not generated the way the example suggests would be a worse
+   * failure than accepting it.
+   */
+  @MinLength(32, { message: 'JWT_SECRET must be at least 32 characters ($constraint1)' })
   @IsNotEmpty()
   JWT_SECRET!: string;
 
@@ -230,6 +246,24 @@ export class EnvironmentVariables {
   @IsUrl()
   @IsNotEmpty()
   STELLAR_HORIZON_URL!: string;
+
+  /**
+   * Second Horizon host for the same network, used as a fallback (Step 17).
+   *
+   * Optional, with two constraints that come from how the value is used rather
+   * than from taste:
+   *
+   * - blank is not a value. Leaving the variable unset keeps the local-node
+   *   default (`configuration.ts`), while an empty one is refused at boot - a
+   *   variable that was typed but not filled in is a mistake worth naming, the
+   *   same way an empty `AFRICASTALKING_BASE_URL` is.
+   * - `require_protocol` for the same reason it is set on that one: the SDK parses
+   *   this into a `URL`, so `horizon.example.com` would boot and then fail at the
+   *   first account load.
+   */
+  @IsOptional()
+  @IsUrl({ require_protocol: true })
+  STELLAR_HORIZON_FALLBACK_URL?: string;
 }
 
 /**

@@ -53,8 +53,27 @@ export function createOpenApiDocument(app: INestApplication): OpenAPIObject {
     )
     .addTag(
       'auth',
-      'Phone identity - start registration with POST /auth/register, then prove the number with POST /auth/otp/verify.',
+      [
+        'Phone identity - no passwords.',
+        'Register: POST /auth/register, then POST /auth/otp/verify.',
+        'Sign in: POST /auth/login/otp for a code, then POST /auth/login for a token pair; POST /auth/refresh renews the access token and GET /auth/session returns the signed-in user.',
+      ].join('\n'),
     )
+    /**
+     * The `Authorization: Bearer <token>` scheme, so the routes that need it show a
+     * padlock and a "Try it out" that can actually be used (Step 16). `@ApiBearerAuth()`
+     * has to name the same security scheme, and it does: both default to `bearer`.
+     */
+    .addBearerAuth({
+      type: 'http',
+      scheme: 'bearer',
+      bearerFormat: 'JWT',
+      description: [
+        'Access token from POST /auth/login or POST /auth/refresh.',
+        'Send it as `Authorization: Bearer <token>`.',
+        'It is a JWT that expires after 15 minutes - refresh it rather than sending the user back to the code screen.',
+      ].join(' '),
+    })
     .build();
 
   return SwaggerModule.createDocument(app, config);
