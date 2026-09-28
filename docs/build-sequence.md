@@ -179,7 +179,7 @@ Done when: a newly registered, phone-verified user automatically has a funded St
 
 - [ ] **Step 17:** two rapid, concurrent transaction-build requests for the *same* source account do not produce a sequence-number conflict — force this race deliberately, don't just trust the mutex/queue exists.
 
-- [ ] **Step 18 (highest scrutiny of the whole build):** inspect the actual database row for a provisioned account — the secret key must be unreadable without the KMS call; confirm no raw secret key ever appears in application logs (grep logs after a provisioning run); confirm the encrypted blob differs per account (not reusing one data key silently).
+- [x] **Step 18 (highest scrutiny of the whole build):** inspect the actual database row for a provisioned account — the secret key must be unreadable without the KMS call; confirm no raw secret key ever appears in application logs (grep logs after a provisioning run); confirm the encrypted blob differs per account (not reusing one data key silently).
 - [ ] **Step 19:** a freshly registered and phone-verified user has, without further action, a Testnet account that is both funded (real XLM balance, not zero) and trustline-active for USDC — check both conditions independently, since "funded but no trustline" is a distinct failure mode from "trustline set but never funded."
 - [ ] **Step 20:** balance endpoint reflects the real Horizon-reported USDC balance, not a cached/stale/default value — verify by comparing directly against a Horizon query for the same account.
 
