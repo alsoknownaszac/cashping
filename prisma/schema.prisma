@@ -57,6 +57,7 @@ model User {
 
   otpVerifications OtpVerification[]
   refreshTokens    RefreshToken[]
+  stellarAccount   StellarAccount?
 
   @@map("users")
 }
@@ -116,6 +117,49 @@ model RefreshToken {
   /// and an eventual "sign out everywhere" - both need.
   @@index([userId, createdAt])
   @@map("refresh_tokens")
+}
+
+/// A user's Stellar account, and the only place key material lives (Step 18).
+///
+/// `userId` is unique because MVP derives exactly one account per user, once the
+/// phone number is verified (Step 19). A second account is a multi-wallet product
+/// decision, so it should take a migration rather than be silently allowed by the
+/// schema.
+///
+/// `encryptedSecretKey` never holds a secret key. It holds the `cp-kms-1`
+/// envelope: a per-account data key wrapped by the KMS master key, plus the seed
+/// encrypted with that data key under AES-256-GCM. The column is useless without a
+/// KMS `Decrypt` call, which is the property the Step 18 audit checks by reading
+/// this table directly.
+///
+/// `dataKeyArn` records the master key that wrapped *this* row's data key. KMS
+/// keys are regional and a key is referenced by an ARN, so a row must not have to
+/// guess which key opens it - that reference is also what a future re-wrap
+/// (`ReEncrypt`) or an audited rotation needs. No key id, wrapping key or data key
+/// is stored in the clear anywhere.
+///
+/// `publicKey` is stored because it is what Horizon and every payment reference,
+/// and it is public by definition. It is unique on the network, so a collision
+/// here means something generated the same key twice - worth failing on.
+///
+/// The relation is `Restrict`, deliberately unlike the `Cascade` the auth models
+/// use: deleting a user must not destroy sealed key material or silently orphan a
+/// funded Stellar account, so deletion has to be a deliberate, audited act that
+/// deals with the account first. `onDelete: Restrict` is what makes that the
+/// only option.
+model StellarAccount {
+  id                 String   @id @default(uuid()) @db.Uuid
+  userId             String   @unique @map("user_id") @db.Uuid
+  publicKey          String   @unique @map("public_key")
+  /// The `cp-kms-1` envelope (see `src/wallet/custody/secret-envelope.ts`).
+  encryptedSecretKey String   @map("encrypted_secret_key")
+  dataKeyArn         String   @map("data_key_arn")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@map("stellar_accounts")
 }
 
 /// Account lifecycle.

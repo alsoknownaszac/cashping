@@ -35,7 +35,15 @@ services:
       AWS_REGION: ${AWS_REGION:-eu-west-1}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-local-compose-placeholder}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-local-compose-placeholder}
-      AWS_KMS_KEY_ID: ${AWS_KMS_KEY_ID:-local-compose-placeholder}
+      # Step 18: the KMS master key that wraps every account's data key. The fallback is
+      # a *shape-valid* ARN, because the env schema now refuses an obviously-placeholder
+      # key reference - this value decides which key the seeds are encrypted under, so a
+      # value that could never be a key is a custody failure, not a missing nicety. Being
+      # shape-valid keeps `docker compose up` working on a fresh clone without AWS
+      # credentials, and the wallet fails closed instead: the KMS boot probe logs that
+      # the key cannot be used, and the first custody call fails. Replace it (or set
+      # AWS_KMS_KEY_ID in ./.env) before provisioning anything.
+      AWS_KMS_KEY_ID: ${AWS_KMS_KEY_ID:-arn:aws:kms:eu-west-1:000000000000:key/00000000-0000-0000-0000-000000000000}
       STELLAR_NETWORK: ${STELLAR_NETWORK:-TESTNET}
       STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
       # [optional] Failover Horizon host (Step 17). Commented out because "${VAR:-}"
@@ -43,6 +51,13 @@ services:
       # point it at a second host. Note that a Horizon running on the host machine
       # is not "localhost" from inside this container - use
       # http://host.docker.internal:8000.
+      # [optional] Non-AWS KMS endpoint (Step 18). Commented out for the same reason as
+      # the Horizon fallback above - "${VAR:-}" would forward an *empty* string, which the
+      # env schema refuses - and because this service runs NODE_ENV=production, where
+      # `validate` refuses the variable outright: custody pointed at a non-AWS endpoint is
+      # a different trust boundary. Uncomment to point the stack at a KMS emulator on the
+      # host; that emulator has to hold a key with the ARN configured above.
+      # AWS_ENDPOINT_URL: http://host.docker.internal:4566
     ports:
       # Host port defaults to 3000; override with API_HOST_PORT when 3000 is
       # already taken on the host (e.g. by another local dev server).

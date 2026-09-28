@@ -179,6 +179,90 @@ redis` - and a `.env`, so it is deliberately not part of the CI job, which has n
 service. It registers random numbers and deletes them again in `afterAll`, so repeated runs
 are safe.
 
+## Stellar key custody (Step 18)
+
+Every account's secret seed is stored **encrypted**, in a form that cannot be opened without
+a KMS call. There is no plaintext seed anywhere in the database, no seed in any log line, and
+no code path that stores one "temporarily" - the audit for this step exists precisely to prove
+that, by reading the table directly rather than through the API.
+
+**The stored form** (`src/wallet/custody/secret-envelope.ts`):
+
+```text
+cp-kms-1.<wrapped data key>.<iv>.<tag>.<ciphertext>      # five dot-separated base64url segments
+```
+
+- A per-account **data key** (AES-256) encrypts the seed; the master key in KMS wraps that
+  data key. Two layers, because they buy different things: the data key is per account (so no
+  two accounts share one, and one compromised row says nothing about the next), and the master
+  key never leaves KMS (so a database dump alone is unusable).
+- The account id is bound **twice** - as the KMS `EncryptionContext` on the wrapped data key,
+  and as the AES-GCM additional authenticated data on the seed. Moving a blob to another
+  account's row fails in both places: locally, before any network call, and then at KMS.
+- The envelope version is in the AAD too, so a future `cp-kms-2` blob cannot be relabelled
+  `cp-kms-1` and fed to this code.
+
+Where the pieces live, and why:
+
+- **`src/wallet/custody/secret-envelope.ts`** - the format, and nothing else. Pure crypto and
+  a strict parser; it has never heard of AWS, which is what keeps the format testable offline.
+- **`src/wallet/custody/key-wrapper.ts`** - the `KEY_WRAPPER` port `SeedCustodyService` depends
+  on, plus the three errors the contract can produce. The failures live next to the port
+  because they are what a caller has to handle.
+- **`src/wallet/custody/kms-key-wrapper.ts`** - the only file in the repo that imports
+  `@aws-sdk/client-kms`. It classifies SDK failures, and probes the configured key once at boot.
+- **`src/wallet/custody/seed-custody.service.ts`** - the API: `createSealedAccount()` returns a
+  public key and an envelope (the `Keypair` never leaves the method), `openSeed(row)` returns a
+  keypair for signing. It logs nothing, deliberately.
+- **`stellar_accounts`** (Prisma migration `add_stellar_accounts`) - `encrypted_secret_key`,
+  `data_key_arn`, `public_key`. The user relation is `ON DELETE RESTRICT`: deleting a user must
+  not destroy sealed key material or orphan a funded account, so the database refuses it.
+
+| Failure | Thrown as | What it means |
+| --- | --- | --- |
+| KMS unreachable, throttled, credentials rejected, key disabled, policy denies | `KeyCustodyUnavailableError` | The call did not happen; nothing about the stored row is in question. Retry later, or fix the key/policy. Never reported as corruption. |
+| Key reference does not resolve (wrong region, deleted key, bad ARN) | `KmsKeyNotFoundError` | Configuration, not an outage. Aborts boot in production. |
+| KMS refuses the blob/key/context pairing, or the GCM tag fails | `SecretEnvelopeError` | Tampering, a botched rotation, or a bug. Stop everything; do not retry. |
+
+`AWS_KMS_KEY_ID` accepts what AWS accepts - a key ARN, a bare key id, or `alias/...` - and must
+be a key in `AWS_REGION`, because KMS keys are regional and a key from another region is
+reported as `NotFoundException` with no hint that the region is the problem. The boot probe
+(`DescribeKey` plus a region comparison) is what turns that class of mistake into one clear
+startup line. On failure it behaves differently by cause: a key reference that **cannot** work
+aborts startup in production, while an **unreachable** KMS is only logged - the Step 3 rule that
+a missing dependency must not put the container into a restart loop holds here too, and custody
+fails closed regardless.
+
+### Pointing KMS at a local emulator
+
+`AWS_ENDPOINT_URL` redirects every KMS call elsewhere - in practice LocalStack, which serves KMS
+on `http://localhost:4566`. It is optional, blank is refused, and `validate` refuses it outright
+when `NODE_ENV=production`: custody aimed at a non-AWS endpoint is a different trust boundary,
+not a convenience.
+
+An emulator is **not** part of `docker-compose.yml`, and nothing in CI needs one. The opt-in
+integration spec is the only thing that uses it:
+
+```bash
+docker run -d --name cashping-kms -p 4566:4566 -e SERVICES=kms \
+  -e LOCALSTACK_AUTH_TOKEN=... localstack/localstack:latest      # ~2.5 min to become healthy
+AWS_ENDPOINT_URL=http://localhost:4566 RUN_KMS_IT=1 npm run test:e2e
+```
+
+Two things worth knowing before relying on one: the key has to be created *in* the emulator
+(`awslocal kms create-key`), because a shape-valid ARN that does not exist there is a
+`NotFoundException`, and the vendor's free tier is licensed for non-commercial use - check their
+terms before pointing this product's development at it.
+
+### Tests
+
+`npm test` covers the envelope (round trips, tampering, truncation, account and version
+mismatches), the KMS failure classification and the service's behaviour, all offline: the AWS
+client sits behind `KEY_WRAPPER` and `KMS_CLIENT_FACTORY`, so the suite needs neither network
+nor credentials. The step's own audit - three accounts producing three different blobs, a
+database row that reads as ciphertext, and a log grep for the seed pattern that comes back
+empty - is reproducible with the two commands in the section above.
+
 ## Deployment
 
 When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.

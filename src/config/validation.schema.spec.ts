@@ -246,4 +246,87 @@ describe('environment validation', () => {
       );
     });
   }
+
+  // --- AWS / KMS (Step 18) -------------------------------------------------
+
+  // The key reference decides what every account's seed is encrypted under, and these are
+  // the three forms AWS accepts - so all three have to pass, because any of them can come
+  // from a real deployment.
+  it('accepts a KMS key ARN, a bare key id and an alias', () => {
+    const forms = [
+      'arn:aws:kms:eu-west-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab',
+      '1234abcd-12ab-34cd-56ef-1234567890ab',
+      'alias/cashping-seeds',
+    ];
+
+    for (const value of forms) {
+      expect(validate({ ...VALID_ENV, AWS_KMS_KEY_ID: value }).AWS_KMS_KEY_ID).toBe(value);
+    }
+  });
+
+  // `replace-me` and `local-compose-placeholder` are the placeholders that used to be in
+  // .env.example and docker-compose.yml. Either would have booted and then failed on the
+  // first registration, which is exactly what this constraint exists to stop - custody has
+  // no working default.
+  for (const value of ['replace-me', 'local-compose-placeholder', 'not-a-key', '', 'key/1234']) {
+    it(`rejects AWS_KMS_KEY_ID=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, AWS_KMS_KEY_ID: value })).toThrowError(
+        /AWS_KMS_KEY_ID/,
+      );
+    });
+  }
+
+  // A blank or malformed region is not a small mistake: the SDK would fall back to a region
+  // of its own, and a key in another region comes back as `NotFoundException`, which reads
+  // like a deleted key rather than a region mismatch.
+  for (const value of ['', 'eu_west_1', 'europe', 'eu-west', 'EU-WEST-1']) {
+    it(`rejects AWS_REGION=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, AWS_REGION: value })).toThrowError(/AWS_REGION/);
+    });
+  }
+
+  it('accepts the region forms AWS uses', () => {
+    for (const value of ['eu-west-1', 'us-east-1', 'ap-southeast-2', 'us-gov-west-1']) {
+      expect(validate({ ...VALID_ENV, AWS_REGION: value }).AWS_REGION).toBe(value);
+    }
+  });
+
+  it('leaves AWS_ENDPOINT_URL undefined when unset, so the SDK uses the regional endpoint', () => {
+    expect(validate({ ...VALID_ENV }).AWS_ENDPOINT_URL).toBeUndefined();
+  });
+
+  it('accepts AWS_ENDPOINT_URL outside production', () => {
+    const result = validate({ ...VALID_ENV, AWS_ENDPOINT_URL: 'http://localhost:4566' });
+
+    expect(result.AWS_ENDPOINT_URL).toBe('http://localhost:4566');
+  });
+
+  // A bare host would boot and then fail at the first KMS call, because the SDK parses this
+  // into a URL - the same constraint as STELLAR_HORIZON_FALLBACK_URL, for the same reason.
+  for (const value of ['', '   ', 'localhost:4566']) {
+    it(`rejects AWS_ENDPOINT_URL=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, AWS_ENDPOINT_URL: value })).toThrowError(
+        /AWS_ENDPOINT_URL/,
+      );
+    });
+  }
+
+  // The cross-variable rule, and the one that matters most: custody pointed at an endpoint
+  // that is not AWS, while AWS_KMS_KEY_ID still names an AWS key, is a different trust
+  // boundary rather than a convenience - so it is refused, not logged.
+  it('refuses AWS_ENDPOINT_URL in production', () => {
+    expect(() =>
+      validate({
+        ...VALID_ENV,
+        NODE_ENV: 'production',
+        AWS_ENDPOINT_URL: 'http://localhost:4566',
+      }),
+    ).toThrowError(/AWS_ENDPOINT_URL is set while NODE_ENV=production/);
+  });
+
+  it('leaves production alone once the endpoint is removed', () => {
+    expect(validate({ ...VALID_ENV, NODE_ENV: 'production' }).NODE_ENV).toBe(
+      NodeEnvironment.Production,
+    );
+  });
 });

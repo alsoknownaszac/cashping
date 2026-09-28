@@ -1,4 +1,7 @@
 import { Module } from '@nestjs/common';
+import { KEY_WRAPPER } from './custody/key-wrapper.js';
+import { KMS_CLIENT_FACTORY, KmsKeyWrapper, createKmsClient } from './custody/kms-key-wrapper.js';
+import { SeedCustodyService } from './custody/seed-custody.service.js';
 import { STELLAR_ACCOUNT_SOURCE } from './stellar/account-source.js';
 import {
   HORIZON_SERVER_FACTORY,
@@ -22,6 +25,17 @@ import { StellarService } from './stellar/stellar.service.js';
  * - `HORIZON_SERVER_FACTORY` is bound to the SDK constructor here and to a fake in
  *   `HorizonAccountSource`'s spec, so its error mapping is testable offline.
  *
+ * Step 18 adds three providers on the same pattern, for key material rather than
+ * sequence numbers:
+ *
+ * - `KEY_WRAPPER` is the port `SeedCustodyService` depends on, bound here to
+ *   `KmsKeyWrapper`. That binding is the only place AWS enters the wallet module.
+ * - `KMS_CLIENT_FACTORY` is bound to the real SDK constructor and to an injected
+ *   fake in `KmsKeyWrapper`'s spec, so every branch of the KMS error mapping is
+ *   testable without a network - the same reason `HORIZON_SERVER_FACTORY` exists.
+ * - `SeedCustodyService` is the API Step 19 will call. Nothing imports it yet,
+ *   which is why it is not exported: the export arrives with provisioning.
+ *
  * Keypair custody (Step 18), provisioning (19) and balances (20) add their own
  * providers here. `StellarService` is deliberately *not* exported yet: nothing
  * outside this module injects it, and an export nothing imports is a guess about
@@ -34,6 +48,9 @@ import { StellarService } from './stellar/stellar.service.js';
     StellarService,
     { provide: STELLAR_ACCOUNT_SOURCE, useClass: HorizonAccountSource },
     { provide: HORIZON_SERVER_FACTORY, useValue: createHorizonServer },
+    SeedCustodyService,
+    { provide: KEY_WRAPPER, useClass: KmsKeyWrapper },
+    { provide: KMS_CLIENT_FACTORY, useValue: createKmsClient },
   ],
 })
 export class WalletModule {}

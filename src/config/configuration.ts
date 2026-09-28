@@ -303,12 +303,24 @@ export default function configuration() {
       environment: process.env.SENTRY_ENVIRONMENT ?? process.env.NODE_ENV ?? 'development',
     },
 
-    /** AWS credentials + KMS key used to wrap Stellar secret seeds. */
+    /**
+     * AWS credentials and the KMS master key that wraps Stellar secret seeds
+     * (Step 18).
+     *
+     * `endpointUrl` is unset in every normal deployment, and then the SDK talks to the
+     * regional endpoint it derives from `region`. Set, it redirects every KMS call -
+     * wrap and unwrap alike - to something else, which in practice means a local
+     * emulator (LocalStack publishes KMS on http://localhost:4566). The validation
+     * schema refuses a value once `NODE_ENV=production`: a master key living in an
+     * emulator while `AWS_KMS_KEY_ID` still names an AWS key is a custody failure, not a
+     * convenience.
+     */
     aws: {
       region: process.env.AWS_REGION as string,
       accessKeyId: process.env.AWS_ACCESS_KEY_ID as string,
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY as string,
       kmsKeyId: process.env.AWS_KMS_KEY_ID as string,
+      endpointUrl: process.env.AWS_ENDPOINT_URL,
     },
 
     /** Stellar network selection. */

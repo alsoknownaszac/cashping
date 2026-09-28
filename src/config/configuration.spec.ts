@@ -140,4 +140,27 @@ describe('configuration', () => {
       );
     });
   });
+
+  describe('aws.endpointUrl', () => {
+    const originalEndpointValue = process.env['AWS_ENDPOINT_URL'];
+
+    afterEach(() => {
+      restore('AWS_ENDPOINT_URL', originalEndpointValue);
+    });
+
+    // Pass-through, but asserted anyway: the default is the whole point. There must be no
+    // fallback endpoint, because a fallback would mean custody silently pointing somewhere
+    // other than AWS the moment the variable was mistyped into existence.
+    it('is undefined unless AWS_ENDPOINT_URL is set, so the SDK uses the regional AWS endpoint', () => {
+      delete process.env['AWS_ENDPOINT_URL'];
+
+      expect(configuration().aws.endpointUrl).toBeUndefined();
+    });
+
+    it('takes a supplied endpoint as it is', () => {
+      process.env['AWS_ENDPOINT_URL'] = 'http://localhost:4566';
+
+      expect(configuration().aws.endpointUrl).toBe('http://localhost:4566');
+    });
+  });
 });

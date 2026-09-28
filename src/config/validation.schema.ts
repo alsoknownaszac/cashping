@@ -68,6 +68,33 @@ const CORS_ALLOWED_ORIGINS_PATTERN =
   /^\s*https?:\/\/[^\s,/:*]+(?::\d{1,5})?\s*(?:,\s*https?:\/\/[^\s,/:*]+(?::\d{1,5})?\s*)*$/;
 
 /**
+ * An AWS region, as used by `AWS_REGION` and inside a KMS key ARN: `eu-west-1`,
+ * `us-east-1`, `ap-southeast-2`.
+ *
+ * Only the shape. Whether the region exists, and whether the key lives in it, is what
+ * the boot probe asks KMS (`KmsKeyWrapper.onModuleInit`). The shape is still worth
+ * checking, because a blank or mistyped region is otherwise silent: the SDK falls back
+ * to a default of its own, and a key in another region then comes back as
+ * `NotFoundException` - which reads like a deleted key rather than a region mistake.
+ */
+const AWS_REGION_PATTERN = /^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/;
+
+/**
+ * A KMS key reference, in the three forms AWS accepts - and therefore the three this
+ * app has to accept, since any of them can come from a real deployment:
+ *
+ * - a key ARN - `arn:aws:kms:eu-west-1:123456789012:key/<uuid>`
+ * - an alias - `alias/cashping-seeds` (or the full `arn:...:alias/...` form)
+ * - a bare key id - `1234abcd-12ab-34cd-56ef-1234567890ab`
+ *
+ * The ARN's region is deliberately *not* compared to `AWS_REGION` here: the schema
+ * checks one variable at a time, and the comparison belongs where it can also say which
+ * region the key actually resolved to - the boot probe, which has KMS's own answer.
+ */
+const AWS_KMS_KEY_ID_PATTERN =
+  /^(?:arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:(?:key\/[0-9a-fA-F-]{36}|alias\/[A-Za-z0-9/_-]+)|alias\/[A-Za-z0-9/_-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
+
+/**
  * Validates a phone-number region against the metadata `libphonenumber-js`
  * actually ships, rather than against the shape of a country code.
  *
@@ -226,6 +253,18 @@ export class EnvironmentVariables {
   SENTRY_ENVIRONMENT?: string;
 
   // --- AWS / KMS -----------------------------------------------------------
+  /**
+   * Region the SDK signs for, and the region the key has to live in.
+   *
+   * KMS keys are regional, so this is not only a routing detail: a key from another region
+   * is invisible from here, and AWS reports that as `NotFoundException` - no hint that the
+   * region is the problem. The boot probe is what compares the two for real; this is the
+   * half that stops a blank or mistyped region from silently becoming a default of the
+   * SDK's choosing.
+   */
+  @Matches(AWS_REGION_PATTERN, {
+    message: 'AWS_REGION must be an AWS region such as eu-west-1',
+  })
   @IsNotEmpty()
   AWS_REGION!: string;
 
@@ -235,8 +274,51 @@ export class EnvironmentVariables {
   @IsNotEmpty()
   AWS_SECRET_ACCESS_KEY!: string;
 
+  /**
+   * The KMS master key that wraps per-account data keys (Step 18).
+   *
+   * Required, and required to *look* like a key reference: every account's seed is
+   * encrypted under it, so an empty or obviously-placeholder value is a custody failure
+   * waiting for the first registration rather than a missing nicety.
+   *
+   * A placeholder that is *shaped* like a real ARN still boots - nothing here can tell it
+   * apart from a real key - and then fails closed at the boot probe and at the first
+   * custody call. That is deliberate: `docker-compose.yml` runs the API with a
+   * shape-valid placeholder so the stack starts without AWS credentials, and the
+   * consequence is a loud log line rather than a silently unusable wallet.
+   */
+  @Matches(AWS_KMS_KEY_ID_PATTERN, {
+    message:
+      'AWS_KMS_KEY_ID must be a KMS key ARN, a key id or an alias (for example arn:aws:kms:eu-west-1:123456789012:key/...)',
+  })
   @IsNotEmpty()
   AWS_KMS_KEY_ID!: string;
+
+  /**
+   * [optional] A non-AWS KMS endpoint (Step 18).
+   *
+   * Unset in every normal deployment: the SDK then uses the regional endpoint it derives
+   * from `AWS_REGION`. Set, it redirects every KMS call to that address, which is how a
+   * local emulator stands in for AWS - LocalStack publishes KMS on
+   * `http://localhost:4566`, and the same variable is what the opt-in custody
+   * integration spec points at.
+   *
+   * Two constraints, both from how the value is used rather than from taste:
+   *
+   * - blank is not a value, exactly as for `STELLAR_HORIZON_FALLBACK_URL`. A variable
+   *   that was typed and never filled in is a mistake worth naming at boot.
+   * - `require_protocol`, because the SDK parses this into a URL: a bare host would boot
+   *   and then fail at the first KMS call.
+   * - `require_tld: false`, unlike the Horizon URL: the thing this variable exists for is
+   *   an emulator, and an emulator is reached at `localhost`, `127.0.0.1` or
+   *   `host.docker.internal` - none of which has a top-level domain to require.
+   *
+   * The fourth constraint is not expressible in a decorator: `validate` refuses this
+   * variable outright when `NODE_ENV=production`.
+   */
+  @IsOptional()
+  @IsUrl({ require_protocol: true, require_tld: false })
+  AWS_ENDPOINT_URL?: string;
 
   // --- Stellar -------------------------------------------------------------
   @IsEnum(StellarNetwork)
@@ -295,6 +377,42 @@ export function formatValidationErrors(errors: ValidationError[]): string {
 }
 
 /**
+ * Refuses `AWS_ENDPOINT_URL` in production (Step 18).
+ *
+ * A cross-variable rule has nowhere to live in a per-property decorator, and this one has
+ * to fail at boot: the variable exists so a developer can point KMS at a local emulator,
+ * and in production the same value would send every wrap and unwrap to an endpoint
+ * outside AWS while `AWS_KMS_KEY_ID` still names an AWS key. Seeds would be encrypted
+ * under a master key that is not the one the configuration claims - a custody failure
+ * that no amount of well-formed key-id syntax would reveal.
+ *
+ * `NODE_ENV` is compared as the raw string rather than the validated enum, because this
+ * runs before validation: it has to fire on exactly the value the operator wrote.
+ */
+function assertEndpointIsNotSelectedForProduction(candidate: Record<string, unknown>): void {
+  const endpoint = candidate['AWS_ENDPOINT_URL'];
+
+  if (typeof endpoint !== 'string' || endpoint.trim() === '') {
+    return;
+  }
+
+  if (candidate['NODE_ENV'] !== NodeEnvironment.Production) {
+    return;
+  }
+
+  throw new Error(
+    [
+      'Invalid environment configuration - the API refused to start.',
+      'Fix the following in your .env (see .env.example):',
+      '  - AWS_ENDPOINT_URL is set while NODE_ENV=production.',
+      '    It exists to point KMS at a local emulator in development. In production it would',
+      '    send every key-custody call to that endpoint while AWS_KMS_KEY_ID still names an',
+      '    AWS key. Unset it - or fix NODE_ENV, if this process is not production.',
+    ].join('\n'),
+  );
+}
+
+/**
  * `ConfigModule.forRoot({ validate })` hook.
  *
  * Runs before the app boots: coerces numeric values, then enforces the schema.
@@ -319,6 +437,10 @@ export function validate(config: Record<string, unknown>): EnvironmentVariables 
       candidate[key] = BOOLEAN_LITERALS[raw.trim().toLowerCase()] ?? raw;
     }
   }
+
+  // Before the schema runs, so this reports its own, more specific message rather than
+  // whatever `@IsUrl()` would say about the same value.
+  assertEndpointIsNotSelectedForProduction(candidate);
 
   const validated = plainToInstance(EnvironmentVariables, candidate);
   const errors = validateSync(validated, {
