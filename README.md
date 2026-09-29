@@ -329,7 +329,7 @@ AWS_ENDPOINT_URL=http://localhost:5055 AWS_KMS_KEY_ID=<an arn in that endpoint> 
 
 ## Known gaps
 
-Recorded rather than fixed, so that they stay decisions instead of surprises. Neither one
+Recorded rather than fixed, so that they stay decisions instead of surprises. None of them
 blocks a step in `docs/build-sequence.md`.
 
 - **`test/auth.e2e-spec.ts` leaves user rows behind when a run is killed.** Its cleanup is
@@ -351,6 +351,83 @@ blocks a step in `docs/build-sequence.md`.
   formatting in CI (`.github/workflows/ci.yml` runs lint, test and build), so this is a
   convention gap rather than a broken build. It is deliberately left out of Step 19's
   commits, so that "the files Step 19 touched are formatted" stays a statement about Step 19.
+- **Nothing retries Stellar provisioning automatically - but a half-provisioned account is now
+  completed by calling the service again.** `AccountProvisioningService.provisionFor` still has
+  exactly one caller in `src` - `AuthService.verifyOtp` (`src/identity/auth.service.ts:404`) - and
+  there is no scheduler and no queue behind it: neither `@nestjs/schedule` nor a job library is in
+  `dependencies`, and the only `setTimeout` calls in `src` are the provisioning deadline and the
+  Stellar SDK's transaction timeout. So a verify that comes back `incomplete` (a friendbot `429` or
+  `5xx`, a Horizon `5xx`, or the 30s deadline) is still the last *automatic* attempt that user's
+  wallet gets: the way back cannot be a second verify, because the OTP row is spent by then, and
+  `/v1/wallet/account` and `/v1/wallet/balance` are reads that throw `NotFoundException` instead
+  of provisioning (`src/wallet/balances/balances.service.ts:133-149`), so nothing a client can
+  call reaches `provisionFor` again.
+  What changed (2026-09-29) is that the retry path those docstrings promised now exists *and
+  works*. `provision` no longer answers from the row: a user who already has a `stellar_accounts`
+  row goes through `outstandingFor`
+  (`src/wallet/provisioning/account-provisioning.service.ts:440`), which asks Horizon once
+  (`StellarService.loadBalances`) what is still missing. A load that resolves *is* the account
+  existing on the ledger, and `UsdcTrustlineService.isUsdcLine`
+  (`src/wallet/provisioning/usdc-trustline.ts:194`) is whether one of the lines that came back is
+  this deployment's USDC - code *and* issuer, never the code alone. Only what is missing is then
+  done: funding is skipped when the account already exists (`ALREADY_FUNDED`, `:550`, so no second
+  starting balance from the endpoint that pays repeats), and `ensureFor` runs only when the
+  trustline is absent - which is why a repeat call for a finished account still submits nothing at
+  all. `already-provisioned` is now Horizon's answer rather than the row's (`:351-362`), and
+  resuming uses the *stored* row: the key that was already sealed is the one funded and signed
+  for, never a second keypair. The docstrings were corrected with the code - the one that claimed a
+  queue consumer as a retry path (`:166-169` before this change) now states what is true (an
+  operator's script) and names what is still missing.
+  That closes what this note used to record: an account that was stored but never funded, or
+  funded but never trusted, was reported as done by every later call and could not be finished by
+  anyone, however many times the service was called - while the two layers that *were* built to be
+  safe to repeat (friendbot tolerating "already funded", `friendbot-funder.ts:162-184`;
+  `changeTrust` being a no-op at the ledger level, `usdc-trustline.ts:96-104`) were never reached
+  for such a row. The spec that used to assert the short-circuit
+  (`account-provisioning.service.spec.ts:427`, "a user who already has an account as
+  already-provisioned, and funds nothing", 24/24 passing) now asserts the same outcome for the
+  reason that makes it honest - a *finished* account, as Horizon reports it - and the resumption
+  block below it (`:618`) covers the half-provisioned ones: "completes an account that was stored
+  but never funded", "gives a funded account the USDC trustline it is missing, without asking the
+  funder again", "does not take a USDC line from another issuer for the trustline this app
+  establishes", and "provisions nothing on the strength of a lookup Horizon did not answer". That
+  is 29 tests in the file, was 24. The live run re-ran green end to end - 3/3, including
+  `test/provisioning.e2e-spec.ts:356`, which seals a real row through KMS, confirms Horizon has
+  never seen that key, and then completes it on Testnet (`funded 4769c489…`, `trustline
+  3b04d58f…`) - and the repeat-call invariant still holds against the chain: `funder_calls=1`,
+  sequence unchanged, one USDC trustline. The `stage` such a failure reports is logged (`warn`
+  for the retryable failures, `error` for the ones needing a human) but not stored -
+  `stellar_accounts`
+  has no status column - so after a restart the only trace is a log line.
+  **What is still open is the caller, not the flow.** Nothing invokes `provisionFor` on its own,
+  and the deadline is still not what strands a user: `withDeadline` rejects the caller but
+  deliberately does not cancel the work it stops waiting for, so a slow-but-eventually-successful
+  provisioning completes in the background and only the *report* is lost. The attempt that no later
+  call can rescue is the one that fails *after* its deadline was reported - the work carried on in
+  the background, then failed, and its outcome was dropped - and nothing sweeps for it. Closing
+  that needs a sweep that reprovisions rows whose account is unfunded or has no USDC trustline, or
+  a queue to run the flow again; neither exists, so recovery from that one case is still manual.
+  Found by reading the paths rather than by a failure being observed (2026-09-29): the
+  verification run that day provisioned fully on the first attempt.
+- **The development KMS is an in-memory emulator, so the keys wallets are sealed under do not
+  outlive it.** Custody calls go to `motoserver/moto:5.2.3` (container `cashping-kms-moto`),
+  started by hand with `docker run`, and `docker inspect` shows why it cannot be relied on: an
+  empty `Mounts` list, a default entrypoint (`/usr/local/bin/moto_server -H 0.0.0.0`, no
+  persistence flag), and no `MOTO_*` variable in its environment - so the master key lives in that
+  container's memory, under Moto's default account id (`123456789012`). The endpoint and key
+  come from the launching shell, as the wallet integration test's docblock describes:
+  `AWS_ENDPOINT_URL=http://localhost:5055` and
+  `AWS_KMS_KEY_ID=arn:aws:kms:eu-west-1:123456789012:key/5b58f5b1-fbc7-480f-8de8-dbf86825341a` -
+  not from `.env`, whose `AWS_ENDPOINT_URL` is commented out and whose `AWS_KMS_KEY_ID` is the
+  all-zero placeholder. A restart, a `docker rm`, or a rebuilt container loses the key, and with
+  it the ability to open any envelope sealed against it: the `stellar_accounts` row survives and
+  the Testnet account survives, but nothing can sign for that wallet any more. Accepted rather
+  than fixed (2026-09-29) - development should not need real AWS credentials, and the round trip
+  is exercised for real either way, since a Testnet `changeTrust` signed through this emulator was
+  accepted for account `GBTISMWS76ZFPUT3ACDW4LIQKQU4FCRVRVSWDTTLHOEJSAGNYYFVPU5E`. Anything that
+  has to outlive the container needs a real KMS, or an emulator configured to persist its state -
+  not the container as it is run here. See also [Pointing KMS at a local
+  emulator](#pointing-kms-at-a-local-emulator).
 
 ## Deployment
 

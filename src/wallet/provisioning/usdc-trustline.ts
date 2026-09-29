@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Asset, Operation } from '@stellar/stellar-sdk';
 import { SeedCustodyService, type SealedAccountRow } from '../custody/seed-custody.service.js';
+import type { StellarBalanceLine } from '../stellar/account-source.js';
 import { StellarService } from '../stellar/stellar.service.js';
 import type { SubmittedTransaction } from '../stellar/transaction-submitter.js';
 
@@ -100,8 +101,14 @@ export interface TrustlineAccountRow extends SealedAccountRow {
  * create-if-absent, it is a set-the-limit operation, and setting the same limit twice
  * is a no-op at the ledger level. That is what makes provisioning retryable: an
  * account that got as far as being funded but not trusted can be re-provisioned
- * without a "does it already have one?" check first, and without a balance read that
- * would need a port Step 20 has not built yet.
+ * without a "does it already have one?" check first.
+ *
+ * This class still submits without asking - the ledger accepts the repeat either way, so
+ * the check is not required *here*. A caller that has a reason to ask anyway can:
+ * `isUsdcLine` answers "is this line already my trustline" from the same
+ * `StellarService.loadBalances` port Step 20 built, and `AccountProvisioningService` uses
+ * it to decide whether a half-provisioned account still needs this transaction at all
+ * rather than buying a submission the ledger will ignore.
  *
  * ## Signing happens inside the account's lock
  *
@@ -167,6 +174,27 @@ export class UsdcTrustlineService {
    */
   assetIdentity(): UsdcAssetIdentity {
     return { code: USDC_ASSET_CODE, issuer: this.issuer };
+  }
+
+  /**
+   * Whether one of Horizon's balance lines *is* the USDC trustline this app establishes.
+   *
+   * The comparison is the asset identity - code *and* issuer - never the code alone:
+   * `USDC:GBBD…` and `USDC:GDHU…` are two different assets that happen to share a code
+   * (the reason `UsdcAssetIdentity` exists), so a line matched on the code would read as
+   * "this account can receive USDC" when it in fact trusts somebody else's. Answering
+   * from `assetIdentity()` rather than restating `USDC` here is also what keeps this
+   * answer identical to `BalancesService`'s, which builds its USDC line from the same
+   * method (Step 20's spec pins that it is not a literal there).
+   *
+   * Takes a line rather than an account because the caller already has the lines: they
+   * arrive with the account load, so this is a comparison with no round trip of its own to
+   * hide - and no way to report a trustline from a response that was never fetched.
+   */
+  isUsdcLine(line: StellarBalanceLine): boolean {
+    const { code, issuer } = this.assetIdentity();
+
+    return line.asset_code === code && line.asset_issuer === issuer;
   }
 
   /**

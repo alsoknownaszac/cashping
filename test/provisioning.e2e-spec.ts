@@ -69,11 +69,12 @@ import { StellarService } from './../src/wallet/stellar/stellar.service.js';
  *
  * ## What it leaves behind
  *
- * One `users` row and one `stellar_accounts` row, both deleted again in `afterAll` (the
- * account row first: the relation is `onDelete: Restrict`, deliberately). The Testnet
- * account itself cannot be deleted - it stays on the ledger, funded and trusting USDC,
- * with a seed nobody holds. That is a Testnet-only cost, and it is why this file
- * provisions exactly one account per run.
+ * Two `users` rows and two `stellar_accounts` rows, both deleted again in `afterAll` (the
+ * account rows first: the relation is `onDelete: Restrict`, deliberately). The Testnet
+ * accounts themselves cannot be deleted - they stay on the ledger, funded and trusting USDC,
+ * with a seed nobody holds. That is a Testnet-only cost, and it is why this file provisions
+ * exactly two accounts per run: the one the checklist describes, and the stored-but-never-
+ * funded one the resumption test manufactures and completes.
  */
 
 const ENABLED = process.env['RUN_STELLAR_IT'] === '1';
@@ -166,6 +167,14 @@ interface Harness {
   readonly prisma: PrismaService;
   readonly funder: RecordingFunder;
   readonly userId: string;
+  /**
+   * Every user this run wrote, so `afterAll` deletes all of them.
+   *
+   * A list rather than just `userId`, because the resumption test writes its own user: a
+   * stored-but-never-funded account is manufactured the only way the schema allows - a real
+   * sealed row for a real user, with no funding transaction.
+   */
+  readonly created: string[];
   readonly close: () => Promise<void>;
 }
 
@@ -199,6 +208,7 @@ async function harness(): Promise<Harness> {
   return {
     provisioning: new AccountProvisioningService(
       prisma,
+      stellar,
       custody,
       new UsdcTrustlineService(stellar, custody, config),
       funder,
@@ -208,6 +218,7 @@ async function harness(): Promise<Harness> {
     prisma,
     funder,
     userId: user.id,
+    created: [user.id],
     close: () => prisma.$disconnect(),
   };
 }
@@ -242,10 +253,14 @@ describe.skipIf(!ENABLED)('provisioning against Testnet (e2e, live)', () => {
   });
 
   afterAll(async () => {
-    // The account row first: `onDelete: Restrict` refuses to delete the user until it is
+    // The account rows first: `onDelete: Restrict` refuses to delete the user until they are
     // gone, which is the schema insisting a funded Stellar account is not deleted casually.
-    await app.prisma.stellarAccount.deleteMany({ where: { userId: app.userId } });
-    await app.prisma.user.deleteMany({ where: { id: app.userId } });
+    // Every user this run created, not only the first: the resumption test writes one too.
+    for (const userId of app.created) {
+      await app.prisma.stellarAccount.deleteMany({ where: { userId } });
+      await app.prisma.user.deleteMany({ where: { id: userId } });
+    }
+
     await app.close();
   });
 
@@ -323,7 +338,9 @@ describe.skipIf(!ENABLED)('provisioning against Testnet (e2e, live)', () => {
     // And nothing was submitted for the account at all. A Stellar account's sequence
     // number only moves when a transaction for it lands, so an unchanged one is the
     // network's own statement that the second attempt sent nothing - no second
-    // `changeTrust`, and no funding transaction.
+    // `changeTrust`, and no funding transaction. This is the invariant the resumption path
+    // had to keep: the second call now *does* read Horizon, and what stops it submitting a
+    // redundant `changeTrust` is the USDC line in that answer rather than the row.
     const after = await horizonAccount(publicKey);
     expect(after.sequence).toBe(before.sequence);
     // Still exactly one trustline, not two: an `ensureFor` that ran again would leave
@@ -335,4 +352,70 @@ describe.skipIf(!ENABLED)('provisioning against Testnet (e2e, live)', () => {
         `sequence=${after.sequence} (unchanged) usdc_trustlines=${after.balances.length - 1}`,
     );
   }, 60_000);
+
+  it('completes an account that was stored but never funded, rather than reporting it as done', async () => {
+    // The stranded state, manufactured the only way the schema allows: a real sealed row for
+    // a real user, with no funding transaction. It is reachable in production by exactly the
+    // order this flow is built in - seal and store first, then spend - and then a funder that
+    // refuses. The seed is sealed through KMS here, so the account is fully signable and
+    // nothing in this test is a stub.
+    const user = await app.prisma.user.create({
+      data: {
+        phoneNumber: `+2332${String(randomInt(0, 100_000_000)).padStart(8, '0')}`,
+        phoneVerifiedAt: new Date(),
+        status: 'ACTIVE',
+      },
+      select: { id: true },
+    });
+    app.created.push(user.id);
+
+    const sealed = await app.custody.createSealedAccount();
+    await app.prisma.stellarAccount.create({
+      data: {
+        id: sealed.accountId,
+        userId: user.id,
+        publicKey: sealed.publicKey,
+        encryptedSecretKey: sealed.encryptedSecretKey,
+        dataKeyArn: sealed.dataKeyArn,
+      },
+      select: { id: true },
+    });
+
+    // Horizon has never heard of it, which is the state the row claims is not the case.
+    await expect(horizonAccount(sealed.publicKey)).rejects.toThrow(/HTTP 404/);
+
+    const outcome: ProvisioningOutcome = await app.provisioning.provisionFor(user.id);
+
+    // The gap, on the real network. Before this fix the row alone answered
+    // `already-provisioned`, so this account could never be funded or trusted by anyone,
+    // however many times the service was called.
+    expect(outcome).toMatchObject({ status: 'provisioned', publicKey: sealed.publicKey });
+
+    if (outcome.status !== 'provisioned') {
+      throw new Error(`resuming did not finish: ${JSON.stringify(outcome)}`);
+    }
+
+    // The funder ran for the *stored* key - the second account this run funded, and not the
+    // first one's key reused.
+    expect(app.funder.asked).toEqual([publicKey, sealed.publicKey]);
+
+    // And the network agrees, which is the only check that counts: funded, and
+    // trustline-active for this run's issuer.
+    const account = await horizonAccount(sealed.publicKey);
+    const native = account.balances.find((balance) => balance.asset_type === 'native');
+    const usdc = account.balances.find(
+      (balance) =>
+        balance.asset_code === 'USDC' &&
+        balance.asset_issuer === process.env['STELLAR_USDC_ISSUER'],
+    );
+
+    expect(Number(native?.balance)).toBeGreaterThan(0);
+    expect(usdc?.balance).toBe('0.0000000');
+
+    console.log(
+      `[step 19] resumed account=${sealed.publicKey} xlm=${native?.balance ?? '?'} ` +
+        `usdc_trustline=yes funding_tx=${outcome.fundingTransactionHash ?? '(funder named none)'} ` +
+        `trustline_tx=${outcome.trustlineTransactionHash}`,
+    );
+  }, 120_000);
 });

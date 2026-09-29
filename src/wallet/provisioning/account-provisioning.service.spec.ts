@@ -5,6 +5,12 @@ import { Prisma } from '../../generated/prisma/client.js';
 import type { PrismaService } from '../../prisma/prisma.service.js';
 import type { SealedAccount, SeedCustodyService } from '../custody/seed-custody.service.js';
 import {
+  StellarAccountNotFoundError,
+  StellarAccountSourceError,
+  type StellarBalanceLine,
+} from '../stellar/account-source.js';
+import type { StellarService } from '../stellar/stellar.service.js';
+import {
   StellarSubmissionUnavailableError,
   type SubmittedTransaction,
 } from '../stellar/transaction-submitter.js';
@@ -19,12 +25,12 @@ import {
   type ProvisioningOutcome,
   type ProvisioningStage,
 } from './account-provisioning.service.js';
-import type { TrustlineAccountRow, UsdcTrustlineService } from './usdc-trustline.js';
+import { UsdcTrustlineService, type TrustlineAccountRow } from './usdc-trustline.js';
 
 /**
  * The provisioning sequence, with every collaborator faked (Step 19).
  *
- * Three things are being checked, and they are the three the service's docstring promises:
+ * Four things are being checked, and they are the four the service's docstring promises:
  *
  * - **The order.** The row is written before the account is funded, and everything that
  *   spends money happens after the insert. The fakes share one `calls` log *because* of
@@ -35,6 +41,11 @@ import type { TrustlineAccountRow, UsdcTrustlineService } from './usdc-trustline
  *   because that is what tells an operator - and a retry - whether the account exists on
  *   the network yet. Anything that collapsed those into one "failed" would lose the only
  *   fact the caller can act on.
+ * - **The resumption.** A row that exists is the *start* of the work, not the end of it: the
+ *   branch below asks Horizon what is still missing, so an account that was stored but never
+ *   funded, or funded but never trusted, is completed by a later call instead of reported as
+ *   done. Those specs also pin the two limits of it - a *finished* account still costs no
+ *   funder request and no submission, and a Horizon that did not answer provisions nothing.
  * - **The never-throws contract.** `verifyOtp` calls this *after* committing the
  *   verification, so an exception here answers 500 to a user whose code is already spent.
  *   The specs below include the cases that are supposed to be unreachable (a read that
@@ -52,11 +63,30 @@ const PUBLIC_KEY = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
 const WINNER_PUBLIC_KEY = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 const DATA_KEY_ARN = 'arn:aws:kms:eu-west-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab';
 const ENVELOPE = 'cp-kms-1.eyJhY2NvdW50SWQiOiJhY2NvdW50LTEifQ.3f8b1c4d';
+/** The issuer this deployment's USDC comes from, as the trustline service reads it from config. */
+const USDC_ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+/** Funded and nothing else: the balance sheet of a *funded but untrusted* account. */
+const NATIVE_LINE: StellarBalanceLine = { asset_type: 'native', balance: '10000.0000000' };
+/** The line `UsdcTrustlineService.ensureFor` creates, as Horizon reports it. */
+const USDC_LINE: StellarBalanceLine = {
+  asset_type: 'credit_alphanum4',
+  asset_code: 'USDC',
+  asset_issuer: USDC_ISSUER,
+  balance: '0.0000000',
+  limit: '922337203685.4775807',
+  is_authorized: true,
+};
+/** The same code from a different issuer: a different asset, and not this account's trustline. */
+const OTHER_USDC_LINE: StellarBalanceLine = {
+  ...USDC_LINE,
+  asset_issuer: 'GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2',
+};
 /** The projection `provision` reads a user through. */
 interface FakeUserRow {
   id: string;
   phoneVerifiedAt: Date | null;
-  stellarAccount: { id: string; publicKey: string } | null;
+  /** The four columns the relation is selected through: a row that exists is *resumed*. */
+  stellarAccount: TrustlineAccountRow | null;
 }
 
 /** The columns the insert is given, and the columns a committed insert hands back. */
@@ -177,6 +207,34 @@ class FakeCustody {
 }
 
 /**
+ * The network, reduced to the one read provisioning makes of it.
+ *
+ * It defaults to Horizon's answer for a *finished* account - on the ledger, holding the USDC
+ * line this app establishes - because that is what a repeat call finds in production and it
+ * is what makes every spec about a stranded account say so explicitly. `lines` is set to
+ * `[NATIVE_LINE]` for the funded-but-untrusted half of the gap, and `failWith` to a
+ * `StellarAccountNotFoundError` for the stored-but-never-funded half.
+ */
+class FakeStellar {
+  lines: readonly StellarBalanceLine[] = [NATIVE_LINE, USDC_LINE];
+
+  /** Set to make the load fail: a `404` for a key the ledger has never seen. */
+  failWith: Error | null = null;
+
+  constructor(private readonly calls: string[]) {}
+
+  loadBalances = async (): Promise<readonly StellarBalanceLine[]> => {
+    this.calls.push('load-account');
+
+    if (this.failWith !== null) {
+      throw this.failWith;
+    }
+
+    return this.lines;
+  };
+}
+
+/**
  * The funder, recording which public key it was asked to fund.
  *
  * `hangs` is what makes the deadline testable. A funder that never answers is the one
@@ -228,7 +286,24 @@ class FakeTrustline {
   result: SubmittedTransaction = { hash: TRUSTLINE_HASH, ledger: 42_000_001 };
   failWith: Error | null = null;
 
-  constructor(private readonly calls: string[]) {}
+  constructor(
+    private readonly calls: string[],
+    /**
+     * A real `UsdcTrustlineService`, used for one method.
+     *
+     * The flow decides whether to repair a trustline by asking `isUsdcLine`, so a fake with
+     * its own opinion about the asset would make the specs below assert the fake's rule
+     * rather than the production one - and the rule is the money-adjacent half of this:
+     * matching on the code alone would call an account ready while it trusts somebody
+     * else's USDC. `ensureFor` stays faked, because the submission is not what these specs
+     * are about. The fakes handed to it as collaborators are never reached by a predicate.
+     */
+    assetRule: UsdcTrustlineService,
+  ) {
+    this.isUsdcLine = (line: StellarBalanceLine): boolean => assetRule.isUsdcLine(line);
+  }
+
+  readonly isUsdcLine: (line: StellarBalanceLine) => boolean;
 
   ensureFor = async (account: TrustlineAccountRow): Promise<SubmittedTransaction> => {
     this.calls.push('trustline');
@@ -247,6 +322,7 @@ interface Harness {
   /** The shared call log: the order *across* collaborators is the assertion. */
   calls: string[];
   prisma: FakePrisma;
+  stellar: FakeStellar;
   custody: FakeCustody;
   trustline: FakeTrustline;
   funder: FakeFunder;
@@ -254,32 +330,62 @@ interface Harness {
 }
 
 /**
- * The service with all four collaborators faked, wired the way `WalletModule` wires it:
+ * A `stellar_accounts` row as `provision` reads it, and as it hands it to `ensureFor`.
+ *
+ * The four columns, not the two a report needs: this is the row a *resumed* account is
+ * finished through, so the envelope and its ARN are part of what these specs are asserting.
+ */
+function existingRow(overrides: Partial<TrustlineAccountRow> = {}): TrustlineAccountRow {
+  return {
+    id: 'account-existing',
+    publicKey: WINNER_PUBLIC_KEY,
+    encryptedSecretKey: ENVELOPE,
+    dataKeyArn: DATA_KEY_ARN,
+    ...overrides,
+  };
+}
+
+/**
+ * The service with all five collaborators faked, wired the way `WalletModule` wires it:
  * the same arguments, in the same order, with the funder bound to the same token Nest
  * would inject.
  *
  * `timeoutMs` is the one config value the service reads, so it is the one thing the
  * harness is parameterised by - and the specs that care about the deadline drive it
- * through here rather than by waiting 30 seconds.
+ * through here rather than by waiting 30 seconds. The config fake answers by key, as
+ * `ConfigService` does, because the trustline rule below reads the *issuer* from the same
+ * object: a fake that returned the deadline for every key would leave that rule comparing
+ * against a number.
  */
 function createHarness(options: { timeoutMs?: number } = {}): Harness {
   const calls: string[] = [];
   const prisma = new FakePrisma(calls);
+  const stellar = new FakeStellar(calls);
   const custody = new FakeCustody(calls);
-  const trustline = new FakeTrustline(calls);
-  const funder = new FakeFunder(calls);
   const config = {
-    getOrThrow: (): number => options.timeoutMs ?? TIMEOUT_MS,
+    getOrThrow: (key: string): unknown =>
+      key === 'stellar.usdcIssuer' ? USDC_ISSUER : (options.timeoutMs ?? TIMEOUT_MS),
   } as unknown as ConfigService;
+  const trustline = new FakeTrustline(
+    calls,
+    new UsdcTrustlineService(
+      stellar as unknown as StellarService,
+      custody as unknown as SeedCustodyService,
+      config,
+    ),
+  );
+  const funder = new FakeFunder(calls);
 
   return {
     calls,
     prisma,
+    stellar,
     custody,
     trustline,
     funder,
     service: new AccountProvisioningService(
       prisma as unknown as PrismaService,
+      stellar as unknown as StellarService,
       custody as unknown as SeedCustodyService,
       trustline as unknown as UsdcTrustlineService,
       funder,
@@ -424,24 +530,30 @@ describe('AccountProvisioningService.provisionFor: the sequence', () => {
     ]);
   });
 
-  it('reports a user who already has an account as already-provisioned, and funds nothing', async () => {
+  it('reports an account that is already finished as already-provisioned, and funds nothing', async () => {
     const h = createHarness();
     h.prisma.userRow = {
       id: USER_ID,
       phoneVerifiedAt: VERIFIED_AT,
-      stellarAccount: { id: 'account-existing', publicKey: WINNER_PUBLIC_KEY },
+      stellarAccount: existingRow(),
     };
 
     const outcome = await h.service.provisionFor(USER_ID);
 
-    // The answer a repeat call is supposed to get: no key material was touched and no
-    // faucet was called to establish that the account is already there.
+    // The answer a repeat call is supposed to get - now Horizon's answer rather than the
+    // row's, which is the difference this file's resumption specs are about: no key
+    // material was touched, no faucet was called and nothing was submitted. `load-account`
+    // is the read that establishes it, and it is the price of telling this case apart from
+    // the one where a row is all that exists.
     expect(outcome).toEqual({
       status: 'already-provisioned',
       accountId: 'account-existing',
       publicKey: WINNER_PUBLIC_KEY,
     });
-    expect(h.calls).toEqual(['read-user']);
+    expect(h.calls).toEqual(['read-user', 'load-account']);
+    expect(h.funder.funded).toEqual([]);
+    expect(h.trustline.ensured).toEqual([]);
+    expect(h.prisma.inserts).toEqual([]);
   });
 
   it('refuses a user whose phone number is not verified, and creates nothing', async () => {
@@ -489,6 +601,133 @@ describe('AccountProvisioningService.provisionFor: the sequence', () => {
       trustlineTransactionHash: TRUSTLINE_HASH,
     });
     expect(h.trustline.ensured).toHaveLength(1);
+  });
+});
+
+/**
+ * The gap these specs close, and the two limits of closing it.
+ *
+ * `provision` used to answer `already-provisioned` as soon as a `stellar_accounts` row
+ * existed, *before* it looked at funding or the trustline - so an account that was stored but
+ * never funded, or funded but never trusted, was reported as done by every later call and
+ * stayed that way, while the two layers built to be repeated were never reached for that row.
+ * A row is now the *start* of an attempt: Horizon is asked what is still missing, and only
+ * that gets done.
+ */
+describe('AccountProvisioningService.provisionFor: resuming an account that already has a row', () => {
+  it('completes an account that was stored but never funded, instead of reporting it as done', async () => {
+    const h = createHarness();
+    h.prisma.userRow = {
+      id: USER_ID,
+      phoneVerifiedAt: VERIFIED_AT,
+      stellarAccount: existingRow(),
+    };
+    // Horizon's `404`: the row is ahead of the ledger, which is exactly the state a funding
+    // failure leaves behind, since the row is written before anything is spent.
+    h.stellar.failWith = new StellarAccountNotFoundError(WINNER_PUBLIC_KEY);
+
+    const outcome = await h.service.provisionFor(USER_ID);
+
+    // The gap: this used to be `already-provisioned`, naming an account that did not exist
+    // anywhere. It is now the full report of a finished one.
+    expect(outcome).toEqual({
+      status: 'provisioned',
+      accountId: 'account-existing',
+      publicKey: WINNER_PUBLIC_KEY,
+      funding: 'funded',
+      fundingTransactionHash: FUNDING_HASH,
+      trustlineTransactionHash: TRUSTLINE_HASH,
+    });
+    // Funded through the *existing* row: the key that was already sealed, never a second
+    // keypair - which is what makes this a resumption rather than a fresh attempt.
+    expect(h.funder.funded).toEqual([WINNER_PUBLIC_KEY]);
+    expect(h.trustline.ensured).toEqual([existingRow()]);
+    // No seal and no insert anywhere in the sequence: the row is reused, envelope and all.
+    expect(h.calls).toEqual(['read-user', 'load-account', 'fund', 'trustline']);
+  });
+
+  it('gives a funded account the USDC trustline it is missing, without asking the funder again', async () => {
+    const h = createHarness();
+    h.prisma.userRow = {
+      id: USER_ID,
+      phoneVerifiedAt: VERIFIED_AT,
+      stellarAccount: existingRow(),
+    };
+    // On the network with XLM and nothing else: the "funded but untrusted" half of the gap.
+    h.stellar.lines = [NATIVE_LINE];
+
+    const outcome = await h.service.provisionFor(USER_ID);
+
+    expect(outcome).toEqual({
+      status: 'provisioned',
+      accountId: 'account-existing',
+      publicKey: WINNER_PUBLIC_KEY,
+      funding: 'already-funded',
+      fundingTransactionHash: undefined,
+      trustlineTransactionHash: TRUSTLINE_HASH,
+    });
+    // The funder was not asked at all - a load that resolved *is* the account existing, so
+    // there is nothing to fund. On the endpoint that pays repeats, asking anyway would buy
+    // the starting balance a second time.
+    expect(h.funder.funded).toEqual([]);
+    expect(h.trustline.ensured).toEqual([existingRow()]);
+    expect(h.calls).toEqual(['read-user', 'load-account', 'trustline']);
+  });
+
+  it('does not take a USDC line from another issuer for the trustline this app establishes', async () => {
+    const h = createHarness();
+    h.prisma.userRow = {
+      id: USER_ID,
+      phoneVerifiedAt: VERIFIED_AT,
+      stellarAccount: existingRow(),
+    };
+    // `USDC:GDHU…` is a different asset from `USDC:GBBD…`, so this account still cannot
+    // receive *this* deployment's USDC and the repair has to happen. A rule matching on the
+    // code alone would report it ready and leave it as unusable as the untrusted case.
+    h.stellar.lines = [NATIVE_LINE, OTHER_USDC_LINE];
+
+    await h.service.provisionFor(USER_ID);
+
+    expect(h.trustline.ensured).toEqual([existingRow()]);
+  });
+
+  it('provisions nothing on the strength of a lookup Horizon did not answer', async () => {
+    const h = createHarness();
+    h.prisma.userRow = {
+      id: USER_ID,
+      phoneVerifiedAt: VERIFIED_AT,
+      stellarAccount: existingRow(),
+    };
+    h.stellar.failWith = new StellarAccountSourceError(WINNER_PUBLIC_KEY);
+
+    const { stage, detail } = incomplete(await h.service.provisionFor(USER_ID));
+
+    // Not funded and not submitted - and not called unfunded either: a Horizon that did not
+    // answer says *nothing* about the account, so the attempt stops with the one fact it has.
+    // `StellarAccountSourceError`'s own contract is never to provision on a failed lookup,
+    // and the stage is `funding` because the account's existence is the question that could
+    // not be settled. Logged as `warn`, because a repeat of this call is what fixes it.
+    expect(stage).toBe('funding');
+    expect(detail).toContain('could not load');
+    expect(h.calls).toEqual(['read-user', 'load-account']);
+    expect(h.funder.funded).toEqual([]);
+    expect(h.trustline.ensured).toEqual([]);
+    expect(logs.warn.join()).toContain('stage funding');
+  });
+
+  it('refuses a half-provisioned account whose number was never verified, without reading the network', async () => {
+    const h = createHarness();
+    h.prisma.userRow = { id: USER_ID, phoneVerifiedAt: null, stellarAccount: existingRow() };
+
+    const { stage, detail } = incomplete(await h.service.provisionFor(USER_ID));
+
+    // The guard runs *before* the row branch now, because that branch is the one that funds
+    // and signs for an account. `verifyOtp` writes the column before calling, so this state
+    // is unreachable from the app - and `calls` is the assertion with teeth: not even a read
+    // of the network happened for a user nobody has proven owns the number.
+    expect(stage).toBeUndefined();
+    expect(detail).toContain('not verified');
+    expect(h.calls).toEqual(['read-user']);
   });
 });
 
@@ -677,7 +916,7 @@ describe('AccountProvisioningService logging', () => {
     h.prisma.userRow = {
       id: USER_ID,
       phoneVerifiedAt: VERIFIED_AT,
-      stellarAccount: { id: 'account-existing', publicKey: WINNER_PUBLIC_KEY },
+      stellarAccount: existingRow(),
     };
 
     await h.service.provisionFor(USER_ID);
