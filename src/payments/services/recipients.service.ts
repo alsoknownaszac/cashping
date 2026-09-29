@@ -38,15 +38,35 @@ import {
 const SEARCH_COLUMNS = { id: true, handle: true, displayName: true } as const;
 
 /**
- * The columns the confirmation view may read: the same three, plus the one fact that decides
- * `verified`. Still no `phoneNumber`, still no key material, still nothing a screen showing "who
- * am I about to pay" has to have.
+ * The columns that decide whether an account can be paid, plus the one fact `verified` is
+ * derived from. Still no `phoneNumber`, still no key material, still nothing a screen showing
+ * "who am I about to pay" has to have.
  */
-const CONFIRMATION_COLUMNS = {
+const PAYABLE_COLUMNS = {
   id: true,
   handle: true,
   displayName: true,
   phoneVerifiedAt: true,
+} as const;
+
+/**
+ * What makes an id a *payable recipient*, in one place for the two readers of that question.
+ *
+ * `GET /v1/recipients/:id` (Step 22) confirms an id before the client asks for an amount, and
+ * `POST /v1/payments` (Step 25) is the write that spends the money - and both have to answer
+ * "may this account be paid" the same way, or a client can confirm somebody it cannot pay. The
+ * filter is stated rather than left as a habit in one query so that a change is a change to
+ * both paths.
+ *
+ * Both conditions, not just the status: `verified` on the confirmation response is derived
+ * from `phoneVerifiedAt`, and filtering on `ACTIVE` alone would offer a row that is active but
+ * unverified (reachable by a direct write, a half-finished verification, or a future admin
+ * action) as a payee with `verified: false`. An account with no confirmed phone number is not
+ * a payee.
+ */
+const PAYABLE_RECIPIENT_FILTER = {
+  status: UserStatus.ACTIVE,
+  phoneVerifiedAt: { not: null },
 } as const;
 
 /** One directory row, as either query selected it. */
@@ -56,8 +76,12 @@ interface RecipientRow {
   readonly displayName: string | null;
 }
 
-/** The confirmation row: a directory row plus the timestamp `verified` is derived from. */
-interface ConfirmedRecipientRow extends RecipientRow {
+/**
+ * A recipient a payment may be sent to: a directory row plus the timestamp `verified` is
+ * derived from. Exported because Step 25's creation path asks the same question through
+ * `assertPayableRecipient` and needs the row it answers with.
+ */
+export interface PayableRecipient extends RecipientRow {
   readonly phoneVerifiedAt: Date | null;
 }
 
@@ -184,9 +208,40 @@ export class RecipientsService {
   async confirm(callerId: string, id: string): Promise<RecipientConfirmationResponseDto> {
     await this.assertWithinLookupLimit(callerId);
 
-    const recipient: ConfirmedRecipientRow | null = await this.prisma.user.findFirst({
-      where: { id, status: UserStatus.ACTIVE },
-      select: CONFIRMATION_COLUMNS,
+    const recipient = await this.assertPayableRecipient(id);
+
+    return {
+      id: recipient.id,
+      handle: recipient.handle,
+      displayName: recipient.displayName,
+      // `!== null` rather than a truthy check: the column is a Date, and the explicit form is
+      // the one that cannot start lying if it ever holds something else. It is `true` on every
+      // response that gets here, because the filter above requires the timestamp - the
+      // comparison stays because it is the derivation, not a constant.
+      verified: recipient.phoneVerifiedAt !== null,
+    };
+  }
+
+  /**
+   * The account behind `id` if money may be sent to it, or a 404 - the one definition of
+   * "payable", shared with Step 25's creation path (`PaymentsService`).
+   *
+   * No allowance is spent here, deliberately: the lookup limit prices *sweeping the directory*
+   * (see `RecipientLookupRateLimiter`), and a payment's own recipient check is not a sweep - it
+   * is the second half of one confirmed payment, already paid for by the confirmation read.
+   * Charging it twice would cap a client at ten payments a minute for a reason that has nothing
+   * to do with payments.
+   *
+   * The 404 is the same sentence for an id that does not exist, an account that is suspended
+   * and an account that is unverified: they are one answer to the question this is asked ("may
+   * I pay this"), and telling them apart is what would make it a probe. `confirm` above and the
+   * payment path below both read that sentence from here, so the two cannot drift into two
+   * different accounts of the same refusal.
+   */
+  async assertPayableRecipient(id: string): Promise<PayableRecipient> {
+    const recipient: PayableRecipient | null = await this.prisma.user.findFirst({
+      where: { id, ...PAYABLE_RECIPIENT_FILTER },
+      select: PAYABLE_COLUMNS,
     });
 
     if (recipient === null) {
@@ -195,14 +250,7 @@ export class RecipientsService {
       );
     }
 
-    return {
-      id: recipient.id,
-      handle: recipient.handle,
-      displayName: recipient.displayName,
-      // `!== null` rather than a truthy check: the column is a Date, and the explicit form is
-      // the one that cannot start lying if it ever holds something else.
-      verified: recipient.phoneVerifiedAt !== null,
-    };
+    return recipient;
   }
 
   /** Reads `q`, or refuses it with the rule it broke. */

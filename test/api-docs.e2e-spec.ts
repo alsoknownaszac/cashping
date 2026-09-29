@@ -38,6 +38,18 @@ const PROTECTED_GET_PATHS = new Set([
 ]);
 
 /**
+ * The documented POSTs that carry `JwtAuthGuard`, and therefore answer 401 rather than the 400 an
+ * unguarded POST answers to the empty body this file sends.
+ *
+ * Same idea as the GET set above, with one consequence worth writing down: a guarded POST never
+ * reaches the validation pipe without a token, so "the body is refused" cannot be shown from a
+ * tokenless request. It is shown where it can be - `test/payments.e2e-spec.ts` sends a signed
+ * request carrying an undeclared field and asserts the 400 - and what this file keeps proving is
+ * the part it can: the route exists, and the guard is attached to it.
+ */
+const PROTECTED_POST_PATHS = new Set([`/${GLOBAL_PREFIX}/payments`]);
+
+/**
  * What the frontend engineer actually consumes, over real HTTP and wired exactly
  * the way `main.ts` wires it: the docs route, the document's coverage, CORS, and
  * the documented health shape.
@@ -100,6 +112,7 @@ describe('Frontend hand-off (e2e)', () => {
       `/${GLOBAL_PREFIX}/auth/register`,
       `/${GLOBAL_PREFIX}/auth/session`,
       HEALTH_PATH,
+      `/${GLOBAL_PREFIX}/payments`,
       `/${GLOBAL_PREFIX}/recipients/search`,
       `/${GLOBAL_PREFIX}/recipients/{id}`,
       `/${GLOBAL_PREFIX}/wallet/account`,
@@ -142,10 +155,12 @@ describe('Frontend hand-off (e2e)', () => {
             PROTECTED_GET_PATHS.has(path) ? 401 : 200,
           );
         } else {
-          // Routed, and the body is refused: what the global validation pipe is
-          // for, and proof it is wired into this app rather than only into
-          // `main.ts`.
-          expect(response.status, `${where} should reject an empty body`).toBe(400);
+          // Routed, and either the body is refused (what the global validation pipe is for, and
+          // proof it is wired into this app rather than only into `main.ts`) or the guard answers
+          // first because this route is protected.
+          expect(response.status, `${where} should answer`).toBe(
+            PROTECTED_POST_PATHS.has(path) ? 401 : 400,
+          );
         }
       }
     }

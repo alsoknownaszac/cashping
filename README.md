@@ -343,7 +343,7 @@ npm run lint:money   # node src/common/money/check-money-discipline.ts
 ```
 
 ```
-Money discipline: 121 files scanned, 0 violations
+Money discipline: 131 files scanned, 0 violations
 ```
 
 It exits non-zero, naming `file:line` and the reason, on each of four shapes:
@@ -374,24 +374,158 @@ private - and it has exactly two factories, because entry and exit are different
   body cannot carry anything else - plus `toStellarAmount()` for Day 4 and `isPositive()` for
   validation. That last one is `greaterThan(0)` and deliberately *not* decimal.js's own `isPositive()`,
   which is true for zero: the first version of this method had exactly that bug, and `amount.spec.ts`
-  pins `0`, `0.0000000` and `0.0000001` separately because of it. There is no arithmetic, and none is
-  needed yet: balances are read from Horizon as strings and compared as strings, and the overdraft
-  check will be `SELECT ... FOR UPDATE` (Step 25).
+  pins `0`, `0.0000000` and `0.0000001` separately because of it.
+- One subtraction and one comparison, added in Step 25 because the overdraft check is the first code
+  that needed arithmetic: `minus()` and `isAtLeast()`. `minus()` is computed at
+  `MONEY_ARITHMETIC_PRECISION` (40) on a *clone* of decimal.js rather than through `Decimal.set`,
+  which is global - 20 significant digits, the library default, is not enough for two 13-integer-digit
+  operands, and the spec asserts the 21-digit case that the default rounds. A negative *result* is
+  allowed and does not throw (`fromString` and `fromDatabase` still refuse a negative *amount*): an
+  over-committed wallet is a real state, and it is the comparison that turns it into a refusal.
 
 ```bash
-npm test                              # 69 tests: amount.spec.ts (49) + money-discipline.spec.ts (20)
-npm run test:e2e test/money.e2e-spec.ts   # 13 tests, against a real Postgres
+npm test                              # 78 tests: amount.spec.ts (58) + money-discipline.spec.ts (20)
+npm run test:e2e test/money.e2e-spec.ts   # 14 tests, against a real Postgres
 ```
 
 The e2e proves the round trip through the real database rather than through a mock: the column is
 asserted `numeric(20, 7)` from `information_schema`, `123456789012.1234567` survives create →
 store → display byte-for-byte, and the *same* value written to a `double precision` column in the
-same row comes back `123456789012.12346` - a digit gone, quietly. It creates and drops its own
-`money_round_trip_probe` table and touches no real table. It needs the compose database (`docker
-compose up -d postgres redis`), so it is local-only in the same way `auth.e2e-spec.ts` and
+same row comes back `123456789012.12346` - a digit gone, quietly. Since Step 25 it also reads
+`transactions.amount` out of `information_schema`, so the prescribed type is asserted on the table
+that really uses it and not only on a table this file made. It creates and drops its own
+`money_round_trip_probe` table and writes no row of any real table. It needs the compose database
+(`docker compose up -d postgres redis`), so it is local-only in the same way `auth.e2e-spec.ts` and
 `recipients.e2e-spec.ts` are - CI runs lint, the unit tests and the build, and no e2e suite at all.
 Unlike the `RUN_KMS_IT` and `RUN_STELLAR_IT` files it asks for no flag: a database is the only
 thing it needs, and a flag would only mean the round trip goes unproven by default.
+
+## Making a payment (Steps 24-25)
+
+`POST /v1/payments` **writes** a payment and reserves its amount; it does not send one yet. That is
+the honest split, and the `202 Accepted` says it: a `PENDING` `transactions` row exists, the money
+is spoken for, and Day 4's jobs (Steps 26-29) turn `PENDING` into a verdict from Stellar. The
+response carries the transaction id, which is what the client polls and what a support
+conversation can be keyed on.
+
+```bash
+curl -X POST http://localhost:3000/v1/payments \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H 'Content-Type: application/json' \
+  -d '{"recipientId":"0f8fad5b-d9cb-469f-a165-70867728950e","amount":"25.5"}'
+```
+
+The body has exactly two fields, and the amount is a **string**. `25.5` as a JSON number is refused,
+because the alternative is accepting whatever the client's formatter produced - which is how a
+seventh decimal disappears. A `total`, a `fee` or any other undeclared field is refused by the
+global `ValidationPipe` rather than ignored: a request built on "my client added it up" is not
+silently reinterpreted, and `test/payments.e2e-spec.ts` asserts that.
+
+### What fits is decided by the server, from two numbers
+
+```
+spendable = Horizon's USDC balance for the sender  -  the sender's in-flight payments
+```
+
+- The balance is read **from Horizon on every request** through `BalancesService` - the wallet's own
+  definition of what a wallet holds, not a second implementation inside payments. `Horizon silent`
+  is a 503 and `no trustline` is a 400, both of which are refusals rather than guesses: the one
+  answer this endpoint must never give is "we assumed zero".
+- In-flight means the sender's `PENDING` and `PROCESSING` transactions - money committed and not yet
+  debited on the network, which is exactly the part Horizon cannot see. `SUCCESSFUL` rows are *not*
+  subtracted (Horizon already reflects them) and `FAILED` ones never happened.
+- Not enough is a **409** whose message carries the spendable figure, because it is the sender's own
+  balance and the number a client renders as "you can send up to X". The state may change a minute
+  later, which is what makes it a conflict rather than a bad request.
+
+### Two payments at once cannot overdraw the wallet
+
+The check and the insert happen inside one `Prisma.$transaction`, and the first statement in it is
+the one deliberate **raw SQL** in this codebase:
+
+```sql
+SELECT "id" FROM "stellar_accounts" WHERE "user_id" = $1::uuid FOR UPDATE
+```
+
+Prisma exposes no row lock, and no transaction isolation Prisma can ask for stops two transactions
+from both reading the same balance and both inserting. A lock does: the second request waits on the
+sender's wallet row, and when it is let in, its `SUM` of in-flight amounts sees the first request's
+committed row. The lock is per *sender* - the wallet row is the thing whose spending decision has to
+be indivisible - so two people paying at once never wait for each other.
+
+Two things about it are deliberate, and worth knowing before changing this code:
+
+- **The Horizon read happens before the transaction opens, not inside it.** A network round trip is
+  not something to hold a row lock across: a slow Horizon would block every payment for that sender
+  for as long as it was slow. The read is a snapshot taken at the start of the request, which is
+  what it would be inside the lock too - Horizon was never part of this transaction.
+- **The in-flight `SUM` happens after the lock, inside the transaction.** That is the read the lock
+  exists to serialise, and it is a local index scan (`@@index([senderId, status])`).
+
+The proof is a forced race, and it is *mutation tested* the way Step 17's `AccountLock` was: five
+concurrent payments of 3 against a wallet of 10 must produce exactly three rows and 9 committed;
+delete `FOR UPDATE`, run it again, and five are accepted. Both runs are recorded in
+`docs/build-sequence.md`.
+
+### One key is one payment (Step 24)
+
+A client on a flaky connection retries, and a retry of a payment must not be a second payment. So
+the endpoint **requires** `Idempotency-Key` (8-255 characters), and the key is scoped to the route
+and the caller:
+
+| The request | What happens |
+| --- | --- |
+| first request with a key | claims the key, writes the transaction, stores its response |
+| same key, same body, after it finished | `202` with the *stored* body - the same transaction id - plus `Idempotency-Replayed: true`. No second row. |
+| same key, same body, while it is still running | `409` "already in flight". The honest answer is "not yet": inventing one would have the client act on a payment that may not exist. |
+| same key, **different** body | `400`. A key names a request, so replaying the first answer would tell the client a payment happened that it did not ask for. |
+| no key at all | `400`, refused before anything is written. |
+| the request it named was refused | the claim is released, so the client can fix the request and retry with the same key. |
+
+There are two layers, and they do different jobs. Redis (`idempotency:<route>:<userId>:<key>`,
+`SET ... NX` as the atomic claim, 24-hour TTL) is what makes the *answer* right - it is the only
+place the first response is remembered. The database is what makes the *row count* right:
+`@@unique([senderId, idempotencyKey])` on `transactions`. A claim that expired, a Redis flush, a
+second instance that never saw the key, or a bug in the interceptor all end at that constraint, and
+`PaymentsService` turns the violation into a 409 rather than a 500. The e2e asserts the row count,
+because one row is the guarantee and a replayed response is the convenience.
+
+Redis unreachable is a **503**. That is the same fail-closed decision `RecipientLookupRateLimiter`
+records, for a stronger reason: an unreadable lookup counter means an uncounted sweep, while an
+unreadable key means a payment whose duplicate cannot be detected.
+
+### Where the pieces live
+
+| File | What it is |
+| --- | --- |
+| `src/payments/controllers/payments.controller.ts` | `POST /v1/payments`: the guard, the interceptor, the documented statuses. No logic. |
+| `src/payments/services/payments.service.ts` | The four checks in order, the `$transaction`, the lock, the insert, and each failure's status. |
+| `src/common/interceptors/idempotency.interceptor.ts` | Step 24's policy: claim, replay, refuse, release. |
+| `src/common/interceptors/idempotency-store.ts` | `RedisIdempotencyStore` - the claim protocol, and the one place the Redis key's shape is decided. |
+| `src/payments/dto/create-payment.dto.ts` | Two fields, and the docblock that says why there is no `total`. |
+| `prisma/schema.prisma` (`Transaction`) | `amount Decimal @db.Decimal(20, 7)`, `@@unique([senderId, idempotencyKey])`, both relations `Restrict`. |
+
+`PaymentsService` asks `RecipientsService.assertPayableRecipient` who may be paid rather than
+repeating the query, so "unknown, unverified and suspended are one 404" holds on both paths; and
+that method deliberately spends no lookup allowance (the limit prices *sweeping the directory*, not
+the recipient half of one confirmed payment).
+
+### Running the proofs
+
+```bash
+npm test                                    # 629 tests (35 files); 41 of them are Steps 24-25
+npm run test:e2e test/payments.e2e-spec.ts  # 15 tests: real Postgres, real Redis, faked Horizon
+```
+
+The e2e substitutes three providers - `SMS_SENDER`, `AccountProvisioningService` and
+`StellarService` - and nothing else. `StellarService` is the Horizon seam: a funded Testnet wallet
+is not a fixture a test can create, and the whole point of the overdraft check is arithmetic against
+a *known* balance, so the network is faked and everything above it (the `stellar_accounts` row, the
+trustline decision, `readBalances`, the subtract-and-compare, the lock, the insert) runs for real.
+It creates its own accounts, writes their wallet rows, and deletes its transactions before its users
+(both relations are `ON DELETE RESTRICT`, so the database insists on that order).
+
 
 ## Known gaps
 
@@ -504,6 +638,45 @@ blocks a step in `docs/build-sequence.md`.
   has to outlive the container needs a real KMS, or an emulator configured to persist its state -
   not the container as it is run here. See also [Pointing KMS at a local
   emulator](#pointing-kms-at-a-local-emulator).
+
+- **A payment is created against a balance, and Horizon's balance is a snapshot read before the
+  lock.** `PaymentsService` reads the wallet's USDC from Horizon *outside* the transaction that
+  takes the row lock (holding a lock across a network round trip was the worse problem), so what the
+  overdraft check subtracts from is the balance as of the start of the request, plus the in-flight
+  sum read under the lock. Two consequences, both accepted: a sender whose money arrived a
+  millisecond ago is measured against the older number (they can retry, and the retry sees the new
+  one), and a `PROCESSING` payment whose submission actually landed but whose status has not been
+  updated yet is subtracted *and* already reflected in Horizon - so the sender is briefly charged
+  twice against their own balance. That second one is what Step 31's reconciliation is for: it
+  compares the internal ledger against Horizon and reports drift, which is the honest instrument for
+  "the two disagree" rather than a second cache of the truth.
+- **The idempotency claim is Redis, so a Redis outage stops payments even though the database alone
+  would have been enough.** Failing closed is deliberate (an unreadable key is a duplicate that
+  cannot be detected), but the cost is real: with Redis down, `POST /v1/payments` answers 503 for
+  everyone, while `@@unique([senderId, idempotencyKey])` could still have refused every genuine
+  duplicate. The mitigation if that ever matters is to make the Redis claim *advisory* - proceed
+  without it and let the unique index decide - which trades a replayable response (the client gets a
+  409 instead of the original transaction) for availability. Not done now: with one API instance and
+  a 24-hour claim, the outage is the more likely event by far.
+- **A lost claim degrades a retry from "here is your payment" to a 409.** If Redis loses the key
+  (flush, eviction, expiry, a deploy that never wrote it) and the client retries, the database
+  refuses the second insert and `PaymentsService` answers 409 with "this Idempotency-Key already
+  created a payment" - correct, but not the *original body*. The client can recover the payment by
+  listing its history, which does not exist yet: `GET /v1/payments` is Step 30. Until then that
+  message is the whole recovery path, which is why it names the key.
+- **Nothing caps a single payment's size.** `numeric(20, 7)` bounds it at 13 integer digits, and
+  `Amount.fromString` refuses anything wider with a 400 (a wider value reaches Postgres as
+  `numeric field overflow`, i.e. a 500 for a bad request), but there is no *product* limit - no
+  per-transaction maximum, no daily ceiling, no velocity rule. Step 25's text called the ceiling "its
+  product rule" and no rule was specified, so inventing one inside the money type would have hidden a
+  product decision in the code that every money path has to use. A real limit belongs with the
+  product owner, applied as its own check in `PaymentsService`.
+- **Paying yourself is refused, which is a product rule this step chose.** `recipientId === senderId`
+  is a 400 ("sending to your own account would move nothing"), while the confirmation endpoint still
+  allows confirming your own id, because that read is how the frontend answers "this one is you". The
+  asymmetry is deliberate: a read of yourself is not a payment. If self-transfers ever need to be
+  allowed (moving funds between two wallets a user owns), this is the check to revisit - and it will
+  need a story for what the history shows.
 
 ## Deployment
 

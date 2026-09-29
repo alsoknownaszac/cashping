@@ -98,6 +98,29 @@ export const RECIPIENT_LOOKUP_REQUESTS_PER_WINDOW = 20;
 export const RECIPIENT_LOOKUP_WINDOW_SECONDS = 60;
 
 /**
+ * Idempotency policy (Step 24).
+ *
+ * A constant rather than an environment variable, like the block above and for the same reason:
+ * how long a key remembers a payment is a product rule, and it belongs where a change to it
+ * shows up in review rather than in a `.env` nobody diffs.
+ *
+ * A day is chosen against what the number is *for*. The claim is what answers a retry with the
+ * original response, so it has to outlive every realistic retry: a client that lost its response
+ * retries in seconds, a client whose process crashed on a bad network retries when the user
+ * reopens the app, and the same user sending the same payment again *tomorrow* is not a retry -
+ * it is a new payment, and it should get a fresh key from the client (which is why the client
+ * generates one per payment attempt and not per screen). Making this shorter trades a rare
+ * duplicate risk for a rare missing-replay, and the price of the second is worse: without a
+ * stored response the duplicate is a 409, which the client cannot distinguish from "your payment
+ * failed" without a history endpoint.
+ *
+ * The TTL is also the *claim's* lifetime, not just the result's: a request that dies mid-flight
+ * stops blocking its key after this long, and the transaction table's unique index is what keeps
+ * that from becoming a second payment. See `RedisIdempotencyStore`.
+ */
+export const IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
+
+/**
  * Session policy (Step 16).
  *
  * The two lifetimes are a deliberate pair, and the split is what makes the JWT
@@ -362,6 +385,16 @@ export default function configuration() {
     recipients: {
       lookupRequestsPerWindow: RECIPIENT_LOOKUP_REQUESTS_PER_WINDOW,
       lookupWindowSeconds: RECIPIENT_LOOKUP_WINDOW_SECONDS,
+    },
+
+    /**
+     * Idempotency (Step 24): how long a payment's key answers for.
+     *
+     * See `IDEMPOTENCY_TTL_SECONDS` for why it is a day; the read is here rather than in the
+     * interceptor so that the value has the same route to a caller as every other tunable.
+     */
+    idempotency: {
+      ttlSeconds: IDEMPOTENCY_TTL_SECONDS,
     },
 
     /** Outbound SMS via Africa's Talking. */

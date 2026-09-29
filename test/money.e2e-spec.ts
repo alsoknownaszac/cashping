@@ -41,10 +41,12 @@ import { PrismaService } from './../src/prisma/prisma.service.js';
  *
  * ## What it leaves behind
  *
- * Nothing: the probe table is dropped in `afterAll`, and no row of any real table is read
- * or written. The table is created rather than an existing one borrowed because there is
- * no money column in the schema yet - the money rule is what will hold the first one
- * (Step 25's `Transaction.amount`) to this shape.
+ * Nothing of its own: the probe table is dropped in `afterAll`. The probe exists because this
+ * file needs two column types side by side - the prescribed one and a float - and no real table
+ * offers both. Since Step 25 there *is* a money column in the schema
+ * (`transactions.amount`, `Decimal @db.Decimal(20, 7)`), and the `describe` at the end reads it
+ * out of `information_schema` as well: the prescribed type is now also asserted where it is
+ * actually used, not only on a table this file made.
  */
 
 /** The probe table, dropped in `afterAll` whatever happens above. */
@@ -203,6 +205,31 @@ describe('the column the rule prescribes', () => {
       },
       { column_name: 'id', data_type: 'integer', numeric_precision: 32, numeric_scale: 0 },
     ]);
+  });
+
+  it('is the same shape where it is actually used: `transactions.amount`', async () => {
+    const columns = await prisma.$queryRawUnsafe<
+      Array<{ data_type: string; numeric_precision: number | null; numeric_scale: number | null }>
+    >(
+      [
+        'SELECT "data_type", "numeric_precision", "numeric_scale"',
+        'FROM information_schema.columns',
+        'WHERE "table_name" = $1 AND "column_name" = $2',
+      ].join('\n'),
+      'transactions',
+      'amount',
+    );
+
+    // The real column, read from the catalogue rather than from `schema.prisma`: the rule in
+    // `money-discipline.ts` checks the schema file's *text*, and this checks what the database was
+    // actually built with. A `Float` here would lose a digit at rest and no application code could
+    // tell, which is the whole argument for asserting the type in two places.
+    expect(columns).toEqual([{ data_type: 'numeric', numeric_precision: 20, numeric_scale: 7 }]);
+
+    // That the value in this column survives a real write is
+    // `test/payments.e2e-spec.ts`'s "round-trips a crafted 7-decimal amount" - asserted there
+    // because that is where the write path lives, and this file stays a read-only witness to the
+    // shape of the column.
   });
 
   it('holds thirteen integer digits, and refuses the fourteenth', async () => {

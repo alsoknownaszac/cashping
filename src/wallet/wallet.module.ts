@@ -81,8 +81,15 @@ import { WalletController } from './wallet.controller.js';
  * providers here. `StellarService` is deliberately *not* exported yet: nothing
  * outside this module injects it, and an export nothing imports is a guess about
  * the future rather than a boundary - the same reasoning `IdentityModule` records.
- * The export arrives with the first consumer outside this module, which is
- * `PaymentsModule` in Step 23.
+ * The export arrives with the first consumer outside this module, which is Step 27's
+ * submission job - a signed transaction needs the account lock and the network.
+ *
+ * Step 25 exports `BalancesService`, which is that boundary arriving for the *read*
+ * half instead: `PaymentsService` has to know what the sender's wallet holds before it
+ * may write a `PENDING` payment, and it asks the module that owns that question rather
+ * than reading `stellar_accounts` and Horizon itself. The alternative - a second "what
+ * does this wallet hold" implementation in `payments/` - would be a second place for
+ * Step 20's decisions (unfunded, no trustline, Horizon silent) to be got wrong.
  *
  * Step 20 adds the module's first `controllers` entry, and `BalancesService` beside it:
  *
@@ -123,6 +130,6 @@ import { WalletController } from './wallet.controller.js';
     BalancesService,
   ],
   // `verifyOtp` is the only consumer, and it is in `IdentityModule`.
-  exports: [AccountProvisioningService],
+  exports: [AccountProvisioningService, BalancesService],
 })
 export class WalletModule {}

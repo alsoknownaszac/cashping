@@ -73,6 +73,13 @@ export function createOpenApiDocument(app: INestApplication): OpenAPIObject {
         'GET /recipients/search turns a phone number or a handle into an account id, and GET /recipients/:id confirms that the id is the right person. Neither returns a phone number, and the search is rate-limited per caller.',
       ].join('\n'),
     )
+    .addTag(
+      'payments',
+      [
+        'Creating payments (Steps 24-25): POST /payments writes a PENDING transaction and reserves its amount against the sender, or refuses it. Nothing is submitted to Stellar yet - Day 4 does that (Steps 26-29).',
+        'It is idempotent, so it requires an `Idempotency-Key` header: reuse one per payment and every retry answers with the transaction the first request created.',
+      ].join('\n'),
+    )
     /**
      * The `Authorization: Bearer <token>` scheme, so the routes that need it show a
      * padlock and a "Try it out" that can actually be used (Step 16). `@ApiBearerAuth()`

@@ -55,9 +55,11 @@ model User {
   createdAt       DateTime   @default(now()) @map("created_at")
   updatedAt       DateTime   @updatedAt @map("updated_at")
 
-  otpVerifications OtpVerification[]
-  refreshTokens    RefreshToken[]
-  stellarAccount   StellarAccount?
+  otpVerifications     OtpVerification[]
+  refreshTokens        RefreshToken[]
+  stellarAccount       StellarAccount?
+  sentTransactions     Transaction[]     @relation("SentTransactions")
+  receivedTransactions Transaction[]     @relation("ReceivedTransactions")
 
   @@map("users")
 }
@@ -160,6 +162,95 @@ model StellarAccount {
   user User @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@map("stellar_accounts")
+}
+
+/// One payment, from creation to settlement (Step 25).
+///
+/// `amount` is the first money column in the schema, and its type is the point: the
+/// money rule (`src/common/money/money-discipline.ts`, importable as
+/// `npm run lint:money`) fails the build on a money-named column typed `Float`,
+/// `Real` or `DoublePrecision`, and `numeric(20, 7)` is what it prescribes. A float
+/// column would lose the 7th decimal *at rest*, where no later code could recover
+/// it - `test/money.e2e-spec.ts` writes the same crafted value to both and shows the
+/// float one coming back changed. `Decimal(20, 7)` is Stellar's own fixed point:
+/// seven decimals because a stroop is `0.0000001`, and twenty digits of width, which
+/// leaves thirteen integer digits - room for the largest balance the network can
+/// hold (`922337203685477.5807`, twelve integer digits) and every amount this API
+/// will ever write into it.
+///
+/// The write always hands Prisma a *string* (`Amount.toString()`), which Prisma
+/// parses to its own `Decimal` exactly - no JS `number` is involved in either
+/// direction.
+///
+/// `status` is `PENDING` for every row this step writes, and stays that way until
+/// Step 29's state machine moves it (see `TransactionStatus` for what the other
+/// three values are for).
+///
+/// `idempotencyKey` is the client's key for this payment, and
+/// `@@unique([senderId, idempotencyKey])` is what makes "one key, one payment" a
+/// property of the database rather than of the application. The Redis record the
+/// interceptor writes is the *fast* path - it is what lets a duplicate answer with
+/// the original response instead of a second transaction - and this index is the net
+/// under it: a lost or expired claim, a second API instance, a flush, a bug, and the
+/// database still refuses the second row. The key is scoped per sender (not global)
+/// because it is a client-generated nonce: two users may pick the same string, and
+/// nothing about one user's key should constrain another's.
+///
+/// Both relations are `Restrict`, following `StellarAccount`'s reasoning: deleting a
+/// user must not silently destroy payment history, so a user with transactions
+/// cannot be deleted until those rows are dealt with deliberately. It also means a
+/// test that registers senders has to delete its transactions *first*, which is the
+/// honest order.
+///
+/// The columns Step 27-29 add - the submitted transaction's hash, the failure reason,
+/// the poll timestamps - are deliberately absent: each arrives with the step that
+/// writes it, the same way every other model here grew.
+model Transaction {
+  id             String            @id @default(uuid()) @db.Uuid
+  senderId       String            @map("sender_id") @db.Uuid
+  recipientId    String            @map("recipient_id") @db.Uuid
+  /// The money, as `numeric(20, 7)`: 13 integer digits - see this model's docblock.
+  amount         Decimal           @db.Decimal(20, 7)
+  status         TransactionStatus @default(PENDING)
+  /// The client's `Idempotency-Key` for this payment, unique per sender.
+  idempotencyKey String            @map("idempotency_key")
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  sender    User @relation("SentTransactions", fields: [senderId], references: [id], onDelete: Restrict)
+  recipient User @relation("ReceivedTransactions", fields: [recipientId], references: [id], onDelete: Restrict)
+
+  /// One key, one payment: the structural half of Step 24's guarantee. See the
+  /// docblock above - the Redis record is the fast path, this constraint is the net.
+  @@unique([senderId, idempotencyKey])
+  /// The overdraft check's index: "this sender's in-flight payments, summed".
+  @@index([senderId, status])
+  /// Step 30's history: one side of the list, newest first.
+  @@index([recipientId, createdAt])
+  @@map("transactions")
+}
+
+/// Where a payment is in its life (Steps 25 and 29).
+///
+/// Only `PENDING` is written today, and the value is named rather than numbered for
+/// the reason the money rule exists: a status that is a number is a status whose
+/// meaning a reader has to guess.
+///
+/// The other three are Day 4's, and they are declared here rather than in a later
+/// migration because they are the *shape* of this column, not a feature of it - the
+/// job that submits (Step 27) moves a row to `PROCESSING` and the job that polls
+/// (Step 28) resolves it to `SUCCESSFUL` or to `FAILED`, and Step 29 puts a guard
+/// around the transitions. Naming them now means Step 29's migration adds code, not
+/// a column type - and it costs nothing, because nothing can write them until then.
+enum TransactionStatus {
+  /// Created and reserved against the sender's balance; nothing has been submitted.
+  PENDING
+  /// Submitted (or in flight) at the network; the outcome is not known yet.
+  PROCESSING
+  /// Horizon confirmed the transaction is in a closed ledger.
+  SUCCESSFUL
+  /// The network rejected it, or it failed on-ledger. The reason is a later column.
+  FAILED
 }
 
 /// Account lifecycle.

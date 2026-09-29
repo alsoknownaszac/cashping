@@ -1,6 +1,11 @@
 import { Decimal } from 'decimal.js';
 import { describe, expect, it } from 'vitest';
-import { Amount, InvalidAmountError, MONEY_DECIMAL_PLACES } from './amount.js';
+import {
+  Amount,
+  InvalidAmountError,
+  MONEY_DECIMAL_PLACES,
+  MONEY_INTEGER_DIGITS,
+} from './amount.js';
 
 /**
  * Step 23's first half: the type an amount has to be while the API is handling it,
@@ -63,10 +68,11 @@ describe('fromString', () => {
     ['0.1', '0.1'],
     ['0.0000001', '0.0000001'],
     [BEYOND_A_DOUBLE, BEYOND_A_DOUBLE],
-    // No magnitude ceiling: the per-transaction limit is Step 25's rule and the
-    // column's precision bounds it at the database. A type that silently truncated
-    // here would be a product decision nobody chose.
-    ['9999999999999999999999', '9999999999999999999999'],
+    // Up to the column's own width, and no further: 13 integer digits with all 7
+    // decimals spent is the widest value `numeric(20, 7)` can hold, and a type that
+    // truncated here instead would be a product decision nobody chose. The bound is the
+    // storage layer's, not a per-transaction ceiling - see `MONEY_INTEGER_DIGITS`.
+    ['9999999999999.9999999', '9999999999999.9999999'],
   ];
 
   for (const [input, canonical] of ACCEPTED) {
@@ -134,6 +140,21 @@ describe('fromString', () => {
 
     expect(Amount.fromString(atTheLimit).toString()).toBe(atTheLimit);
     expect(rejectionFor(`${atTheLimit}0`)).toContain(`${MONEY_DECIMAL_PLACES + 1} decimal places`);
+  });
+
+  it('allows exactly MONEY_INTEGER_DIGITS integer digits, and not one more', () => {
+    // The column's width, and the one bound that is not a product decision: a wider
+    // value is refused by Postgres with `numeric field overflow`, which would reach a
+    // client as a 500 for a bad request. The end of the range is accepted with all
+    // seven decimals spent, so the check cannot be a truncation in disguise.
+    const widest = `${'9'.repeat(MONEY_INTEGER_DIGITS)}.${'9'.repeat(MONEY_DECIMAL_PLACES)}`;
+
+    expect(Amount.fromString(widest).toString()).toBe(widest);
+    expect(rejectionFor(`1${'0'.repeat(MONEY_INTEGER_DIGITS)}`)).toContain(
+      `${MONEY_INTEGER_DIGITS + 1} integer digits`,
+    );
+    // Padding is not width: this is `1.5`, and it is accepted as such.
+    expect(Amount.fromString('0001.50').toString()).toBe('1.5');
   });
 
   it('writes the smallest unit as a decimal, not as an exponent', () => {
@@ -244,6 +265,88 @@ describe('isPositive', () => {
     expect(new Decimal('0').isPos()).toBe(true);
     expect(new Decimal('0').greaterThan(0)).toBe(false);
     expect(Amount.fromString('0').isPositive()).toBe(false);
+  });
+});
+
+describe('minus', () => {
+  it('is exact for the ordinary case a float gets wrong', () => {
+    expect(0.3 - 0.2).not.toBe(0.1);
+    expect(Amount.fromString('0.3').minus(Amount.fromString('0.2')).toString()).toBe('0.1');
+    expect(Amount.fromString('1.0000000').minus(Amount.fromString('0.0000001')).toString()).toBe(
+      '0.9999999',
+    );
+  });
+
+  it('removes exactly the amount that was there, down to zero', () => {
+    const balance = Amount.fromString(BEYOND_A_DOUBLE);
+
+    expect(balance.minus(balance).toString()).toBe('0');
+    expect(balance.minus(Amount.fromString('0')).toString()).toBe(BEYOND_A_DOUBLE);
+    expect(balance.minus(Amount.fromString('0.0000001')).toString()).toBe('123456789012.1234566');
+  });
+
+  it('keeps 21 significant digits, which the library default would round away', () => {
+    // The widest result two `Amount`s can produce. It is not a payment this API can
+    // send (no column error, no client input) - it is the measurement that shows why
+    // MONEY_ARITHMETIC_PRECISION is not decimal.js's default of 20. A client's whole
+    // complaint about money bugs is "the number changed and nothing said so", so the
+    // default is asserted to *be* wrong here, next to the value this class produces.
+    const largest = Amount.fromString('9999999999999.9999999');
+    const doubled = '19999999999999.9999998';
+
+    expect(new Decimal('9999999999999.9999999').plus('9999999999999.9999999').toString()).not.toBe(
+      doubled,
+    );
+
+    // The same magnitude through this class, as `largest - (0 - largest)`: the
+    // subtraction can leave the range the column stores (see the next test), which is
+    // how the sum is reachable at all without a `plus`.
+    expect(largest.minus(Amount.fromString('0').minus(largest)).toString()).toBe(doubled);
+  });
+
+  it('can go negative, unlike the two factories, because an over-committed balance is real', () => {
+    // `fromString` refuses `-0.5` and `fromDatabase` refuses `-1.5000000`: a negative
+    // amount is not something a client may send or a column may store. A negative
+    // *result* is the state the overdraft check exists to detect, so it must be
+    // representable - and it must not throw on the way, or a raced payment would turn
+    // into a 500 instead of a refusal.
+    const debt = Amount.fromString('1').minus(Amount.fromString('1.5'));
+
+    expect(debt.toString()).toBe('-0.5');
+    expect(Amount.fromString('1').minus(Amount.fromString('2.5')).toString()).toBe('-1.5');
+  });
+});
+
+describe('isAtLeast', () => {
+  it('accepts spending exactly the balance, and one unit above it', () => {
+    const balance = Amount.fromString('10.0000000');
+
+    expect(balance.isAtLeast(Amount.fromString('10'))).toBe(true);
+    expect(balance.isAtLeast(Amount.fromString('9.9999999'))).toBe(true);
+  });
+
+  it('refuses one unit more, and a zero balance against a real payment', () => {
+    const balance = Amount.fromString('10.0000000');
+
+    expect(balance.isAtLeast(Amount.fromString('10.0000001'))).toBe(false);
+    expect(Amount.fromString('0').isAtLeast(Amount.fromString('0.0000001'))).toBe(false);
+    // Zero against zero is fine - nothing to spend is not an overdraft.
+    expect(Amount.fromString('0').isAtLeast(Amount.fromString('0.0000000'))).toBe(true);
+  });
+
+  it('compares by value, so two spellings of one amount agree', () => {
+    expect(Amount.fromString('1.50').isAtLeast(Amount.fromString('1.5'))).toBe(true);
+    expect(Amount.fromString('1.5').isAtLeast(Amount.fromString('1.50'))).toBe(true);
+    expect(Amount.fromString('007').isAtLeast(Amount.fromString('7.0'))).toBe(true);
+  });
+
+  it('cannot pass on a negative balance, however small the payment', () => {
+    // The whole point of the pair: `minus` may go below zero, and the comparison is
+    // what turns that into a refusal rather than a payment.
+    const overdrawn = Amount.fromString('1').minus(Amount.fromString('2'));
+
+    expect(overdrawn.isAtLeast(Amount.fromString('0'))).toBe(false);
+    expect(overdrawn.isAtLeast(Amount.fromString('0.0000001'))).toBe(false);
   });
 });
 

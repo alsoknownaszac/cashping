@@ -1,7 +1,12 @@
 import { Module } from '@nestjs/common';
+import { IdempotencyInterceptor } from '../common/interceptors/idempotency.interceptor.js';
+import { RedisIdempotencyStore } from '../common/interceptors/idempotency-store.js';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { RedisModule } from '../redis/redis.module.js';
+import { WalletModule } from '../wallet/wallet.module.js';
+import { PaymentsController } from './controllers/payments.controller.js';
 import { RecipientsController } from './controllers/recipients.controller.js';
+import { PaymentsService } from './services/payments.service.js';
 import { RecipientLookupRateLimiter } from './services/recipient-lookup-rate-limiter.service.js';
 import { RecipientsService } from './services/recipients.service.js';
 
@@ -32,11 +37,32 @@ import { RecipientsService } from './services/recipients.service.js';
  *
  * `StellarService` (the wallet's) is not imported yet, and its absence is the boundary still
  * holding: nothing in this module signs or submits anything until Step 27, which is the step
- * the build sequence says to propose before implementing.
+ * the build sequence says to propose before implementing. What *is* imported from the wallet is
+ * `BalancesService` (Step 25): a payment has to know what the sender's wallet holds, and the
+ * module that owns that question answers it - see `WalletModule`'s docstring.
+ *
+ * Steps 24 and 25 add the write side of this module: `PaymentsController`, `PaymentsService`,
+ * and the two idempotency providers - `IdempotencyInterceptor` (Step 24's policy) and
+ * `RedisIdempotencyStore` (its state). The two live in `src/common/interceptors/` because that
+ * is the path the build sequence names for the interceptor and because they are not
+ * payments-specific infrastructure (the submission endpoints in Steps 27-29 need the same
+ * guarantee), while being *provided* here is the honest statement of who uses them today: a
+ * provider in a module nothing else imports is a claim about a future consumer, and this pair
+ * gets promoted to its own module the day there is a second one.
+ *
+ * `RecipientsService` is injected by `PaymentsService` rather than duplicated: "may this id be
+ * paid" has one answer (`assertPayableRecipient`), and the payment path is the second reader of
+ * it - which is why that method exists without the lookup limit (see its docstring).
  */
 @Module({
-  imports: [PrismaModule, RedisModule],
-  controllers: [RecipientsController],
-  providers: [RecipientsService, RecipientLookupRateLimiter],
+  imports: [PrismaModule, RedisModule, WalletModule],
+  controllers: [RecipientsController, PaymentsController],
+  providers: [
+    RecipientsService,
+    RecipientLookupRateLimiter,
+    PaymentsService,
+    IdempotencyInterceptor,
+    RedisIdempotencyStore,
+  ],
 })
 export class PaymentsModule {}

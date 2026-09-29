@@ -31,20 +31,28 @@ import { Decimal } from 'decimal.js';
  * `toStellarAmount()` below is the one conversion *towards* minor units, and it
  * happens in one place.
  *
- * ## What is deliberately *not* here
+ * ## The arithmetic that *is* here, and why it is one operation wide
  *
- * Arithmetic. No `plus`, `minus`, `times`, and no `Decimal.set(...)`. `decimal.js`
- * defaults to 20 significant digits and half-up rounding, and neither of those has
- * been decided *for this product* yet; a rounding policy half-chosen now would be
- * baked in by the first operation that rounds. Everything this class does today -
- * parse, validate, format - is exact, so there is nothing to round. The first code
- * that needs money arithmetic (Day 4's fee and balance work) adds the operations
- * *and* the precision decision, together, where a reviewer can see both.
+ * Step 23 left arithmetic out on purpose, with a promise attached: the first code
+ * that needed it would add the operation *and* the precision decision together,
+ * where a reviewer can see both. Step 25 is that code - the overdraft check has to
+ * ask "is the sender's balance at least this payment plus everything already in
+ * flight for them?", and that needs exactly one subtraction and one comparison.
+ * Both are here now, and `MONEY_ARITHMETIC_PRECISION` below is the decision.
  *
- * The other thing not here is a maximum. The per-transaction ceiling is Step 25's
- * product rule, and the column's own precision bounds it at the database; deciding
- * it inside the type that Step 25 has to use would hide a product limit in the one
- * place nobody looks for it.
+ * What is still absent is every other operation. There is no `plus`, no `times`,
+ * no percentage and no allocation: a fee or a split would each need their own
+ * rounding rule (what happens to the half-stroop), and inventing them before there
+ * is a product reason would bake in a policy nobody chose. The comparison arrives
+ * with the subtraction because a number you cannot compare cannot be checked, and
+ * comparison needs no precision at all - `decimal.js` compares exactly.
+ *
+ * The other thing not here is a maximum. The per-transaction ceiling was left with
+ * Step 25 as "its product rule", and Step 25 deliberately did not add one: no
+ * product limit is specified anywhere, so the only ceiling is the column's own
+ * `numeric(20, 7)` (thirteen integer digits), applied by Postgres. Putting a guess
+ * at a limit inside the type every money path has to use would hide a product
+ * decision in the one place nobody looks for it.
  */
 
 /**
@@ -54,6 +62,57 @@ import { Decimal } from 'decimal.js';
  * network it is running on.
  */
 export const MONEY_DECIMAL_PLACES = 7;
+
+/**
+ * Integer digits a stored amount has room for, from the column's own width.
+ *
+ * `Decimal @db.Decimal(20, 7)` - the type the money rule prescribes and the one
+ * `Transaction.amount` uses - is 20 digits of precision with 7 after the point, so
+ * 13 lie in front of it. `fromString` refuses text wider than that, and the reason
+ * is not tidiness: Postgres raises `numeric field overflow` for a wider value, which
+ * reaches a client as a 500 for what is really a bad request. A ceiling the storage
+ * layer enforces has to be answered where the amount is parsed, or the client is
+ * blamed for the database's limit. It is *not* a product ceiling - a per-transaction
+ * maximum would be a decision nobody has made (see the module docblock).
+ */
+export const MONEY_INTEGER_DIGITS = 13;
+
+/**
+ * The precision money arithmetic is done at (Step 25).
+ *
+ * `decimal.js`'s default is 20 significant digits, and 20 is *not* enough for
+ * money - which is worth spelling out, because it looks like plenty. A
+ * `numeric(20, 7)` value is 13 integer digits plus 7 decimals, so a single operand
+ * is at most 20 significant digits; a result can be wider, because the integer part
+ * grows and the decimals stay (`9999999999999.9999999 + 9999999999999.9999999` is
+ * `19999999999999.9999998` - 21 significant digits), and at the default precision
+ * that last digit is *rounded*, silently. 40 leaves room for any combination of
+ * operands a `numeric(20, 7)` column can hold (and for a fee rule later), so no
+ * operation this API can express rounds at all. `amount.spec.ts` asserts the 21-digit
+ * case against both constructors, so the difference is executable rather than argued.
+ *
+ * The rounding mode is therefore unreachable, and it is stated rather than left at
+ * the library default for one reason: the first *reachable* rounding should be a
+ * decision someone made, not something inherited. Half-up matches what Postgres
+ * does with `numeric` (it rounds half away from zero), so an amount that ever does
+ * get rounded here rounds the way the column would.
+ */
+export const MONEY_ARITHMETIC_PRECISION = 40;
+
+/**
+ * `decimal.js` at the precision above, as a *clone* rather than `Decimal.set(...)`.
+ *
+ * `Decimal.set` is global: it would reconfigure the constructor the whole process
+ * shares, including the one `fromString` parses with (where rounding cannot happen
+ * and must never be introduced) and any future library that computes with decimals.
+ * A clone has its own config, so this module configures arithmetic and nothing else.
+ * The clone is deliberately not exported: arithmetic has one home, and it is the
+ * methods below.
+ */
+const Money = Decimal.clone({
+  precision: MONEY_ARITHMETIC_PRECISION,
+  rounding: Decimal.ROUND_HALF_UP,
+});
 
 /**
  * The only text this API accepts as an amount.
@@ -197,6 +256,20 @@ export class Amount {
       throw new InvalidAmountError(input, describeRejection(input));
     }
 
+    /**
+     * Padding zeros are not width: `0001.50` is `1.5` and has one integer digit.
+     * Leading zeros are stripped rather than counted, so the check is about the value
+     * the column will hold.
+     */
+    const integerDigits = (input.split('.')[0] ?? '').replace(/^0+/, '').length;
+
+    if (integerDigits > MONEY_INTEGER_DIGITS) {
+      throw new InvalidAmountError(
+        input,
+        `${integerDigits} integer digits, and a stored amount has room for ${MONEY_INTEGER_DIGITS} - see MONEY_INTEGER_DIGITS`,
+      );
+    }
+
     return new Amount(new Decimal(input));
   }
 
@@ -295,6 +368,39 @@ export class Amount {
    */
   isPositive(): boolean {
     return this.value.greaterThan(0);
+  }
+
+  /**
+   * This amount less `other` - exact, and the one arithmetic operation this API
+   * has (Step 25).
+   *
+   * Written for the overdraft check, which has to turn "what the wallet holds" and
+   * "what is already committed against it" into the number a payment is measured
+   * against; see `MONEY_ARITHMETIC_PRECISION` for the precision this is computed
+   * at, and why it is not the library default. The result is *not* re-validated:
+   * `fromString` and `fromDatabase` both refuse a negative amount because a
+   * negative amount is not something a client may send or a column may store, but a
+   * negative *result* is a real and important state - it is what an over-committed
+   * wallet looks like, and the caller's job is to compare it (see `isAtLeast`),
+   * never to skip the subtraction and assume it cannot go below zero.
+   */
+  minus(other: Amount): Amount {
+    return new Amount(Money.sub(this.value, other.value));
+  }
+
+  /**
+   * Whether this amount is at least `other`.
+   *
+   * A comparison, not arithmetic: `decimal.js` compares exactly at any precision,
+   * so there is no rounding policy hiding here, and `>=` is deliberate rather than
+   * `>` - spending exactly the balance down to zero is a legal payment, which is
+   * the distinction `isPositive`'s docblock flags for the other end of the range.
+   *
+   * Takes an `Amount`, never a string or a number: comparing money is only
+   * meaningful between two values that have both been through this class.
+   */
+  isAtLeast(other: Amount): boolean {
+    return this.value.greaterThanOrEqualTo(other.value);
   }
 
   /**
