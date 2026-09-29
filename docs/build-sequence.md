@@ -185,19 +185,96 @@ Done when: a newly registered, phone-verified user automatically has a funded St
 
 **If anything fails:** Step 18 failing is a stop-everything issue, not a fix-later one — do not proceed to Day 3 with any doubt about key material safety, even against Testnet.
 
-<!-- ============================================================
-     STILL MISSING — Days 3 through 5 (Steps 21–34). Day 2 (Steps
-     15–20, including the Step 18 standing rule and the "Audit
-     Checklist — Day 2" above) was restored from a later paste and is
-     verbatim. Days 3–5 are still absent, which is why the orphaned
-     line below ("when: every item in Section 5 …") has no opening —
-     it is the tail of a "Done when:" sentence from within that
-     still-missing region, not a transcription error.
-     ============================================================ -->
+## Day 3 — Recipient Resolution & Payments Core (Part 1)
 
-when: every item in Section 5 of the architecture plan has a concrete answer in the codebase, not just an intention.
+**Step 21 — `GET /v1/recipients/search`**
+Accepts a phone number or handle, normalizes phone input through the Step 9 utility before querying, returns minimal recipient info (not the full user record — avoid leaking data beyond what's needed to confirm identity). Rate-limit this endpoint specifically — it's the one most exposed to enumeration attacks (someone probing which phone numbers are registered).
 
-<!-- (The "Done when:" opening of the line above was also lost on the far side of the truncation point.) -->
+**Step 22 — `GET /v1/recipients/:id` (confirmation payload)**
+Returns the fuller confirmation view: display name/handle, verified status indicator — the data the frontend's recipient-confirmation screen needs.
+
+**Step 23 — Decimal precision foundation (MVP-blocking item)**
+Before writing the payment creation endpoint, confirm the `Transaction.amount` field is `Decimal` in Prisma (not `Float`), install `decimal.js`, and establish the rule now, in code review terms: **amounts are strings in every DTO and every JSON response, converted to `Decimal` immediately on entry and only converted to a display string immediately on exit — never a bare JS `number` in between.** Write this as an actual lint rule or code comment convention the rest of the build follows, since it's easy to violate accidentally in a later step if it isn't decided now.
+
+**Step 24 — Idempotency interceptor**
+Build the interceptor (in `common/interceptors/`) that checks an `idempotencyKey` from the request against Redis/DB before allowing a payment-creation request to proceed, returning the original result on a duplicate rather than creating a second transaction.
+
+**Step 25 — `POST /v1/payments` (creation, not yet submission)**
+Validates recipient exists, validates amount (server-side only, ignore any client-computed total), locks the sender's balance inside a DB transaction using `Prisma.$transaction` with a raw `SELECT ... FOR UPDATE` (Prisma doesn't expose row locks natively — this is the one deliberate raw-SQL escape hatch in the codebase), writes the `Transaction` row as `PENDING`, and returns `202` with the transaction ID. Does not yet touch Stellar — that's Day 4.
+
+Done when: two rapid duplicate requests with the same idempotency key produce exactly one `Transaction` row, and a deliberately-forced race (two simultaneous payment requests draining the same balance) doesn't allow an overdraft.
+
+### Audit Checklist — Day 3 (Steps 21–25)
+
+- [x] **Step 21:** search returns only minimal recipient info, not the full user record; rate limiting is verified by actually making the requests, not by reading the guard config; a deliberate enumeration attempt (sweeping many numbers) is meaningfully slowed/blocked. — verified by `test/recipients.e2e-spec.ts` (`npm run test:e2e test/recipients.e2e-spec.ts`, 11 tests): every documented body is asserted to carry no phone number in any of its three shapes; the allowance is spent over HTTP by *sweeping distinct unregistered numbers* (each a 200 with an empty list, so what is counted is the lookup rather than what it found) and the next lookup is a 429 whose message carries the remaining window; the confirmation route draws on the same allowance; and a second caller still gets its 200, which is the per-caller keying shown rather than asserted.
+- [x] **Step 22:** the confirmation payload contains everything the recipient-confirmation screen needs (display name/handle, verified indicator) and nothing more sensitive than that. — the body is asserted *exactly* (`id`, `handle`, `displayName`, `verified`, and nothing else) for a payable recipient and for the caller's own id, and unverified, suspended and unknown ids all answer the same 404 sentence, which is also asserted to be identical between the three so the endpoint cannot be used to ask which ids exist.
+- [ ] **Step 23:** grep the codebase for any bare JS `number` handling of an amount between entry and exit — there should be none; a deliberately-crafted high-precision amount round-trips through create → store → display without precision loss.
+- [ ] **Step 24:** two rapid duplicate requests with the same idempotency key produce exactly one `Transaction` row — verified live, not inferred from the interceptor's code.
+- [ ] **Step 25 (mutation-tested, per the Step 17 standard):** a deliberately-forced concurrent race on the same sender's balance does not allow an overdraft; confirm this by breaking the lock deliberately and watching the test fail, then restoring it — the same proof standard Step 17's `AccountLock` test used.
+
+**If anything fails:** fix before Day 4 — Day 4 builds the Stellar submission on top of whatever `Transaction` row Day 3 created, so a broken lock or a precision bug here becomes a real financial bug once real submission is wired in.
+
+---
+
+## Day 4 — Payments Core (Part 2): Stellar Submission
+
+**Step 26 — BullMQ queue setup**
+Register the payments queue and a worker processor in `payments/jobs/`.
+
+**Step 27 — Transaction submission job**
+On `Transaction` creation, enqueue a job. The processor: builds the Stellar payment operation via the Step 17 `StellarService`, signs with the sender's decrypted (in-memory only, never logged) key, submits to Horizon, updates status to `PROCESSING` with the returned hash.
+
+**Standing rule applies to this step, same as Step 18:** this is the step where the app actually signs a real user's key and submits a real payment to the network — combining `SeedCustodyService`, the Stellar SDK wrapper, and BullMQ into the one action that moves someone's money. Before writing code, describe the intended approach (how the key is retrieved and immediately discarded after signing, how a mid-submission failure is handled without double-submitting, how the job is idempotent against retries) and wait for explicit confirmation.
+
+**Step 28 — Status polling job**
+A separate repeatable BullMQ job (or a per-transaction delayed job scheduled right after submission) polls Horizon for confirmation using the stored `stellarTxHash`, updates status to `SUCCESSFUL` or `FAILED` with a `failureReason`, and triggers a notification.
+
+**Step 29 — Transaction status state machine**
+Formalize the transitions (`PENDING → PROCESSING → SUCCESSFUL | FAILED`) as an explicit guard in the service layer — no direct status writes from anywhere else in the codebase, so the state machine can't be bypassed by a future shortcut.
+
+Done when: a payment submitted through the full flow (create → job picks it up → Stellar submission → polling confirms) lands as `SUCCESSFUL` with a real Testnet transaction hash you can look up on a Stellar Testnet explorer, and a deliberately-invalid payment (e.g. insufficient balance forced past the earlier check, or a bad destination) resolves to `FAILED` with a readable reason rather than hanging in `PROCESSING` forever.
+
+### Audit Checklist — Day 4 (Steps 26–29)
+
+- [ ] **Step 26:** the queue is registered and a trivial job round-trips through it in a test.
+- [ ] **Step 27 (highest scrutiny, same standard as Step 18):** a real Testnet transaction hash is produced from a real signed submission; the decrypted key is confirmed never logged (grep, as in Step 18's audit); a deliberately-retried job does not produce a double-submission; confirm via the approved proposal that this was built exactly as agreed, not improvised during implementation.
+- [ ] **Step 28:** a real submitted transaction is polled and correctly resolves to `SUCCESSFUL`; a deliberately-invalid transaction resolves to `FAILED` with a readable reason rather than hanging in `PROCESSING`.
+- [ ] **Step 29:** attempt a direct status write from outside the state-machine guard in a test — it should be structurally prevented or caught, not merely discouraged by convention.
+
+**If anything fails:** Step 27 failing is a stop-everything issue, same as Step 18 — do not proceed to Day 5 with any doubt about signing/submission safety.
+
+---
+
+## Day 5 — History, Reconciliation, Hardening
+
+**Step 30 — `GET /v1/payments/:id` and `GET /v1/payments`**
+Individual lookup plus paginated, filterable history (sent/received, date range, status).
+
+**Step 31 — Reconciliation job**
+A scheduled BullMQ job comparing the sum of internal ledger movements per account against the actual Horizon balance, logging (and alerting via Sentry) any drift.
+
+**Step 32 — Audit log**
+Append-only table/model logging sensitive actions (login, OTP verify, handle change, payment initiated/completed, any key-access event) — write this as a service method called explicitly at each of those points, not as a generic catch-all interceptor, so the log entries carry meaningful context.
+
+**Step 33 — Rate limiting pass**
+Go back through every endpoint built so far and confirm `@nestjs/throttler` guards are applied appropriately — this is a deliberate sweep, not a one-time setup, since it's easy for a new endpoint added mid-week to slip through unguarded.
+
+**Step 34 — Security review against the architecture plan's Section 5 checklist**
+Walk the checklist item by item against the actual code: key management, auth, transaction integrity, data protection, API hardening, Stellar-specific risks. Fix anything found before calling the week done — this is the checkpoint, not a formality.
+
+Done when: every item in Section 5 of the architecture plan has a concrete answer in the codebase, not just an intention.
+
+### Audit Checklist — Day 5 (Steps 30–34)
+
+- [ ] **Step 30:** history endpoint correctly paginates and filters (sent/received, date range, status) against real data, not just a small fixture that happens to pass.
+- [ ] **Step 31:** the reconciliation job actually detects a deliberately-introduced drift between internal ledger and Horizon balance, and alerts via Sentry — verified by forcing a mismatch, not by reading the comparison logic.
+- [ ] **Step 32:** every listed sensitive action (login, OTP verify, handle change, payment initiated/completed, key-access event) produces a real audit log row — verified by triggering each one and checking the table, not by grepping for the service-method calls.
+- [ ] **Step 33:** re-check every endpoint built across Days 1–5 for a throttler guard — produce the actual list of endpoints and their guard status as evidence, not an assertion that the sweep happened.
+- [ ] **Step 34:** each item in the architecture plan's Section 5 has a specific, named answer (which file, which line, which test) — a checklist item marked done with no pointer to where it's enforced doesn't count.
+
+**If anything fails:** this is the last checkpoint before the Days 6–7 buffer — anything found here should be fixed now, not carried into buffer time meant for edge cases and slippage absorption.
+
+---
 
 Days 6–7 — Buffer
 No new features. This time is explicitly for:

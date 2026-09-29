@@ -78,6 +78,26 @@ export const OTP_REQUESTS_PER_WINDOW = 3;
 export const OTP_REQUEST_WINDOW_MINUTES = 15;
 
 /**
+ * Recipient directory policy (Step 21).
+ *
+ * Constants rather than environment variables, like the OTP block above and for the same
+ * reason: these are product rules (how many lookups one account gets in a minute), not
+ * per-environment settings, and they belong where a change shows up in review.
+ *
+ * Why a limit is needed at all: `GET /v1/recipients/search` answers "is this number
+ * registered", so an unlimited caller can sweep numbers and read the answer off the
+ * difference between a result and an empty list. The numbers below are chosen against that
+ * sweep rather than against a person's use: 20 lookups a minute is far more than anyone
+ * needs to find the person they are about to pay (one search plus one confirmation is two),
+ * and it caps a sweep at 28,800 numbers a day per account - slow enough that the *pattern* is
+ * visible in `recipients:lookup:*` long before the sweep is useful. The limiter is per caller
+ * and shared by both directory endpoints, so the pair of calls one payment costs is priced at
+ * two units.
+ */
+export const RECIPIENT_LOOKUP_REQUESTS_PER_WINDOW = 20;
+export const RECIPIENT_LOOKUP_WINDOW_SECONDS = 60;
+
+/**
  * Session policy (Step 16).
  *
  * The two lifetimes are a deliberate pair, and the split is what makes the JWT
@@ -329,6 +349,19 @@ export default function configuration() {
       maxAttempts: OTP_MAX_ATTEMPTS,
       requestsPerWindow: OTP_REQUESTS_PER_WINDOW,
       requestWindowMinutes: OTP_REQUEST_WINDOW_MINUTES,
+    },
+
+    /**
+     * Recipient directory policy (Step 21).
+     *
+     * Under its own group rather than inside `payments`, because it is not about payments yet:
+     * it is the cost of asking who someone is, and Steps 23-29 will add their own keys beside
+     * it when they have something to configure. See `RECIPIENT_LOOKUP_REQUESTS_PER_WINDOW` for
+     * why the limit exists and how the number was chosen.
+     */
+    recipients: {
+      lookupRequestsPerWindow: RECIPIENT_LOOKUP_REQUESTS_PER_WINDOW,
+      lookupWindowSeconds: RECIPIENT_LOOKUP_WINDOW_SECONDS,
     },
 
     /** Outbound SMS via Africa's Talking. */

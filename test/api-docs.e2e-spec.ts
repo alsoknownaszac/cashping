@@ -18,8 +18,24 @@ const HEALTH_PATH = `/${GLOBAL_PREFIX}/health`;
  * tokenless request this file makes. Named rather than inferred: the point of the
  * loop below is that a path is routed and behaves like its siblings, and a guarded
  * GET answering 200 would mean the guard stopped being applied.
+ *
+ * Every guarded GET in the app belongs here, and the wallet pair is the reason this list
+ * is spelled out rather than derived: Step 20 added them without touching this file, so
+ * the loop below read 401 where it expected 200 and the whole suite failed for a reason
+ * that had nothing to do with the docs. Adding a guarded GET now means adding it here -
+ * which is a one-line edit and exactly the kind of thing a failing test should ask for.
  */
-const PROTECTED_GET_PATHS = new Set([`/${GLOBAL_PREFIX}/auth/session`]);
+const PROTECTED_GET_PATHS = new Set([
+  `/${GLOBAL_PREFIX}/auth/session`,
+  `/${GLOBAL_PREFIX}/recipients/search`,
+  // The documented path, with Swagger's own `{id}` placeholder rather than a UUID: the guard
+  // runs before the router's `ParseUUIDPipe`, so this answers 401. A 400 here would mean the
+  // pipe was reached first, i.e. that the route is unguarded - the failure this set exists to
+  // turn red.
+  `/${GLOBAL_PREFIX}/recipients/{id}`,
+  `/${GLOBAL_PREFIX}/wallet/account`,
+  `/${GLOBAL_PREFIX}/wallet/balance`,
+]);
 
 /**
  * What the frontend engineer actually consumes, over real HTTP and wired exactly
@@ -84,6 +100,10 @@ describe('Frontend hand-off (e2e)', () => {
       `/${GLOBAL_PREFIX}/auth/register`,
       `/${GLOBAL_PREFIX}/auth/session`,
       HEALTH_PATH,
+      `/${GLOBAL_PREFIX}/recipients/search`,
+      `/${GLOBAL_PREFIX}/recipients/{id}`,
+      `/${GLOBAL_PREFIX}/wallet/account`,
+      `/${GLOBAL_PREFIX}/wallet/balance`,
     ]);
   });
 
@@ -115,9 +135,9 @@ describe('Frontend hand-off (e2e)', () => {
         expect(response.status, `${where} is documented but not routed`).not.toBe(405);
 
         if (method === 'get') {
-          // `/auth/session` is the one documented GET behind `JwtAuthGuard`, and its
-          // answer without a bearer token is 401 - which is still proof it is routed
-          // and that the guard is attached to it, the two things this loop checks for.
+          // Every guarded GET answers 401 to this tokenless request (`PROTECTED_GET_PATHS`),
+          // which is still proof it is routed and that the guard is attached to it - the two
+          // things this loop checks for. An unguarded GET is the 200 branch.
           expect(response.status, `${where} should answer`).toBe(
             PROTECTED_GET_PATHS.has(path) ? 401 : 200,
           );

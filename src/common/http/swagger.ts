@@ -66,6 +66,13 @@ export function createOpenApiDocument(app: INestApplication): OpenAPIObject {
         'GET /wallet/account is the wallet itself - the address it is paid at, the network, and whether the ledger knows it yet. GET /wallet/balance is its USDC line, read from Horizon on every call rather than cached.',
       ].join('\n'),
     )
+    .addTag(
+      'recipients',
+      [
+        'Who a payment can be sent to (Steps 21-22).',
+        'GET /recipients/search turns a phone number or a handle into an account id, and GET /recipients/:id confirms that the id is the right person. Neither returns a phone number, and the search is rate-limited per caller.',
+      ].join('\n'),
+    )
     /**
      * The `Authorization: Bearer <token>` scheme, so the routes that need it show a
      * padlock and a "Try it out" that can actually be used (Step 16). `@ApiBearerAuth()`
