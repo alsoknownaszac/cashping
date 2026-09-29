@@ -196,12 +196,13 @@ export class AccountProvisioningService {
    * no key material touched, `already-provisioned`. Both are what make this usable from a
    * retry path (an operator's script) and not only from registration.
    *
-   * **What this does not do is call itself.** Nothing in the app is scheduled or queued -
-   * `AuthService.verifyOtp` is the only caller, and there is no queue consumer or cron to
-   * be a second one (see `WalletModule`) - so an attempt that failed *after* its deadline
-   * was reported (the work carried on in the background and then failed, with its outcome
-   * dropped) stays stranded until something calls this again. Resuming is now possible;
-   * retrying is still not automatic, and that is the part left open.
+   * **What this does not do is call itself.** Nothing puts provisioning on the queue -
+   * `AuthService.verifyOtp` is the only caller, the payments queue added in Step 26 carries a
+   * probe and nothing else, and there is no cron to be a second caller (see `WalletModule`) -
+   * so an attempt that failed *after* its deadline was reported (the work carried on in the
+   * background and then failed, with its outcome dropped) stays stranded until something calls
+   * this again. Resuming is now possible; retrying is still not automatic, and that is the part
+   * left open.
    */
   async provisionFor(userId: string): Promise<ProvisioningOutcome> {
     try {

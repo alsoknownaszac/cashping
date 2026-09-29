@@ -531,6 +531,65 @@ It creates its own accounts, writes their wallet rows, and deletes its transacti
 (both relations are `ON DELETE RESTRICT`, so the database insists on that order).
 
 
+## The payments queue (Step 26)
+
+Step 26 registers the queue and the worker that drains it, and deliberately nothing else: no code in
+this application puts a *payment* on it yet, because that is Step 27 - the step the build sequence
+gates on a written proposal. What exists is the plumbing, live end to end.
+
+| File | What it is |
+| --- | --- |
+| `src/payments/jobs/payments-queue.ts` | The names: `payments` (the queue), `probe` (the one job), and the shapes they move - literals here rather than in each of the three files that need them. |
+| `src/payments/jobs/payments-queue.module.ts` | The connection (`redis.url`, read through `ConfigService`), `forRootAsync` (registered once for the whole app), `registerQueue`, and the providers. |
+| `src/payments/jobs/payments.processor.ts` | The worker: answers a probe, and **throws** on any job name it does not recognise. |
+| `src/payments/jobs/payments-queue.service.ts` | The only way onto the queue - `enqueueProbe()` today, the submission enqueue at Step 27. |
+
+Three decisions, each recorded where it was made:
+
+- **BullMQ gets its own connections, from the same URL.** It cannot share `RedisService.client`:
+  BullMQ blocks on connections and needs `maxRetriesPerRequest: null`, while that client sets `2` on
+  purpose so a rate-limit or idempotency command *rejects* instead of hanging forever. Same Redis,
+  separate sockets, one shared value.
+- **The queue has no `defaultJobOptions`.** Attempts, backoff and retention *are* the retry policy,
+  and the retry policy is what decides whether "the job ran twice" is survivable on a money path.
+  That is Step 27's proposal to write, not a default inherited from whoever wired the queue.
+- **The worker runs inside the API process**, at BullMQ's default concurrency of 1. A second
+  deployable buys nothing at one payment at a time, and its two costs are stated rather than
+  discovered: a redeploy restarts the consumer (BullMQ's stalled-job check re-queues what was in
+  flight), and a job name no handler knows is **thrown** rather than acknowledged, because a job
+  marked done without being attempted is a payment reported as submitted.
+
+### What the probe is for
+
+A worker that never started, a queue registered under a name nothing consumes, and a worker pointed
+at a *different* Redis are three failures that look exactly like a working queue until something is
+added to it. `probe` is the job that tells them apart: it carries no payload and answers
+`{ pong: true, workerPid: <pid> }`, written by the handler - so an answer coming back proves Redis is
+reachable, the queue's keys are being written, a consumer is running, and the consumer is this
+codebase. It sets `removeOnComplete` per job, so it can be fired as often as someone wants to know,
+without Redis growing by one job per question asked.
+
+### Running the proofs
+
+```bash
+npm test                                  # 640 tests (38 files); 11 of them are new here
+npm run test:e2e test/queue.e2e-spec.ts   # 3 tests: real Redis, real worker, no substitutions
+```
+
+The e2e asserts the three things a diff cannot show - the queue is registered under its name in the
+real application, the worker is consuming there, and a job added through the application's own
+enqueue path is answered and gone again (`getCompletedCount` unchanged, which is `removeOnComplete`
+doing its job). It then adds a job named `submit-payment-that-does-not-exist` and asserts that it is
+*rejected*, not acknowledged.
+
+The one thing it deliberately does not assert is that the answering pid is the test's own process.
+Every e2e file here boots this same application and vitest runs files in parallel, so several
+processes may each have a worker on this queue; BullMQ hands each job to exactly one of them, and
+which one is not a property this step has. `workerPid` is still returned - comparing two probe
+answers is how you learn there is more than one consumer - but the assertion is "a live process
+answered", not "this one did".
+
+
 ## Documentation conventions
 
 Rules these docs and this repository's commit messages follow. They exist because a document that is
@@ -592,8 +651,9 @@ blocks a step in `docs/build-sequence.md`.
 - **Nothing retries Stellar provisioning automatically - but a half-provisioned account is now
   completed by calling the service again.** `AccountProvisioningService.provisionFor` still has
   exactly one caller in `src` - `AuthService.verifyOtp` (`src/identity/auth.service.ts:404`) - and
-  there is no scheduler and no queue behind it: neither `@nestjs/schedule` nor a job library is in
-  `dependencies`, and the only `setTimeout` calls in `src` are the provisioning deadline and the
+  nothing puts it on the queue: `@nestjs/schedule` is still not a dependency, the payments queue
+  (Step 26) carries a single job **as of Step 26** and it is a probe rather than any kind of
+  provisioning work, and the only `setTimeout` calls in `src` are the provisioning deadline and the
   Stellar SDK's transaction timeout. So a verify that comes back `incomplete` (a friendbot `429` or
   `5xx`, a Horizon `5xx`, or the 30s deadline) is still the last *automatic* attempt that user's
   wallet gets: the way back cannot be a second verify, because the OTP row is spent by then, and
@@ -705,6 +765,13 @@ blocks a step in `docs/build-sequence.md`.
   asymmetry is deliberate: a read of yourself is not a payment. If self-transfers ever need to be
   allowed (moving funds between two wallets a user owns), this is the check to revisit - and it will
   need a story for what the history shows.
+- **Nothing tells Sentry about a failed job.** The global exception filter (Step 6) reports what a
+  *request* did, and the worker has no equivalent: `PaymentsProcessor` logs a failed job with its
+  name, id and attempt count, which is enough to find it in Redis and in the log and not enough to
+  be paged about. Step 27 owns what a failed *submission* reports, and the argument for wiring a
+  reporter there is that a submission which failed is money that did not move - a different category
+  from a probe that failed. Recorded so that it stays a decision instead of a surprise during the
+  first incident.
 
 ## Deployment
 

@@ -7,9 +7,17 @@ import { Redis } from 'ioredis';
  *
  * Redis is not a cache here, it is state: the OTP request counter (Step 13) is
  * the first thing that has to survive a restart of the process, and the same
- * connection is what BullMQ's queues, the idempotency-key store and any future
- * lock will use. That is why it is a provider rather than a client created where
- * it happens to be needed.
+ * connection is what the idempotency-key store and the recipients lookup counter
+ * use. That is why it is a provider rather than a client created where it
+ * happens to be needed.
+ *
+ * BullMQ is the one Redis consumer that does *not* use this client (Step 26), and
+ * the reason is recorded where the decision was made, in `PaymentsQueueModule`:
+ * BullMQ needs connections it can block on, which means
+ * `maxRetriesPerRequest: null`, and this client's `2` is the deliberate opposite
+ * - a command that cannot be served must *reject*, so the rate limiter and the
+ * idempotency store fail closed instead of hanging. The two share one thing:
+ * `redis.url`.
  *
  * `main.ts` keeps its own short-lived client for the boot-time reachability
  * check on purpose: that probe wants `retryStrategy: () => null` so a dead Redis
