@@ -34,6 +34,19 @@
 -- Prisma does not model CHECK constraints, so this is hand-written SQL (as with
 -- the enum rename in 20260926142106) and the drift check documented in that
 -- migration still reports no drift afterwards - which is what keeps this honest.
+--
+-- And it is the reason for this last note: the comment block you are reading is
+-- part of the file, and `_prisma_migrations.checksum` covers the file's bytes, so
+-- editing a word above changes this migration's hash. Nothing has to be done for a
+-- fresh clone - the row is written from the file at the moment the migration is
+-- applied. An *existing* local database that applied the earlier text does, and it
+-- needs the same one-statement correction this file already got once: recompute the
+-- digest over the file (sha256) and update the recorded value, e.g.
+--   UPDATE _prisma_migrations SET checksum = '<sha256 of this file>'
+--    WHERE migration_name = '20260926180554_user_handle_canonical_form';
+-- Without that, `prisma migrate dev` reports this migration as modified - the same
+-- drift check the paragraph above is about - for a comment-only change that never
+-- touched a line of DDL.
 
 ALTER TABLE "users" ADD CONSTRAINT "users_handle_canonical_form" CHECK (
   "handle" IS NULL OR ("handle" = lower("handle") AND "handle" ~ '^[a-z0-9_]{3,20}$')
