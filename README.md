@@ -327,11 +327,87 @@ AWS_ENDPOINT_URL=http://localhost:5055 AWS_KMS_KEY_ID=<an arn in that endpoint> 
   RUN_STELLAR_IT=1 npm run test:e2e test/wallet.e2e-spec.ts
 ```
 
+## Money precision and the money rule (Step 23)
+
+An amount is a **string on the wire, an `Amount` in code, and `numeric(20, 7)` at rest**. It is
+never a JS `number` anywhere in between: a double carries about 15 significant digits, and the
+largest legal USDC amount here is 13 integer digits plus 7 decimals, so the values this system
+must not round are exactly the ones a double silently rounds.
+
+That is a rule, not a convention, because the loss is undetectable once it has happened - a
+rounded amount looks like a correct amount. `npm run lint` runs two things, and the second one is
+the rule:
+
+```bash
+npm run lint:money   # node src/common/money/check-money-discipline.ts
+```
+
+```
+Money discipline: 121 files scanned, 0 violations
+```
+
+It exits non-zero, naming `file:line` and the reason, on each of four shapes:
+
+- a money-named column typed `Float`, `Real` or `DoublePrecision` in `prisma/schema.prisma`;
+- a money-named member typed `number` or `Decimal` in any `*.dto.ts` (a DTO carries strings);
+- a money-named value typed `number` in any other `.ts` file (a repository boundary, a Horizon
+  response, a service return);
+- an import of `decimal.js` from outside `src/common/money/` - one place knows how decimals work.
+
+`"amount: string"` is fine and is the intended spelling; the rule reads types, so it is what a
+reviewer would check, checked every push. `docs/build-sequence.md`'s Step 23 records what each
+rule was proven against, including a deliberately-violating tree that makes the whole `lint` job
+go red.
+
+`src/common/money/amount.ts` is then the only way a money value can exist - the constructor is
+private - and it has exactly two factories, because entry and exit are different problems:
+
+- `Amount.fromString(s)` for untrusted text. Strict about *spelling*: a sign, `1e3`, whitespace, a
+  thousands separator, a leading or trailing `.`, and more than 7 decimals are each refused with a
+  reason, so a 400 explains itself.
+- `Amount.fromDatabase(v)` for whatever the driver handed back, judged by *value* rather than by
+  spelling. This is the one lenient path on purpose: Prisma returns a `Decimal` whose `toString()`
+  is the shortest exact form - `1` for a stored `1.0000000`, `1e-7` for the smallest unit - so what
+  arrives is spelled differently from what was sent, and the e2e asserts both spellings. It throws
+  on the 17-decimal shape a float leaves behind.
+- One canonical `toString()` for both the database and JSON - `toJSON()` returns it, so a response
+  body cannot carry anything else - plus `toStellarAmount()` for Day 4 and `isPositive()` for
+  validation. That last one is `greaterThan(0)` and deliberately *not* decimal.js's own `isPositive()`,
+  which is true for zero: the first version of this method had exactly that bug, and `amount.spec.ts`
+  pins `0`, `0.0000000` and `0.0000001` separately because of it. There is no arithmetic, and none is
+  needed yet: balances are read from Horizon as strings and compared as strings, and the overdraft
+  check will be `SELECT ... FOR UPDATE` (Step 25).
+
+```bash
+npm test                              # 69 tests: amount.spec.ts (49) + money-discipline.spec.ts (20)
+npm run test:e2e test/money.e2e-spec.ts   # 13 tests, against a real Postgres
+```
+
+The e2e proves the round trip through the real database rather than through a mock: the column is
+asserted `numeric(20, 7)` from `information_schema`, `123456789012.1234567` survives create →
+store → display byte-for-byte, and the *same* value written to a `double precision` column in the
+same row comes back `123456789012.12346` - a digit gone, quietly. It creates and drops its own
+`money_round_trip_probe` table and touches no real table. It needs the compose database (`docker
+compose up -d postgres redis`), so it is local-only in the same way `auth.e2e-spec.ts` and
+`recipients.e2e-spec.ts` are - CI runs lint, the unit tests and the build, and no e2e suite at all.
+Unlike the `RUN_KMS_IT` and `RUN_STELLAR_IT` files it asks for no flag: a database is the only
+thing it needs, and a flag would only mean the round trip goes unproven by default.
+
 ## Known gaps
 
 Recorded rather than fixed, so that they stay decisions instead of surprises. None of them
 blocks a step in `docs/build-sequence.md`.
 
+- **The money rule matches names, so it can only see money that is named like money.** A value of
+  an amount called `total` or `x` typed `number` is invisible to it, and so is a `Float` column
+  whose name carries none of `MONEY_WORDS` - `amount`, `balance`, `fee`, `price`, `total`, `subtotal`
+  and their plurals, matched on snake_case boundaries. This is deliberate - the alternative is a
+  type-checker that cannot exist without a branded type threaded through every boundary, and the
+  columns the build is about are all named `amount` - but it means the rule is a strong net rather
+  than a proof: Step 25's `Transaction.amount` and the queue payloads Steps 26-28 will carry are
+  covered by name, and a future money value must be named accordingly or added to `MONEY_WORDS`.
+  The repo-wide case in `money-discipline.spec.ts` asserts the rule ran over every file in `src` and
+  `test`; it cannot assert that every money value is named, and does not pretend to.
 - **`test/auth.e2e-spec.ts` leaves user rows behind when a run is killed.** Its cleanup is
   two-sided on purpose - `beforeAll` deletes whatever a previous run left for the 40 numbers
   *this* run draws, and `afterAll` deletes exactly the numbers it registered - and both sides
