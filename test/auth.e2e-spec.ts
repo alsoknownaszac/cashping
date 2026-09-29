@@ -1,4 +1,4 @@
-import { createHash, randomInt } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { type INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Test, type TestingModule } from '@nestjs/testing';
@@ -9,6 +9,7 @@ import { AppModule } from './../src/app.module.js';
 import { GLOBAL_PREFIX } from './../src/common/http/prefix.js';
 import { createValidationPipe } from './../src/common/pipes/validation.pipe.js';
 import { UserStatus } from './../src/generated/prisma/enums.js';
+import { HANDLE_MAX_LENGTH, HANDLE_MIN_LENGTH } from './../src/identity/handle/handle.js';
 import {
   SMS_SENDER,
   type SmsMessage,
@@ -149,6 +150,18 @@ function uniqueLocalNumber(): string {
 const RESERVED_NUMBERS = 40;
 
 /**
+ * The handles this file claims as literals, in the canonical form the database stores.
+ *
+ * They are cleaned in `beforeAll` for the same reason the reserved numbers are: `handle`
+ * is unique across the whole table, so a run that is interrupted between its two
+ * registrations leaves the first one held, and the next run's *first* registration is a
+ * 409 that has nothing to do with the code under test. Seen once, on 2026-09-29, from a
+ * run killed mid-suite: `+233247381367` still holding `miriam`. Every other handle in
+ * this file is derived from a number it drew, and is covered by the number cleanup.
+ */
+const CLAIMED_HANDLES = ['miriam', 'admiral'];
+
+/**
  * The numbers this run may use, filled in `beforeAll` *before* the first one is handed
  * out, so that whatever a previous run left behind for them can be deleted first.
  *
@@ -234,6 +247,50 @@ function latestCodeFor(phoneNumber: string): string {
   }
 
   return codeFrom(message.body);
+}
+
+/**
+ * A statement the database *accepted*, thrown to roll its transaction back.
+ *
+ * The constraint test below wants to run an INSERT and leave nothing behind whichever
+ * way it goes, so committing is not an option and a `DELETE` afterwards is not the same
+ * thing: the row would exist for a moment, and a failure in between would leave it.
+ * Throwing from inside `prisma.$transaction` rolls the whole thing back, and this
+ * error's *identity* is what tells "the database accepted it" apart from "the database
+ * refused it" - the distinction the assertions are built on.
+ */
+class RolledBackAfterSuccess extends Error {
+  constructor(readonly handle: string) {
+    super(`the database accepted handle "${handle}", so this transaction is rolled back`);
+    this.name = 'RolledBackAfterSuccess';
+  }
+}
+
+/**
+ * Writes one handle into `users` with no normalizer in the way, then rolls it back.
+ *
+ * The INSERT names only the columns it needs: `id` and `updated_at` have no database
+ * default (Prisma supplies both from the client on every ordinary write), and `status`
+ * does have one, so omitting it is what a real row would get. Everything else is left
+ * unset, so the only rule this statement can break is the one under test.
+ */
+async function attemptRawHandleInsert(
+  prisma: PrismaService,
+  e164: string,
+  handle: string,
+): Promise<RolledBackAfterSuccess | Error> {
+  return prisma
+    .$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(
+        'INSERT INTO "users" ("id", "phone_number", "handle", "updated_at") VALUES ($1::uuid, $2, $3, CURRENT_TIMESTAMP)',
+        randomUUID(),
+        e164,
+        handle,
+      );
+
+      throw new RolledBackAfterSuccess(handle);
+    })
+    .catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
 }
 
 /** The half of a session response this file compares between requests. */
@@ -361,6 +418,15 @@ describe('Registration, verification and sessions (e2e)', () => {
     await prisma.user.deleteMany({
       where: { phoneNumber: { in: availableNumbers.map(toE164) } },
     });
+
+    /**
+     * ...and the two fixed handles, which are not derived from a drawn number and so are
+     * not covered by the delete above - see `CLAIMED_HANDLES`. Deleting by handle is safe
+     * here in a way deleting by any looser criterion would not be: these are values this
+     * file brings, so a row holding one was written by this suite, or by a run of it that
+     * died before its own cleanup.
+     */
+    await prisma.user.deleteMany({ where: { handle: { in: CLAIMED_HANDLES } } });
   });
 
   /**
@@ -468,6 +534,111 @@ describe('Registration, verification and sessions (e2e)', () => {
 
     expect(otp?.codeHash).not.toBe(code);
     expect(Object.values(otp ?? {})).not.toContain(code);
+  });
+
+  /**
+   * Step 15's audit item, at the altitude it names: `@Miriam` and `@miriam` are one
+   * handle, and the *endpoint* is where that has to hold. The normalizer and the CHECK
+   * constraint are covered on their own; neither of them is what a second signup talks
+   * to, and the migration's comment used to say this file already proved the conflict
+   * when it sent no handle at all.
+   */
+  it('refuses a handle another account already holds in a different case, with a 409', async () => {
+    const first = freshNumber();
+    // Drawn without `freshNumber()`, because this is the number that has to come out of
+    // the test with *no* row: `registered` is what `afterAll` deletes and counts, and a
+    // number recorded but never written would be reported as a row that went missing.
+    const secondLocal = takeReservedNumber();
+    const secondE164 = toE164(secondLocal);
+
+    const claimed = await request(app.getHttpServer())
+      .post(REGISTER_PATH)
+      .send({ phoneNumber: first.local, handle: '@Miriam' })
+      .expect(201);
+
+    // The *canonical* form is what was stored, and it is what the answer reports. This
+    // is the fact that makes the refusal below a case-insensitive conflict rather than
+    // two different handles happening to collide.
+    expect(claimed.body.handle).toBe('miriam');
+
+    const conflict = await request(app.getHttpServer())
+      .post(REGISTER_PATH)
+      .send({ phoneNumber: secondLocal, handle: '@miriam' })
+      .expect(409);
+
+    expect(conflict.body.message).toContain('@miriam is already taken');
+
+    // The handle still belongs to the first account, and the refused signup left no row
+    // of its own behind - which is also why the second number is still unregistered.
+    expect((await prisma.user.findUnique({ where: { phoneNumber: first.e164 } }))?.handle).toBe(
+      'miriam',
+    );
+    expect(await prisma.user.findUnique({ where: { phoneNumber: secondE164 } })).toBeNull();
+  });
+
+  it('refuses a reserved handle over HTTP, and claims nothing for the number that tried', async () => {
+    const { local, e164 } = freshNumber();
+
+    const refused = await request(app.getHttpServer())
+      .post(REGISTER_PATH)
+      .send({ phoneNumber: local, handle: '@admin' })
+      .expect(400);
+
+    expect(refused.body.message).toContain('"@admin" is reserved by Cashping');
+
+    // The reserved set is consulted before the row is written (a refused handle costs no
+    // SMS), so the number is still unregistered...
+    expect(await prisma.user.findUnique({ where: { phoneNumber: e164 } })).toBeNull();
+
+    // ...and that is what this second call proves rather than assumes: had the refused
+    // attempt written a row, the number would now be taken and this would be a 409 for a
+    // number nobody has claimed.
+    const accepted = await request(app.getHttpServer())
+      .post(REGISTER_PATH)
+      .send({ phoneNumber: local, handle: 'admiral' })
+      .expect(201);
+
+    expect(accepted.body.handle).toBe('admiral');
+  });
+
+  /**
+   * The migration's own assertion, at the only altitude that can make it: a write that
+   * never goes through `resolveHandle`/`assertHandleAllowed`. The endpoint above cannot
+   * stand in for it - a handle the normalizer would reject never reaches the database -
+   * and this is the constraint a future code path would have to be saved by, so it is
+   * the constraint that has to be shown refusing something.
+   */
+  it('keeps a non-canonical handle out of the database even when the INSERT skips normalization', async () => {
+    // Drawn without `freshNumber()` for the same reason as the number above: every INSERT
+    // here is rolled back, so this number must not be counted as a row to delete -
+    // `afterAll` would then report a row this file never left behind.
+    const e164 = toE164(takeReservedNumber());
+
+    // A canonical handle goes through the same statement, so what the cases below prove
+    // is the CHECK refusing a value, not a malformed INSERT.
+    expect(await attemptRawHandleInsert(prisma, e164, 'ok_handle')).toBeInstanceOf(
+      RolledBackAfterSuccess,
+    );
+
+    for (const handle of ['Miriam', 'has-dash', 'ab', 'x'.repeat(HANDLE_MAX_LENGTH + 1)]) {
+      const refused = await attemptRawHandleInsert(prisma, e164, handle);
+
+      // The constraint by name, and the SQLSTATE that says it was a CHECK violation
+      // rather than some other refusal (a type error, a unique index) wearing its message.
+      expect(String(refused)).toContain('users_handle_canonical_form');
+      expect(String(refused)).toContain('23514');
+    }
+
+    // The bounds in the constraint are literals ('^[a-z0-9_]{3,20}$') while the service
+    // uses these constants, and nothing compares the two: move one in handle.ts and the
+    // database keeps the old rule with no error of its own. These two lines are the
+    // alarm, and they are the reason the migration says the duplication is checked.
+    expect(HANDLE_MIN_LENGTH).toBe(3);
+    expect(HANDLE_MAX_LENGTH).toBe(20);
+
+    // Nothing survived any of the attempts: the rollback is this file's, not the
+    // database's, so the run leaves no row behind for a later one to trip over.
+    expect(await prisma.user.count({ where: { phoneNumber: e164 } })).toBe(0);
   });
 
   it('verifies the code, activating the user and consuming the code', async () => {
