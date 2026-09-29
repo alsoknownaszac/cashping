@@ -177,7 +177,8 @@ Where the pieces live, and why:
 expiry and rate-limit paths). It needs the compose stack - `docker compose up -d postgres
 redis` - and a `.env`, so it is deliberately not part of the CI job, which has no database
 service. It registers random numbers and deletes them again in `afterAll`, so repeated runs
-are safe.
+are safe for the numbers it reserved - with one gap, recorded in [Known gaps](#known-gaps):
+a run killed before that hook leaves rows for numbers no later run draws again.
 
 ## Stellar key custody (Step 18)
 
@@ -262,6 +263,31 @@ client sits behind `KEY_WRAPPER` and `KMS_CLIENT_FACTORY`, so the suite needs ne
 nor credentials. The step's own audit - three accounts producing three different blobs, a
 database row that reads as ciphertext, and a log grep for the seed pattern that comes back
 empty - is reproducible with the two commands in the section above.
+
+## Known gaps
+
+Recorded rather than fixed, so that they stay decisions instead of surprises. Neither one
+blocks a step in `docs/build-sequence.md`.
+
+- **`test/auth.e2e-spec.ts` leaves user rows behind when a run is killed.** Its cleanup is
+  two-sided on purpose - `beforeAll` deletes whatever a previous run left for the 40 numbers
+  *this* run draws, and `afterAll` deletes exactly the numbers it registered - and both sides
+  are keyed on numbers the run knows. A run that is interrupted (Ctrl-C, a crash, a killed
+  test process) therefore leaves its rows for numbers no later run is likely to draw again,
+  and they accumulate silently, because nothing counts them. Measured in the compose database
+  on 2026-09-29: 19 `users` rows, all in the reserved `+2332…` range, in two batches (11 at
+  2026-09-27 00:53 and 8 at 2026-09-29 01:22), 9 of them with `phone_verified_at IS NULL`
+  and none with a `handle`, and `stellar_accounts` empty - so no leftover is a
+  half-provisioned wallet and nothing user-visible depends on them. The fix is a bounded
+  cleanup - by the reserved range, or by a run id written onto the row - not a wider
+  assertion; the assertions are not what is wrong.
+- **Five `src/wallet/custody` files predate the repo's prettier normalisation.** `ce9d165`
+  normalised `src` and `test` to prettier (`printWidth 100`) and Step 18's files were written
+  after it, so `npm run format` would rewrite `kms-key-wrapper.ts`, `secret-envelope.ts`,
+  `seed-custody.service.ts` and their two specs - line-wrapping only. Nothing checks
+  formatting in CI (`.github/workflows/ci.yml` runs lint, test and build), so this is a
+  convention gap rather than a broken build. It is deliberately left out of Step 19's
+  commits, so that "the files Step 19 touched are formatted" stays a statement about Step 19.
 
 ## Deployment
 
