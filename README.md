@@ -531,6 +531,30 @@ It creates its own accounts, writes their wallet rows, and deletes its transacti
 (both relations are `ON DELETE RESTRICT`, so the database insists on that order).
 
 
+## Documentation conventions
+
+Rules these docs and this repository's commit messages follow. They exist because a document that is
+right when it is written and quietly wrong later is worse than one that never claimed anything.
+
+- **A count carries the step it was measured at.** The lint scanner counts files and the test runner
+  counts tests, and both grow with every step, so a bare `131 files scanned` is a fact about one
+  afternoon and a false statement by Step 27. Written as **131 files scanned, 0 violations as of
+  Step 25** it stays true forever, and a reader can see how old the measurement is without going to
+  the log. A count that is re-measured later is *appended* with its own label rather than edited in
+  place: the Step 23 audit line in `docs/build-sequence.md` carries both `121 files, 0 violations as
+  of Step 23` and `131 files, 0 violations as of Step 25`, because the older number is evidence about
+  a smaller tree, not a mistake to be corrected.
+- **A heading that names a step does not label the counts inside it.** `## Money precision and the
+  money rule (Step 23)` says when the *feature* landed; it says nothing about when the *number* under
+  it was measured. The number needs its own label.
+- **Numbers come from a real run, and say which one.** Every count in these docs is the output of a
+  command that can be run again - `npm test`, `npm run lint`, `npm run test:e2e <file>` - quoted from
+  the run that was made rather than rounded, extrapolated or remembered. Where the number *is* the
+  claim (the 202/409 split of the forced overdraft race, `SUM = 9`), the command that reads it is
+  named next to it.
+- **Commit messages are documents that happen to be immutable**, so the same rule applies to a count
+  in a commit body.
+
 ## Known gaps
 
 Recorded rather than fixed, so that they stay decisions instead of surprises. None of them

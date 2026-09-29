@@ -3,6 +3,8 @@ A literal step-by-step walkthrough, in order, from project setup to deployment. 
 
 Two items identified as MVP-blocking in the architecture plan's gap analysis (decimal precision handling, phone number normalization) are folded into the relevant steps below rather than left as a separate afterthought — they're cheap to do right the first time and expensive to retrofit.
 
+**Documentation convention used throughout this document:** any count of files, tests or lines quoted here, or in a commit message, carries the step it was measured at — `131 files scanned, 0 violations as of Step 25`, never a bare `131 files` — because the tree only grows and an unlabelled count silently becomes false. Evidence quoted below is the verbatim output of a command that can be re-run, and a re-measurement is appended with its own label rather than replacing the older figure. The README's *Documentation conventions* section states the rule in full.
+
 Day 0 — Project Setup & Folder Structure
 Step 1 — Initialize the repository
 
