@@ -171,6 +171,58 @@ function readBooleanFlag(raw: string | undefined, fallback: boolean): boolean {
 export const DEFAULT_FALLBACK_HORIZON_URL = 'http://localhost:8000';
 
 /**
+ * Where a Testnet account is funded from (Step 19).
+ *
+ * Friendbot is Stellar's own Testnet faucet and the only funder that exists there - it
+ * creates an account by paying it 10,000 XLM from its own account, so the newly created
+ * keypair never needs to hold anything to be born. It is deliberately *not* the treasury
+ * account the build sequence mentions for staging: a treasury is a funded account the
+ * operator controls and tops up, and neither exists yet.
+ *
+ * The host is the service's own host rather than the Horizon host: `horizon-testnet`
+ * serves friendbot at `/friendbot` while `friendbot.stellar.org` serves it at `/`, so the
+ * configured value is the *request URL* and `friendbotAccountUrl()` only adds the `addr`
+ * query parameter. Both hosts were verified live: `https://friendbot.stellar.org/?addr=G...`
+ * and `https://horizon-testnet.stellar.org/friendbot?addr=G...` answer a funding request,
+ * while `https://friendbot.stellar.org/friendbot?addr=G...` is a 404.
+ */
+export const DEFAULT_FRIENDBOT_URL = 'https://friendbot.stellar.org/';
+
+/**
+ * Resolves the funder's endpoint.
+ *
+ * Unset (or blank, which is what `STELLAR_FRIENDBOT_URL=` in an `.env` file produces)
+ * means the public Testnet faucet - the same belt-and-braces split as
+ * `resolveFallbackHorizonUrl`: the factory keeps producing something usable and
+ * `validation.schema.ts` is the half that refuses the boot on a blank value.
+ *
+ * A trailing slash is *not* stripped here, unlike the Horizon fallback: this value is
+ * parsed by `URL` rather than concatenated, and `new URL` treats `https://host` and
+ * `https://host/` as the same address.
+ */
+export function resolveFriendbotUrl(override: string | undefined): string {
+  const explicit = override?.trim();
+
+  return explicit === undefined || explicit === '' ? DEFAULT_FRIENDBOT_URL : explicit;
+}
+
+/**
+ * How long one account's provisioning may take before the flow gives up on it
+ * (Step 19), in milliseconds.
+ *
+ * Provisioning runs inside the request that verified the phone number, so this number is
+ * the tail latency added to a response the user is waiting for: registration completes in
+ * milliseconds, and a 30-second ceiling is the point at which a caller is better served by
+ * a success response (the account *is* activated - provisioning is not part of that fact)
+ * and a second attempt later than by a request that hangs.
+ *
+ * Not a per-call timeout: the funder and Horizon have bounds of their own, and this is the
+ * one on the whole sequence, because the failure mode that matters is a *sequence* of
+ * calls each answering just inside their own limit.
+ */
+export const DEFAULT_PROVISIONING_TIMEOUT_MS = 30_000;
+
+/**
  * Resolves the fallback Horizon host.
  *
  * Unset (or blank, which is what `STELLAR_HORIZON_FALLBACK_URL=` in an `.env`
@@ -332,6 +384,22 @@ export default function configuration() {
        * Step 17 (see `DEFAULT_FALLBACK_HORIZON_URL`).
        */
       fallbackHorizonUrl: resolveFallbackHorizonUrl(process.env.STELLAR_HORIZON_FALLBACK_URL),
+      /**
+       * The issuer whose USDC every wallet is given a trustline for (Step 19).
+       *
+       * An issuer is half of an asset's identity on Stellar: `USDC:GBBD...` and
+       * `USDC:GDHU...` are two different assets that happen to share a code, so this is a
+       * required, network-specific value rather than a constant. Testnet's issuer is
+       * Circle's own Testnet account, and the same code on the public network is a
+       * different key - which is exactly why the schema demands a key and not a name.
+       */
+      usdcIssuer: process.env.STELLAR_USDC_ISSUER as string,
+      /** Where a Testnet account is funded from. See `DEFAULT_FRIENDBOT_URL`. */
+      friendbotUrl: resolveFriendbotUrl(process.env.STELLAR_FRIENDBOT_URL),
+      /** Wall-clock ceiling on one account's provisioning. See `DEFAULT_PROVISIONING_TIMEOUT_MS`. */
+      provisioningTimeoutMs: Number(
+        process.env.STELLAR_PROVISIONING_TIMEOUT_MS ?? DEFAULT_PROVISIONING_TIMEOUT_MS,
+      ),
     },
   };
 }

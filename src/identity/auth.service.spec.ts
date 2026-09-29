@@ -5,6 +5,10 @@ import { UserStatus } from '../generated/prisma/enums.js';
 import { type NotificationsService } from '../notifications/notifications.service.js';
 import { SmsDeliveryError } from '../notifications/sms/sms-sender.js';
 import { type PrismaService } from '../prisma/prisma.service.js';
+import {
+  type AccountProvisioningService,
+  type ProvisioningOutcome,
+} from '../wallet/provisioning/account-provisioning.service.js';
 import { AuthService } from './auth.service.js';
 import {
   OtpRateLimitExceededError,
@@ -20,8 +24,8 @@ import { type IssuedTokens, type SessionUser, type TokenService } from './token/
  * Everything around it is faked, so each test names one behaviour - which status
  * code a given situation produces, and crucially *what must not have happened*
  * (no SMS on a 409, no row on a 429, no user created for an unparseable number, no
- * session started by a code that was already spent). The database and Redis are
- * exercised for real in `test/auth.e2e-spec.ts`.
+ * session started by a code that was already spent, no wallet for a code that was
+ * refused). The database and Redis are exercised for real in `test/auth.e2e-spec.ts`.
  */
 
 /** A Ghanaian mobile written the way a user types it, and how it must be stored. */
@@ -235,12 +239,57 @@ class FakeTokenService {
   };
 }
 
+/**
+ * `AccountProvisioningService` as `AuthService` is allowed to see it (Step 19).
+ *
+ * One method, and the shape of its return value is the point: `provisionFor` *reports* an
+ * outcome rather than throwing one, which is what `verifyOtp` is built on. `throwWith`
+ * exists to prove the other half - that even if that contract were broken, the flow is not
+ * relying on it in a way that changes what the client sees.
+ */
+class FakeProvisioning {
+  /**
+   * The transaction's own call log, shared so a call here lands *between* its lines.
+   * That is the only way to tell "provisioned after the commit" from "provisioned
+   * inside the transaction", which are different promises to a user waiting on the
+   * response - and the wrong one holds row locks across a faucet call.
+   */
+  calls: string[] = [];
+
+  readonly provisioned: string[] = [];
+
+  outcome: ProvisioningOutcome = {
+    status: 'provisioned',
+    accountId: 'account-1',
+    publicKey: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+    funding: 'funded',
+    fundingTransactionHash: 'funding-hash',
+    trustlineTransactionHash: 'trustline-hash',
+  };
+
+  /** Set to make `provisionFor` throw the way nothing in Step 19 actually does. */
+  throwWith: Error | null = null;
+
+  provisionFor = async (userId: string): Promise<ProvisioningOutcome> => {
+    this.calls.push('provision');
+
+    if (this.throwWith !== null) {
+      throw this.throwWith;
+    }
+
+    this.provisioned.push(userId);
+
+    return this.outcome;
+  };
+}
+
 interface Harness {
   prisma: FakePrisma;
   otp: FakeOtpService;
   limiter: FakeRateLimiter;
   notifications: FakeNotifications;
   tokens: FakeTokenService;
+  provisioning: FakeProvisioning;
   auth: AuthService;
 }
 
@@ -250,6 +299,9 @@ function createHarness(): Harness {
   const limiter = new FakeRateLimiter();
   const notifications = new FakeNotifications();
   const tokens = new FakeTokenService();
+  const provisioning = new FakeProvisioning();
+
+  provisioning.calls = prisma.calls;
 
   return {
     prisma,
@@ -257,6 +309,7 @@ function createHarness(): Harness {
     limiter,
     notifications,
     tokens,
+    provisioning,
     auth: new AuthService(
       prisma as unknown as PrismaService,
       createConfig(),
@@ -264,6 +317,7 @@ function createHarness(): Harness {
       limiter as unknown as OtpRateLimiterService,
       notifications as unknown as NotificationsService,
       tokens as unknown as TokenService,
+      provisioning as unknown as AccountProvisioningService,
     ),
   };
 }
@@ -521,7 +575,7 @@ describe('AuthService.verifyOtp', () => {
 
   for (const [description, outcome, expectedStatus, expectedMessage] of FAILED_CHECKS) {
     it(`maps ${description} onto a ${expectedStatus} without activating the user`, async () => {
-      const { auth, prisma, otp } = createHarness();
+      const { auth, prisma, otp, provisioning } = createHarness();
       const user = seedUser(prisma);
       otp.outcome = outcome;
 
@@ -537,6 +591,9 @@ describe('AuthService.verifyOtp', () => {
       expect(prisma.calls).toEqual(['findUnique']);
       expect(user.status).toBe(UserStatus.PENDING_VERIFICATION);
       expect(user.phoneVerifiedAt).toBeNull();
+      // Nor a wallet: provisioning is the consequence of a *verified* number, so a
+      // refused code cannot leave a funded account behind either.
+      expect(provisioning.provisioned).toEqual([]);
     });
   }
 
@@ -556,9 +613,17 @@ describe('AuthService.verifyOtp', () => {
     // with the code exactly as the user typed it.
     expect(otp.checked).toEqual([{ userId: user.id, code: '123456' }]);
 
-    // Consume and activate are one transaction, in that order.
+    // Consume and activate are one transaction, in that order. Provisioning happens after
+    // it - Step 19, asserted in its own test below - which is why this is the first five
+    // entries rather than the whole log.
     expect(prisma.transactionCount).toBe(1);
-    expect(prisma.calls).toEqual(['findUnique', 'begin', 'tx.consume', 'tx.activate', 'commit']);
+    expect(prisma.calls.slice(0, 5)).toEqual([
+      'findUnique',
+      'begin',
+      'tx.consume',
+      'tx.activate',
+      'commit',
+    ]);
     expect(user.status).toBe(UserStatus.ACTIVE);
     expect(user.phoneVerifiedAt).not.toBeNull();
 
@@ -574,6 +639,62 @@ describe('AuthService.verifyOtp', () => {
     // `TokenService.issue` reads nothing but the id.
     expect(tokens.issued).toHaveLength(1);
     expect(tokens.issued[0]).toMatchObject({ id: user.id, status: UserStatus.ACTIVE });
+  });
+
+  /**
+   * Step 19, and the ordering here is the whole point of the test: `provision` lands
+   * *after* `commit` in the shared call log, so the wallet is built once the fact that
+   * makes the user a customer is durable - not inside the transaction, where a slow
+   * faucet would hold the user's row locks (and where a crash would roll back a
+   * verification because a third party was slow).
+   */
+  it('provisions the wallet for the user it just verified, after the commit', async () => {
+    const { auth, prisma, provisioning } = createHarness();
+    const user = seedUser(prisma);
+
+    await auth.verifyOtp({ phoneNumber: LOCAL_NUMBER, code: '123456' });
+
+    expect(prisma.calls).toEqual([
+      'findUnique',
+      'begin',
+      'tx.consume',
+      'tx.activate',
+      'commit',
+      'provision',
+    ]);
+    // For the id the *database* holds, not the number the client sent: the wallet is
+    // attached to a user row, and the number is only what was verified.
+    expect(provisioning.provisioned).toEqual([user.id]);
+  });
+
+  /**
+   * The response is the contract `verifyOtp` has always had, and provisioning cannot
+   * change it - because by the time it runs the code has been spent, so a retry cannot
+   * succeed and an error would tell a user they failed at the one thing they just did.
+   * An `incomplete` outcome is the ordinary shape of that: the account exists and has no
+   * wallet yet, and the caller is told the same thing it would have been told otherwise.
+   */
+  it('answers exactly as before when provisioning comes back incomplete', async () => {
+    const { auth, prisma, provisioning } = createHarness();
+    const user = seedUser(prisma);
+    provisioning.outcome = {
+      status: 'incomplete',
+      stage: 'funding',
+      accountId: 'account-1',
+      publicKey: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      detail: 'friendbot answered 503',
+    };
+
+    const response = await auth.verifyOtp({ phoneNumber: LOCAL_NUMBER, code: '123456' });
+
+    expect(response.userId).toBe(user.id);
+    // The session is still started: the phone number *is* verified, and that is what the
+    // tokens are for. Only the wallet is missing, which is a retry for the service.
+    expect(response.accessToken).toBe('access-token-1');
+    expect(response.refreshToken).toBe('refresh-token-1');
+    // And no stage leaks into the body - a client that branched on this would be a
+    // client making a decision that belongs to the service.
+    expect(JSON.stringify(response)).not.toContain('funding');
   });
 
   it('accepts a number in any format, because it normalizes before looking it up', async () => {
@@ -737,6 +858,24 @@ describe('AuthService.login', () => {
 
     // The row as it was read, with no in-memory patch - because nothing was written.
     expect(tokens.issued).toEqual([user]);
+  });
+
+  /**
+   * Sign-in is not a provisioning trigger, and this is the assertion that keeps it that
+   * way: a user who can sign in has been verified before, so their wallet already exists
+   * (`AccountProvisioningService` answers `already-provisioned` and funds nothing). A
+   * sign-in that called it would be a network round trip on the hot path for every
+   * returning user, to discover something this flow already knows.
+   */
+  it('provisions nothing: signing in does not create wallets', async () => {
+    const { auth, prisma, tokens, provisioning } = createHarness();
+    seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+
+    await auth.login({ phoneNumber: LOCAL_NUMBER, code: '123456' });
+
+    expect(provisioning.provisioned).toEqual([]);
+    expect(prisma.calls).toEqual(['findUnique', 'consume']);
+    expect(tokens.issued).toHaveLength(1);
   });
 
   it('refuses a code that was already used, and starts no session for it', async () => {

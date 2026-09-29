@@ -21,6 +21,12 @@ import { UserStatus } from '../generated/prisma/enums.js';
 import { type UserModel } from '../generated/prisma/models.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import {
+  // A value import, not `import type`: Nest resolves this constructor parameter from
+  // emitted metadata, and a type-only import erases the class that the metadata names.
+  AccountProvisioningService,
+  type ProvisioningOutcome,
+} from '../wallet/provisioning/account-provisioning.service.js';
 import { type LoginCodeResponseDto } from './dto/login-code-response.dto.js';
 import { type LoginDto, type LoginResponseDto } from './dto/login.dto.js';
 import { type SubmittedPhoneNumberDto } from './dto/phone-number.dto.js';
@@ -55,6 +61,21 @@ import { TokenService, type IssuedTokens, type SessionUser } from './token/token
 type RegisteredUser = Pick<UserModel, 'id' | 'status' | 'handle'>;
 
 /**
+ * The wallet half of a verification log line (Step 19).
+ *
+ * `provisioned` and `already-provisioned` are the same good news for the operator - the
+ * user has an account - and `incomplete` names how far the attempt got, which
+ * `AccountProvisioningService` has already logged in detail (public key, transaction
+ * hashes, stage). What this adds is one line per verification instead of a line the
+ * operator has to join against another by user id.
+ */
+function describeWallet(outcome: ProvisioningOutcome): string {
+  return outcome.status === 'incomplete'
+    ? `wallet incomplete${outcome.stage === undefined ? '' : ` at stage ${outcome.stage}`}`
+    : `wallet ${outcome.status}`;
+}
+
+/**
  * Registration, OTP verification and sessions (Steps 10, 14 and 16).
  *
  * The order of the steps inside `register` is the interesting part, and each
@@ -68,6 +89,10 @@ type RegisteredUser = Pick<UserModel, 'id' | 'status' | 'handle'>;
  * checked is where they differ, and the difference is the point: verification changes
  * the account (it becomes `ACTIVE`), while sign-in changes nothing at all and only
  * starts a session.
+ *
+ * Step 19 adds the second consequence of verification: it provisions the wallet. That call
+ * is inside `verifyOtp`, below the transaction that activates the user, and the note there
+ * is the long version of why it sits exactly there and why it cannot change the answer.
  */
 @Injectable()
 export class AuthService {
@@ -80,6 +105,13 @@ export class AuthService {
     private readonly otpRateLimiter: OtpRateLimiterService,
     private readonly notifications: NotificationsService,
     private readonly tokens: TokenService,
+    /**
+     * The one wallet dependency in this bounded context, and the direction of the import is
+     * deliberate: identity does not hold key material or talk to Horizon, it *asks* the
+     * wallet module for the thing Step 19 describes - "a funded account, once the phone
+     * number is verified" - and `WalletModule` is the module that knows how.
+     */
+    private readonly provisioning: AccountProvisioningService,
   ) {}
 
   /**
@@ -345,9 +377,37 @@ export class AuthService {
      */
     const session: SessionUser = { ...user, status: UserStatus.ACTIVE };
 
+    /**
+     * Step 19: the wallet, for a user who has just proved their number.
+     *
+     * **After the commit, never inside it.** Provisioning creates a key at KMS, calls a
+     * faucet over HTTP and submits a transaction to Horizon - a database transaction held
+     * open across those calls holds its row locks for as long as a public Testnet faucet
+     * feels like taking, and a crash inside it would roll back *verification* because a
+     * third party was slow. `status = ACTIVE` and `phone_verified_at` are the facts that
+     * make this user a customer; the wallet is a consequence of them, not a condition.
+     *
+     * **Awaited, and still unable to change the answer.** Awaited because a floating
+     * promise in a request handler is a failure nobody ever sees and an unhandled
+     * rejection waiting to happen. Unable to change the answer because `provisionFor`
+     * reports every failure as an outcome rather than as an exception - and the reason is
+     * this exact call site: the OTP has been spent by the transaction above, so a client
+     * that retries cannot succeed, and an error response here would tell a user they
+     * failed at the one thing they just did successfully.
+     *
+     * The outcome is not in the response. Step 20's balance endpoint is where a client
+     * learns what its wallet holds, and a client that could read a provisioning stage out
+     * of *this* body would be a client that branches on the state of the chain - which is
+     * the wrong place to put it, because a failed attempt is retried by the service that
+     * knows how, not by a user who cannot.
+     */
+    const wallet = await this.provisioning.provisionFor(user.id);
+
     const issued = await this.tokens.issue(session);
 
-    this.logger.log(`Phone verified for ${maskPhoneNumber(phoneNumber)} (user ${user.id})`);
+    this.logger.log(
+      `Phone verified for ${maskPhoneNumber(phoneNumber)} (user ${user.id}); ${describeWallet(wallet)}`,
+    );
 
     return {
       ...this.toTokenPair(issued),

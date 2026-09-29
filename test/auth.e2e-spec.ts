@@ -17,6 +17,10 @@ import {
 } from './../src/notifications/sms/sms-sender.js';
 import { PrismaService } from './../src/prisma/prisma.service.js';
 import { RedisService } from './../src/redis/redis.service.js';
+import {
+  AccountProvisioningService,
+  type ProvisioningOutcome,
+} from './../src/wallet/provisioning/account-provisioning.service.js';
 
 /**
  * The Day 1 exit criterion, over real HTTP against a real database and Redis:
@@ -36,6 +40,11 @@ import { RedisService } from './../src/redis/redis.service.js';
  * instead of a phone, and Africa's Talking is never called from a test. Every
  * other participant is the production one: the global validation pipe, the
  * exception filter, Prisma, Redis and the OTP policy.
+ *
+ * Step 19's wallet provisioning is the one other thing replaced, and for the same kind of
+ * reason - see `RecordingProvisioning`. It sits *behind* a verification, so leaving it real
+ * would make every verify in this file reach KMS, a faucet and Horizon to test something
+ * else.
  */
 
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
@@ -83,6 +92,41 @@ class CapturingSmsSender implements SmsSender {
 const smsSender = new CapturingSmsSender();
 
 /**
+ * `AccountProvisioningService`, replaced (Step 19).
+ *
+ * `verifyOtp` provisions a wallet, so the *real* flow reaches KMS, friendbot and Horizon
+ * from behind an endpoint this file exercises in a dozen tests. Two reasons that cannot
+ * stand: a run would fail for reasons that have nothing to do with registration and
+ * sessions (a faucet that is down, an expired AWS session), and on a machine whose AWS
+ * credentials work it would create real Testnet accounts - and `stellar_accounts` is
+ * `ON DELETE RESTRICT`, so `afterAll` could no longer clean up after itself.
+ *
+ * What is left is the part this file is actually positioned to check: that verification
+ * *asks* for the right user's wallet. Everything inside the wallet has its own offline spec
+ * (`account-provisioning.service.spec.ts`). Step 19's live run - a real funded account with a
+ * real USDC trustline on Testnet - is a separate, still-open item: nothing in this file should
+ * be read as evidence that it has happened.
+ */
+class RecordingProvisioning {
+  readonly provisioned: string[] = [];
+
+  async provisionFor(userId: string): Promise<ProvisioningOutcome> {
+    this.provisioned.push(userId);
+
+    return {
+      status: 'provisioned',
+      accountId: `account-${userId}`,
+      publicKey: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      funding: 'funded',
+      fundingTransactionHash: 'funding-hash',
+      trustlineTransactionHash: 'trustline-hash',
+    };
+  }
+}
+
+const provisioning = new RecordingProvisioning();
+
+/**
  * A Ghanaian mobile that has never been registered before.
  *
  * Random because the two things that make this flow interesting - the per-number
@@ -98,9 +142,9 @@ function uniqueLocalNumber(): string {
 /**
  * How many numbers this run reserves.
  *
- * Seventeen are drawn today - one per registration flow, and one for the
- * never-registered case - so the pool is deliberately roomy: a test added later should
- * not have to remember to resize it, and `takeReservedNumber` fails loudly if it does.
+ * One per registration flow, and one for the never-registered case - so the pool is
+ * deliberately roomy: a test added later should not have to remember to resize it, and
+ * `takeReservedNumber` fails loudly if it does.
  */
 const RESERVED_NUMBERS = 40;
 
@@ -289,6 +333,10 @@ describe('Registration, verification and sessions (e2e)', () => {
     })
       .overrideProvider(SMS_SENDER)
       .useValue(smsSender)
+      // Step 19: the wallet, out of the way of everything below - see
+      // `RecordingProvisioning` for why, and for the one thing it still asserts.
+      .overrideProvider(AccountProvisioningService)
+      .useValue(provisioning)
       .compile();
 
     app = moduleFixture.createNestApplication();
@@ -658,6 +706,24 @@ describe('Registration, verification and sessions (e2e)', () => {
       status: UserStatus.ACTIVE,
       handle: null,
     });
+  });
+
+  it('asks for a wallet for the user whose number was just verified (Step 19)', async () => {
+    const { local, e164 } = freshNumber();
+    const before = provisioning.provisioned.length;
+
+    const session = await registerAndVerify(app, local, e164);
+
+    // One wallet, for the row the database holds - and it is asked for *inside* the verify
+    // request, which is what makes the account exist "without the user doing anything
+    // else". `AccountProvisioningService` is the stub here (see
+    // `RecordingProvisioning`), so what this proves is the trigger rather than the wallet.
+    expect(provisioning.provisioned.slice(before)).toEqual([session.userId]);
+
+    // And nothing about it is in the response: a client that could read a provisioning
+    // stage out of the verification body would be a client making a decision that belongs
+    // to the service.
+    expect(JSON.stringify(session)).not.toContain('wallet');
   });
 
   it('adds a second session when a code is used to sign in, without touching the first', async () => {

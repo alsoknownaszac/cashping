@@ -6,6 +6,11 @@ import { AccountLock } from './account-lock.js';
 import { STELLAR_ACCOUNT_SOURCE, type StellarAccountSource } from './account-source.js';
 import { StellarAccountSession, type TransactionOptions } from './stellar-account-session.js';
 import { networkPassphraseFor, parseStellarNetwork } from './stellar-network.js';
+import {
+  STELLAR_TRANSACTION_SUBMITTER,
+  type StellarTransactionSubmitter,
+  type SubmittedTransaction,
+} from './transaction-submitter.js';
 
 /** A transaction request: which account pays, and what it should do. */
 export interface BuildTransactionRequest extends TransactionOptions {
@@ -32,6 +37,10 @@ export interface BuildTransactionRequest extends TransactionOptions {
  * 3. **Nothing here holds a secret.** `generateKeypair` returns a keypair to its
  *    caller and keeps no reference to it; custody (KMS-encrypted seeds) is Step
  *    18's problem, and no key material reaches this class's fields or any log.
+ * 4. **There is one way to reach Horizon.** Loading a sequence number and submitting
+ *    a signed transaction are both ports this class owns, so no other file imports a
+ *    Horizon client, and a submission failure is classified the same way wherever it
+ *    happens.
  *
  * ## The two ways in, and why both exist
  *
@@ -67,6 +76,8 @@ export class StellarService {
   constructor(
     config: ConfigService,
     @Inject(STELLAR_ACCOUNT_SOURCE) private readonly accounts: StellarAccountSource,
+    @Inject(STELLAR_TRANSACTION_SUBMITTER)
+    private readonly submitter: StellarTransactionSubmitter,
   ) {
     // Read and validated once, at construction: boot fails on a bad
     // `STELLAR_NETWORK`, not the first payment of the day.
@@ -137,5 +148,24 @@ export class StellarService {
     return this.withAccount(request.sourceAccount, (account) =>
       account.build(request.operations, request),
     );
+  }
+
+  /**
+   * Sends an already-signed transaction to the network, and resolves with what
+   * Horizon said about it.
+   *
+   * The caller signs, not this class: signing needs the account's keypair, which
+   * lives behind custody (Step 18) and is opened by the flow that knows what it is
+   * spending - not held here, where it could outlive the call. What this method adds
+   * is the *single exit*: every submission in the app goes through one port, so a
+   * classification of "rejected" versus "no verdict" is never re-derived locally.
+   *
+   * It deliberately does not take the account lock. Submitting is the *end* of a
+   * locked section, not a step inside one that a second caller can interleave with -
+   * the flows that must hold a lock across build-and-submit do so by calling this
+   * from inside their `withAccount` callback (see `withAccount` above).
+   */
+  submitTransaction(transaction: Transaction): Promise<SubmittedTransaction> {
+    return this.submitter.submit(transaction);
   }
 }

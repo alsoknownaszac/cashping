@@ -46,6 +46,13 @@ services:
       AWS_KMS_KEY_ID: ${AWS_KMS_KEY_ID:-arn:aws:kms:eu-west-1:000000000000:key/00000000-0000-0000-0000-000000000000}
       STELLAR_NETWORK: ${STELLAR_NETWORK:-TESTNET}
       STELLAR_HORIZON_URL: ${STELLAR_HORIZON_URL:-https://horizon-testnet.stellar.org}
+      # Step 19: the USDC issuer every provisioned account trusts. Required by the env
+      # schema, and the fallback is Circle's *Testnet* issuer so `docker compose up` works
+      # on a fresh clone: the schema refuses anything that is not a Stellar account id, so
+      # the placeholder has to be a real key on the configured network (a nonsense value
+      # would stop the container from starting, which is the schema doing its job).
+      # Testnet USDC is not money; a real deployment sets this to the issuer it is paid in.
+      STELLAR_USDC_ISSUER: ${STELLAR_USDC_ISSUER:-GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5}
       # [optional] Failover Horizon host (Step 17). Commented out because "${VAR:-}"
       # would forward an *empty* string, which the env schema refuses; uncomment to
       # point it at a second host. Note that a Horizon running on the host machine

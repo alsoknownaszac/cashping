@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { NotificationsModule } from '../notifications/notifications.module.js';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { RedisModule } from '../redis/redis.module.js';
+import { WalletModule } from '../wallet/wallet.module.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
 import {
@@ -28,7 +29,15 @@ const SECONDS_PER_MINUTE = 60;
  *   - `PrismaModule` - the users, OTP and refresh-token rows;
  *   - `RedisModule` - the per-number request counter (Step 13);
  *   - `NotificationsModule` - the SMS that carries the code (Step 11);
- *   - `JwtModule` - the signing secret and the access-token lifetime (Step 16).
+ *   - `JwtModule` - the signing secret and the access-token lifetime (Step 16);
+ *   - `WalletModule` - provisioning, and only provisioning (Step 19): `verifyOtp` is the
+ *     event the build sequence names as the trigger ("triggered once `phoneVerifiedAt` is
+ *     set"), so this module imports the wallet module's *one* exported provider rather
+ *     than the module's internals. `WalletModule` exports nothing else, deliberately: key
+ *     custody and Horizon are not this module's business, and an identity service holding
+ *     a `StellarService` would be a second place that decides how a transaction is built.
+ *     The dependency runs one way - identity asks for a wallet, the wallet knows nothing
+ *     about users' sessions - and `WalletModule` does not import this one.
  *
  * There is no separate token or session module, and that is a decision rather than
  * an omission: `TokenService` and `JwtStrategy` are two halves of one agreement -
@@ -37,10 +46,10 @@ const SECONDS_PER_MINUTE = 60;
  * and export the same two providers, with one more file to read to see that.
  *
  * Nothing is exported yet, and that is a real state of the world: no other module
- * consumes identity for now. Day 2's wallet provisioning will import this module
- * (to act on `phoneVerifiedAt`), and the account-suspension follow-up is the change
- * that needs `TokenService` from outside - *that* is the change that adds the export,
- * because an export nothing imports is a guess about the future.
+ * consumes identity for now. The account-suspension follow-up is the change that needs
+ * `TokenService` from outside - *that* is the change that adds the export, because an
+ * export nothing imports is a guess about the future. (`WalletModule`'s export is the
+ * other half of this rule: it arrived when this module became its consumer, not before.)
  *
  * `ConfigService` is not imported here because `ConfigModule` is global
  * (`app.module.ts`), which is the one thing that should be.
@@ -50,6 +59,7 @@ const SECONDS_PER_MINUTE = 60;
     PrismaModule,
     RedisModule,
     NotificationsModule,
+    WalletModule,
     /**
      * The secret *and* the signing options, registered once so that signing and
      * verifying cannot disagree: `JwtStrategy` reads the same three constants and the

@@ -27,6 +27,7 @@ const VALID_ENV: Record<string, string> = {
   AWS_KMS_KEY_ID: 'arn:aws:kms:eu-west-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab',
   STELLAR_NETWORK: 'TESTNET',
   STELLAR_HORIZON_URL: 'https://horizon-testnet.stellar.org',
+  STELLAR_USDC_ISSUER: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
 };
 
 /** Every variable the schema marks as required (i.e. not `@IsOptional()`). */
@@ -42,6 +43,7 @@ const REQUIRED_KEYS = [
   'AWS_KMS_KEY_ID',
   'STELLAR_NETWORK',
   'STELLAR_HORIZON_URL',
+  'STELLAR_USDC_ISSUER',
 ] as const;
 
 /** Runs `fn` and returns the error it threw; fails the test if it did not throw. */
@@ -180,6 +182,82 @@ describe('environment validation', () => {
     it(`rejects STELLAR_HORIZON_FALLBACK_URL=${JSON.stringify(value)}`, () => {
       expect(() => validate({ ...VALID_ENV, STELLAR_HORIZON_FALLBACK_URL: value })).toThrowError(
         /STELLAR_HORIZON_FALLBACK_URL/,
+      );
+    });
+  }
+
+  // --- Stellar provisioning (Step 19) --------------------------------------
+
+  it('accepts a Stellar account address as STELLAR_USDC_ISSUER', () => {
+    expect(validate({ ...VALID_ENV }).STELLAR_USDC_ISSUER).toBe(VALID_ENV['STELLAR_USDC_ISSUER']);
+  });
+
+  // The mistakes that reach a config file in practice, and none of them is cosmetic:
+  // the `S...` *secret* key the same dashboard shows next to the public one (an issuer
+  // that is a secret is a key leak in a log, and the asset still cannot be trusted), a
+  // truncated paste, a lowercase one (Stellar addresses are uppercase base32, and nothing
+  // downstream accepts the lowercase spelling, so accepting it here would only postpone
+  // the failure to the first trustline build), and a bare code - the other half of the
+  // asset pair, which is never the issuer.
+  for (const value of [
+    '',
+    '   ',
+    'SBBR47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+    'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA',
+    'gbbd47if6lwk7p7mdevscwr7dpuwv3ny3dtqevfl4nat4aqh3zllfla5',
+    'USDC',
+  ]) {
+    it(`rejects STELLAR_USDC_ISSUER=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, STELLAR_USDC_ISSUER: value })).toThrowError(
+        /STELLAR_USDC_ISSUER/,
+      );
+    });
+  }
+
+  // Horizon serves the same faucet on a path, which is the other spelling worth
+  // supporting - see `FriendbotFunder`.
+  it('accepts a STELLAR_FRIENDBOT_URL that is a URL', () => {
+    const funder = 'https://horizon-testnet.stellar.org/friendbot';
+
+    expect(validate({ ...VALID_ENV, STELLAR_FRIENDBOT_URL: funder })).toMatchObject({
+      STELLAR_FRIENDBOT_URL: funder,
+    });
+  });
+
+  it('leaves STELLAR_FRIENDBOT_URL undefined when unset, so the Testnet faucet default applies', () => {
+    expect(validate({ ...VALID_ENV }).STELLAR_FRIENDBOT_URL).toBeUndefined();
+  });
+
+  // Blank is what `VAR=` in an .env file produces, and the scheme-less value is a copied
+  // hostname: the funder parses this into a `URL` on every request, so both would boot and
+  // then fail at the first account - the least useful place to find out a scheme is
+  // missing. Same split as STELLAR_HORIZON_FALLBACK_URL.
+  for (const value of ['', '   ', 'friendbot.stellar.org']) {
+    it(`rejects STELLAR_FRIENDBOT_URL=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, STELLAR_FRIENDBOT_URL: value })).toThrowError(
+        /STELLAR_FRIENDBOT_URL/,
+      );
+    });
+  }
+
+  it('coerces STELLAR_PROVISIONING_TIMEOUT_MS to a number', () => {
+    const result = validate({ ...VALID_ENV, STELLAR_PROVISIONING_TIMEOUT_MS: '45000' });
+
+    expect(result.STELLAR_PROVISIONING_TIMEOUT_MS).toBe(45_000);
+    expect(typeof result.STELLAR_PROVISIONING_TIMEOUT_MS).toBe('number');
+  });
+
+  it('leaves STELLAR_PROVISIONING_TIMEOUT_MS undefined when unset, so the factory default applies', () => {
+    expect(validate({ ...VALID_ENV }).STELLAR_PROVISIONING_TIMEOUT_MS).toBeUndefined();
+  });
+
+  // Zero is the one that matters most: it reads like a working timeout and behaves like a
+  // disabled one, which is why the lower bound is one millisecond rather than zero. The
+  // upper bound is the point at which waiting is no longer a strategy.
+  for (const value of ['', '   ', 'soon', '30000.5', '0', '-1', '700000']) {
+    it(`rejects STELLAR_PROVISIONING_TIMEOUT_MS=${JSON.stringify(value)}`, () => {
+      expect(() => validate({ ...VALID_ENV, STELLAR_PROVISIONING_TIMEOUT_MS: value })).toThrowError(
+        /STELLAR_PROVISIONING_TIMEOUT_MS/,
       );
     });
   }

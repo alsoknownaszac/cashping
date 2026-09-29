@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { ConfigService } from '@nestjs/config';
 import { Keypair } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
-import { KmsKeyNotFoundError, KeyCustodyUnavailableError } from './../src/wallet/custody/key-wrapper.js';
+import {
+  KmsKeyNotFoundError,
+  KeyCustodyUnavailableError,
+} from './../src/wallet/custody/key-wrapper.js';
 import { KmsKeyWrapper, createKmsClient } from './../src/wallet/custody/kms-key-wrapper.js';
 import { SecretEnvelopeError } from './../src/wallet/custody/secret-envelope.js';
 import {
@@ -48,7 +51,7 @@ function configWith(overrides: Record<string, string | undefined> = {}): ConfigS
     'aws.accessKeyId': process.env['AWS_ACCESS_KEY_ID'] ?? 'test',
     'aws.secretAccessKey': process.env['AWS_SECRET_ACCESS_KEY'] ?? 'test',
     'aws.kmsKeyId': process.env['AWS_KMS_KEY_ID'],
-    'nodeEnv': 'test',
+    nodeEnv: 'test',
     'stellar.network': 'TESTNET',
     'stellar.horizonUrl': 'https://horizon-testnet.stellar.org',
     'stellar.fallbackHorizonUrl': 'http://localhost:8000',
@@ -74,13 +77,28 @@ function wrapperWith(overrides: Record<string, string | undefined> = {}): KmsKey
   return new KmsKeyWrapper(configWith(overrides), createKmsClient);
 }
 
-/** The real service. `StellarService` is real too, with an account source it never calls. */
+/** The real service. `StellarService` is real too, with two ports it never reaches. */
 function serviceWith(overrides: Record<string, string | undefined> = {}): SeedCustodyService {
-  const stellar = new StellarService(configWith(overrides), {
-    loadAccount: () => {
-      throw new Error('custody never loads an account: this spec has no Horizon');
+  const stellar = new StellarService(
+    configWith(overrides),
+    {
+      loadAccount: () => {
+        throw new Error('custody never loads an account: this spec has no Horizon');
+      },
     },
-  });
+    {
+      /**
+       * Step 19 gave `StellarService` a second port - somewhere to send a signed
+       * transaction - and it is filled in for the same reason the account source is:
+       * the service under test needs a real `StellarService`, and this spec is about
+       * key material, so neither Horizon nor a funder is involved. A call to either
+       * is a failure of the spec, not a request to make.
+       */
+      submit: () => {
+        throw new Error('custody never submits a transaction: this spec has no Horizon');
+      },
+    },
+  );
 
   return new SeedCustodyService(wrapperWith(overrides), stellar);
 }
@@ -142,7 +160,9 @@ describe.skipIf(!ENABLED)('key custody against a live KMS endpoint', () => {
     // three different blobs.
     expect(new Set(sealed.map((account) => account.accountId)).size).toBe(3);
     expect(new Set(sealed.map((account) => account.encryptedSecretKey)).size).toBe(3);
-    expect(new Set(sealed.map((account) => wrappedDataKeyOf(account).toString('base64url'))).size).toBe(3);
+    expect(
+      new Set(sealed.map((account) => wrappedDataKeyOf(account).toString('base64url'))).size,
+    ).toBe(3);
 
     // Each row records the key that actually wrapped it, as a resolved ARN.
     for (const account of sealed) {
@@ -208,6 +228,11 @@ describe.skipIf(!ENABLED)('key custody against a live KMS endpoint', () => {
     // key on the row verifies. That is the one assertion a fake KMS could never make.
     const signature = signer.sign(Buffer.from('cashping step 18', 'utf8'));
 
-    expect(Keypair.fromPublicKey(sealed.publicKey).verify(Buffer.from('cashping step 18', 'utf8'), signature)).toBe(true);
+    expect(
+      Keypair.fromPublicKey(sealed.publicKey).verify(
+        Buffer.from('cashping step 18', 'utf8'),
+        signature,
+      ),
+    ).toBe(true);
   });
 });

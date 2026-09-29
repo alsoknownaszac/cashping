@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import configuration, {
   DEFAULT_CORS_ALLOWED_ORIGINS,
   DEFAULT_FALLBACK_HORIZON_URL,
+  DEFAULT_FRIENDBOT_URL,
+  DEFAULT_PROVISIONING_TIMEOUT_MS,
   DEFAULT_SWAGGER_ENABLED,
 } from './configuration.js';
 
@@ -29,11 +31,15 @@ describe('configuration', () => {
   const originalValue = process.env['CORS_ALLOWED_ORIGINS'];
   const originalSwaggerValue = process.env['ENABLE_SWAGGER'];
   const originalFallbackValue = process.env['STELLAR_HORIZON_FALLBACK_URL'];
+  const originalFriendbotValue = process.env['STELLAR_FRIENDBOT_URL'];
+  const originalTimeoutValue = process.env['STELLAR_PROVISIONING_TIMEOUT_MS'];
 
   afterEach(() => {
     restore('CORS_ALLOWED_ORIGINS', originalValue);
     restore('ENABLE_SWAGGER', originalSwaggerValue);
     restore('STELLAR_HORIZON_FALLBACK_URL', originalFallbackValue);
+    restore('STELLAR_FRIENDBOT_URL', originalFriendbotValue);
+    restore('STELLAR_PROVISIONING_TIMEOUT_MS', originalTimeoutValue);
   });
 
   describe('cors.allowedOrigins', () => {
@@ -138,6 +144,51 @@ describe('configuration', () => {
       expect(configuration().stellar.fallbackHorizonUrl).toBe(
         'https://horizon.internal.cashping.co',
       );
+    });
+  });
+
+  describe('stellar.friendbotUrl', () => {
+    it('defaults to the public Testnet faucet when the variable is unset', () => {
+      delete process.env['STELLAR_FRIENDBOT_URL'];
+
+      expect(DEFAULT_FRIENDBOT_URL).toBe('https://friendbot.stellar.org/');
+      expect(configuration().stellar.friendbotUrl).toBe(DEFAULT_FRIENDBOT_URL);
+    });
+
+    it('takes a supplied endpoint unchanged', () => {
+      // Deliberately *not* trimmed of its trailing slash, unlike the Horizon fallback:
+      // the funder parses this with `URL` rather than concatenating it, and `new URL`
+      // reads `https://host` and `https://host/` as the same address. The path form is
+      // what Horizon itself serves the faucet on, so it has to survive intact.
+      process.env['STELLAR_FRIENDBOT_URL'] = ' https://horizon-testnet.stellar.org/friendbot';
+
+      expect(configuration().stellar.friendbotUrl).toBe(
+        'https://horizon-testnet.stellar.org/friendbot',
+      );
+    });
+
+    it('reads an empty value as unset, which the schema refuses separately', () => {
+      process.env['STELLAR_FRIENDBOT_URL'] = '';
+
+      expect(configuration().stellar.friendbotUrl).toBe(DEFAULT_FRIENDBOT_URL);
+    });
+  });
+
+  describe('stellar.provisioningTimeoutMs', () => {
+    it('defaults to 30 seconds when the variable is unset', () => {
+      delete process.env['STELLAR_PROVISIONING_TIMEOUT_MS'];
+
+      expect(DEFAULT_PROVISIONING_TIMEOUT_MS).toBe(30_000);
+      expect(configuration().stellar.provisioningTimeoutMs).toBe(DEFAULT_PROVISIONING_TIMEOUT_MS);
+    });
+
+    it('reads a supplied value as a number, because the schema coerces it', () => {
+      // The value reaches this factory already coerced by `validation.schema.ts`
+      // (`NUMERIC_KEYS`); reading it with `Number()` here is what keeps the factory
+      // correct when it is called directly, in a spec like this one.
+      process.env['STELLAR_PROVISIONING_TIMEOUT_MS'] = '45000';
+
+      expect(configuration().stellar.provisioningTimeoutMs).toBe(45_000);
     });
   });
 

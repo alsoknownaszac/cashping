@@ -37,7 +37,15 @@ export enum StellarNetwork {
  * Environment variables that hold a number but arrive as strings via
  * `process.env`, and therefore need coercing before validation.
  */
-const NUMERIC_KEYS = ['PORT'] as const;
+/**
+ * Environment variables that hold a number but arrive as strings via
+ * `process.env`, and therefore need coercing before validation.
+ *
+ * `STELLAR_PROVISIONING_TIMEOUT_MS` is listed because `@IsInt()` needs a number to be
+ * able to say anything useful: left as a string it would fail as "must be an integer
+ * number" for *every* value, including correct ones.
+ */
+const NUMERIC_KEYS = ['PORT', 'STELLAR_PROVISIONING_TIMEOUT_MS'] as const;
 
 /**
  * Environment variables that hold a boolean but arrive as strings via
@@ -93,6 +101,23 @@ const AWS_REGION_PATTERN = /^[a-z]{2}(?:-[a-z]+)+-\d{1,2}$/;
  */
 const AWS_KMS_KEY_ID_PATTERN =
   /^(?:arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:(?:key\/[0-9a-fA-F-]{36}|alias\/[A-Za-z0-9/_-]+)|alias\/[A-Za-z0-9/_-]+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
+
+/**
+ * A Stellar account address (`STELLAR_USDC_ISSUER`, Step 19): a `G`, 55 more characters
+ * of base32, and nothing else.
+ *
+ * Checked as a shape *and* as a checksum? No - the checksum is a job for the SDK, which
+ * this app already depends on, and the schema's job is to be readable. What it must catch
+ * is the two mistakes that reach a config file in practice: the `S...` *secret* key that
+ * the same dashboard shows next to the public one (an issuer that is a secret is a key
+ * leak in a log and an asset nobody can hold), and a truncated paste. Both are wrong
+ * under this pattern, and the error message says which shape is wanted.
+ *
+ * Case matters here and is not normalised: Stellar addresses are uppercase base32, and a
+ * lower-case one would be accepted by nothing downstream, so accepting it here would only
+ * postpone the failure to the first trustline build.
+ */
+const STELLAR_ACCOUNT_ID_PATTERN = /^G[A-Z2-7]{55}$/;
 
 /**
  * Validates a phone-number region against the metadata `libphonenumber-js`
@@ -346,6 +371,60 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsUrl({ require_protocol: true })
   STELLAR_HORIZON_FALLBACK_URL?: string;
+
+  /**
+   * The USDC issuer every new wallet gets a trustline for (Step 19).
+   *
+   * Required, and required to be an *account address*: a trustline names the pair
+   * (code, issuer), and without the issuer half there is no asset to trust. Testnet and
+   * public want different values, which is the whole reason this is configuration and not
+   * a constant - Circle issues on both networks from different keys, and a trustline for
+   * the wrong one is a wallet that cannot receive the USDC the ledger pays out.
+   *
+   * A `S...` secret is refused rather than accepted-and-trimmed: see
+   * `STELLAR_ACCOUNT_ID_PATTERN`.
+   */
+  @Matches(STELLAR_ACCOUNT_ID_PATTERN, {
+    message:
+      'STELLAR_USDC_ISSUER must be a Stellar account address (G...), for example the USDC issuer for this network',
+  })
+  @IsNotEmpty()
+  STELLAR_USDC_ISSUER!: string;
+
+  /**
+   * [optional] Where a Testnet account is funded from (Step 19).
+   *
+   * Optional, with the same two constraints as `STELLAR_HORIZON_FALLBACK_URL` and for the
+   * same reasons: blank is not a value (unset means the public Testnet faucet, an empty
+   * variable is a typo), and `require_protocol` because the value is parsed into a `URL` -
+   * `friendbot.stellar.org` would boot and then fail as a request-time `TypeError`
+   * (`Invalid URL`), which is the least useful place to learn about a missing scheme.
+   *
+   * Unlike the Horizon fallback there is no `require_tld: false`: a local Stellar node
+   * publishes Horizon on `localhost:8000` but friendbot is a *service*, and the local
+   * quickstart container serves it from Horizon's own path - which is expressible as a
+   * host with a TLD or as a literal address.
+   */
+  @IsOptional()
+  @IsUrl({ require_protocol: true })
+  STELLAR_FRIENDBOT_URL?: string;
+
+  /**
+   * [optional] Wall-clock ceiling on one account's provisioning (Step 19), in
+   * milliseconds.
+   *
+   * A number rather than a fixed constant because it is a *deployment* judgement: on
+   * Testnet the funder is a shared public faucet that is occasionally slow, and in
+   * production it is the treasury payment this app sends. Ten minutes is the upper bound
+   * `@Max()` allows - beyond that, waiting is not a strategy - and the lower bound is one
+   * millisecond, not zero: zero would mean "give up immediately", which reads like a
+   * working timeout and behaves like a disabled one.
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(600_000)
+  STELLAR_PROVISIONING_TIMEOUT_MS?: number;
 }
 
 /**

@@ -1,14 +1,21 @@
 import { Module } from '@nestjs/common';
+import { PrismaModule } from '../prisma/prisma.module.js';
 import { KEY_WRAPPER } from './custody/key-wrapper.js';
 import { KMS_CLIENT_FACTORY, KmsKeyWrapper, createKmsClient } from './custody/kms-key-wrapper.js';
 import { SeedCustodyService } from './custody/seed-custody.service.js';
+import { ACCOUNT_FUNDER } from './provisioning/account-funder.js';
+import { AccountProvisioningService } from './provisioning/account-provisioning.service.js';
+import { FriendbotFunder } from './provisioning/friendbot-funder.js';
+import { UsdcTrustlineService } from './provisioning/usdc-trustline.js';
 import { STELLAR_ACCOUNT_SOURCE } from './stellar/account-source.js';
 import {
   HORIZON_SERVER_FACTORY,
   HorizonAccountSource,
   createHorizonServer,
 } from './stellar/horizon-account-source.js';
+import { HorizonTransactionSubmitter } from './stellar/horizon-transaction-submitter.js';
 import { StellarService } from './stellar/stellar.service.js';
+import { STELLAR_TRANSACTION_SUBMITTER } from './stellar/transaction-submitter.js';
 
 /**
  * Wallet bounded context (Stellar account custody, signing, balances).
@@ -33,8 +40,40 @@ import { StellarService } from './stellar/stellar.service.js';
  * - `KMS_CLIENT_FACTORY` is bound to the real SDK constructor and to an injected
  *   fake in `KmsKeyWrapper`'s spec, so every branch of the KMS error mapping is
  *   testable without a network - the same reason `HORIZON_SERVER_FACTORY` exists.
- * - `SeedCustodyService` is the API Step 19 will call. Nothing imports it yet,
- *   which is why it is not exported: the export arrives with provisioning.
+ * - `SeedCustodyService` is the API Step 19 calls. Nothing outside this module imports
+ *   it - the provisioning flow is *in* this module - so it is still not exported.
+ *
+ * Step 19 adds four providers, and the shape of the step is visible in which of them
+ * are tokens:
+ *
+ * - `STELLAR_TRANSACTION_SUBMITTER` is a token because the funder question and the
+ *   submitter question have the same answer: *where the network is* is a deployment
+ *   fact (Testnet, a local node, mainnet), and the unit specs of everything above this
+ *   line need a Horizon that answers in microseconds rather than one that is on the
+ *   other side of an undici socket. `StellarService` owns both ports, so the rest of
+ *   the app never learns whether they point at the same host.
+ * - `ACCOUNT_FUNDER` is the seam the build sequence names for staging: a treasury
+ *   account that the operator funds binds here instead of friendbot, and nothing else
+ *   in provisioning changes. It is *this* module's boundary rather than config's,
+ *   because a treasury funder has a key to sign with and so belongs behind custody,
+ *   not behind an environment variable.
+ * - `FriendbotFunder` and `UsdcTrustlineService` are concrete: a funder bound to
+ *   `ACCOUNT_FUNDER` is a *choice*, and the only friendbot is friendbot. A deployment
+ *   that wants a treasury binds a different class to the same token.
+ * - `AccountProvisioningService` is the step's API and is exported, because the
+ *   consumer is `IdentityModule` - `verifyOtp` is what triggers provisioning, and
+ *   registration completion is the only event that can. Nothing else may import it
+ *   yet: a second caller is a second policy about when accounts are created.
+ *
+ * Step 19 also made this the first module outside identity to talk to the database, which is
+ * why `PrismaModule` is in the `imports` below: `AccountProvisioningService` reads the user's
+ * verification, inserts the `stellar_accounts` row for the new key and re-reads that row after
+ * a lost race, and a provider can only inject what the module that *declares* it imports.
+ * `PrismaModule` is deliberately not `@Global()` - its own docstring records that which modules
+ * talk to the database is worth keeping in the graph - so the alternative, reaching the client
+ * from a global, would have compiled and left the graph saying that nothing outside identity
+ * touches a table. `WalletModule` importing `PrismaModule` is the same statement `IdentityModule`
+ * makes, made by the second module that needs it.
  *
  * Keypair custody (Step 18), provisioning (19) and balances (20) add their own
  * providers here. `StellarService` is deliberately *not* exported yet: nothing
@@ -44,13 +83,21 @@ import { StellarService } from './stellar/stellar.service.js';
  * `PaymentsModule` in Step 23.
  */
 @Module({
+  /** The `stellar_accounts` table, and nothing else: see the docstring above. */
+  imports: [PrismaModule],
   providers: [
     StellarService,
     { provide: STELLAR_ACCOUNT_SOURCE, useClass: HorizonAccountSource },
     { provide: HORIZON_SERVER_FACTORY, useValue: createHorizonServer },
+    { provide: STELLAR_TRANSACTION_SUBMITTER, useClass: HorizonTransactionSubmitter },
     SeedCustodyService,
     { provide: KEY_WRAPPER, useClass: KmsKeyWrapper },
     { provide: KMS_CLIENT_FACTORY, useValue: createKmsClient },
+    UsdcTrustlineService,
+    { provide: ACCOUNT_FUNDER, useClass: FriendbotFunder },
+    AccountProvisioningService,
   ],
+  // `verifyOtp` is the only consumer, and it is in `IdentityModule`.
+  exports: [AccountProvisioningService],
 })
 export class WalletModule {}

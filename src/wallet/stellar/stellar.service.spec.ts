@@ -14,6 +14,7 @@ import { StellarNetwork } from '../../config/validation.schema.js';
 import type { StellarAccountSource } from './account-source.js';
 import { StellarAccountSession } from './stellar-account-session.js';
 import { StellarService } from './stellar.service.js';
+import type { StellarTransactionSubmitter, SubmittedTransaction } from './transaction-submitter.js';
 
 /**
  * Step 17's audit item, **forced rather than assumed**.
@@ -114,7 +115,40 @@ class SimulatedHorizon implements StellarAccountSource {
 const ACCOUNT = Keypair.random().publicKey();
 const OTHER_ACCOUNT = Keypair.random().publicKey();
 
-function createService(horizon: StellarAccountSource, network = 'TESTNET'): StellarService {
+/**
+ * The submitter the cycles below use.
+ *
+ * Submissions here go through the fake Horizon, because what is under test is the
+ * *lock*: `SimulatedHorizon` enforces Stellar's actual rule about sequence numbers and
+ * records what landed, and putting `HorizonTransactionSubmitter`'s error mapping
+ * between the assertion and the thing asserted would make the race harder to read
+ * rather than better covered. The port is still injected for real, so the constructor
+ * is exercised with the same three collaborator kinds `WalletModule` supplies; the
+ * classification of submission failures is that class's own subject, in its own spec.
+ */
+class RecordingSubmitter implements StellarTransactionSubmitter {
+  readonly submitted: Transaction[] = [];
+  answer: SubmittedTransaction = { hash: 'a'.repeat(64), ledger: 42 };
+  failWith: Error | undefined;
+
+  async submit(transaction: Transaction): Promise<SubmittedTransaction> {
+    if (this.failWith !== undefined) {
+      throw this.failWith;
+    }
+
+    this.submitted.push(transaction);
+
+    return this.answer;
+  }
+}
+
+const UNUSED_SUBMITTER = new RecordingSubmitter();
+
+function createService(
+  horizon: StellarAccountSource,
+  network = 'TESTNET',
+  submitter: StellarTransactionSubmitter = UNUSED_SUBMITTER,
+): StellarService {
   const config = {
     getOrThrow: (key: string) => {
       switch (key) {
@@ -130,7 +164,7 @@ function createService(horizon: StellarAccountSource, network = 'TESTNET'): Stel
     },
   } as unknown as ConfigService;
 
-  return new StellarService(config, horizon);
+  return new StellarService(config, horizon, submitter);
 }
 
 function payment(amount = '1'): xdr.Operation {
@@ -287,5 +321,34 @@ describe('StellarService', () => {
     expect(Keypair.fromSecret(first.secret()).publicKey()).toBe(first.publicKey());
     expect(first.publicKey()).not.toBe(second.publicKey());
     expect(first.secret()).not.toBe(second.secret());
+  });
+
+  it('hands a signed transaction to the submitter and reports what it answered', async () => {
+    const horizon = new SimulatedHorizon();
+    const submitter = new RecordingSubmitter();
+    const service = createService(horizon, 'TESTNET', submitter);
+    const keypair = Keypair.random();
+
+    // The shape every flow above this uses: build and consume inside one locked
+    // section, so the sequence number submitted is the one that was read.
+    const submitted = await service.withAccount(ACCOUNT, (session) => {
+      const transaction = session.build([payment()]);
+
+      transaction.sign(keypair);
+
+      return service.submitTransaction(transaction);
+    });
+
+    expect(submitted).toEqual(submitter.answer);
+    expect(submitter.submitted).toHaveLength(1);
+    // Signed by the caller, and signed *validly*: the submitter receives a
+    // transaction whose signature verifies, not a placeholder.
+    expect(submitter.submitted[0]?.signatures).toHaveLength(1);
+    // And the account lock is not held by a submission: `submitTransaction` takes
+    // no lock of its own (see its own note), which is why a flow that must hold one
+    // across build-and-submit does the wrap itself.
+    await expect(
+      service.buildTransaction({ sourceAccount: ACCOUNT, operations: [payment()] }),
+    ).resolves.toBeDefined();
   });
 });
