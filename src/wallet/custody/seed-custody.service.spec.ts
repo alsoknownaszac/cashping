@@ -1,5 +1,5 @@
 import { Keypair } from '@stellar/stellar-sdk';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, type Mock, vi } from 'vitest';
 import type { StellarService } from '../stellar/stellar.service.js';
 import {
   KeyCustodyUnavailableError,
@@ -23,13 +23,24 @@ import { SeedCustodyService, type SealedAccount } from './seed-custody.service.j
  * and still look correct, which is the whole class of bug this step exists to rule out.
  */
 
-const MASTER_KEY_ARN = 'arn:aws:kms:eu-west-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab';
+const MASTER_KEY_ARN =
+  'arn:aws:kms:eu-west-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab';
 
+/**
+ * A `KeyWrapper` that is as strict as KMS and remembers what it was asked.
+ *
+ * The two methods are typed as the *mock* of their signature rather than as vitest's
+ * `ReturnType<typeof vi.fn>`, which is its widest default (`Mock<Procedure | Constructable>`)
+ * and has no call signature - so a fake declared that way never actually satisfied
+ * `KeyWrapper`, and this fixture did not type-check. The signatures are restated rather than
+ * inferred on purpose: a change to the port should now fail *here*, in the fake, instead of
+ * silently widening what the fake is allowed to be.
+ */
 interface FakeKeyWrapper extends KeyWrapper {
   /** The plaintext data keys handed out, so a spec can check what happened to them. */
   readonly handedOut: Buffer[];
-  wrapDataKey: ReturnType<typeof vi.fn>;
-  unwrapDataKey: ReturnType<typeof vi.fn>;
+  wrapDataKey: Mock<(request: WrapDataKeyRequest) => Promise<WrappedDataKey>>;
+  unwrapDataKey: Mock<(request: UnwrapDataKeyRequest) => Promise<Buffer>>;
 }
 
 function fakeKeyWrapper(): FakeKeyWrapper {
@@ -116,7 +127,9 @@ describe('SeedCustodyService.createSealedAccount', () => {
 
     // The id is generated here rather than by the database default, because the seed is
     // bound to it: it has to exist before the seal does.
-    expect(sealed.accountId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(sealed.accountId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
     expect(sealed.publicKey).toMatch(/^G[A-Z2-7]{55}$/);
     expect(sealed.encryptedSecretKey.startsWith('cp-kms-1.')).toBe(true);
     expect(sealed.dataKeyArn).toBe(MASTER_KEY_ARN);
@@ -159,9 +172,10 @@ describe('SeedCustodyService.createSealedAccount', () => {
     expect(wrappedOf(first)).not.toBe(wrappedOf(second));
 
     // And each was asked for under its own account, which is the KMS EncryptionContext.
-    expect(
-      wrapper.wrapDataKey.mock.calls.map(([request]: [WrapDataKeyRequest]) => request.accountId),
-    ).toEqual([first.accountId, second.accountId]);
+    expect(wrapper.wrapDataKey.mock.calls.map(([request]) => request.accountId)).toEqual([
+      first.accountId,
+      second.accountId,
+    ]);
   });
 
   it('zeroes the data key as soon as the seed is sealed', async () => {
@@ -182,7 +196,7 @@ describe('SeedCustodyService.openSeed', () => {
 
     await service.openSeed(rowOf(sealed));
 
-    const [request] = wrapper.unwrapDataKey.mock.calls[0] as [UnwrapDataKeyRequest];
+    const [request] = wrapper.unwrapDataKey.mock.calls[0];
 
     expect(request.accountId).toBe(sealed.accountId);
     // The ARN from the row, not from configuration: that is what makes the stored reference
