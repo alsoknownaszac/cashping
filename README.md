@@ -514,9 +514,13 @@ the recipient half of one confirmed payment).
 ### Running the proofs
 
 ```bash
-npm test                                    # 629 tests (35 files); 41 of them are Steps 24-25
+npm test                                    # 629 tests (35 files); 50 of them are new here
 npm run test:e2e test/payments.e2e-spec.ts  # 15 tests: real Postgres, real Redis, faked Horizon
 ```
+
+Those 50 are `idempotency.interceptor.spec.ts` (13), `idempotency-store.spec.ts` (11),
+`payments.service.spec.ts` (17) and the nine `amount.spec.ts` gained for `minus`, `isAtLeast` and
+the column-width refusal.
 
 The e2e substitutes three providers - `SMS_SENDER`, `AccountProvisioningService` and
 `StellarService` - and nothing else. `StellarService` is the Horizon seam: a funded Testnet wallet
