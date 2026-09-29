@@ -59,6 +59,13 @@ export function createOpenApiDocument(app: INestApplication): OpenAPIObject {
         'Sign in: POST /auth/login/otp for a code, then POST /auth/login for a token pair; POST /auth/refresh renews the access token and GET /auth/session returns the signed-in user.',
       ].join('\n'),
     )
+    .addTag(
+      'wallet',
+      [
+        "The signed-in user's Stellar account (Step 20).",
+        'GET /wallet/account is the wallet itself - the address it is paid at, the network, and whether the ledger knows it yet. GET /wallet/balance is its USDC line, read from Horizon on every call rather than cached.',
+      ].join('\n'),
+    )
     /**
      * The `Authorization: Bearer <token>` scheme, so the routes that need it show a
      * padlock and a "Try it out" that can actually be used (Step 16). `@ApiBearerAuth()`

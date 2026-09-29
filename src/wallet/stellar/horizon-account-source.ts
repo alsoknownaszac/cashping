@@ -1,9 +1,10 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Horizon, NotFoundError, type TransactionSource } from '@stellar/stellar-sdk';
+import { Horizon, NotFoundError } from '@stellar/stellar-sdk';
 import {
   StellarAccountNotFoundError,
   StellarAccountSourceError,
+  type LoadedStellarAccount,
   type StellarAccountSource,
 } from './account-source.js';
 import { horizonServerOptions } from './stellar-network.js';
@@ -54,7 +55,7 @@ export class HorizonAccountSource implements StellarAccountSource {
     @Inject(HORIZON_SERVER_FACTORY) private readonly createServer: HorizonServerFactory,
   ) {}
 
-  async loadAccount(accountId: string): Promise<TransactionSource> {
+  async loadAccount(accountId: string): Promise<LoadedStellarAccount> {
     try {
       // Construction is inside the `try` on purpose: an endpoint the SDK refuses
       // (plain http off loopback, say) surfaces here, and it should read as "this

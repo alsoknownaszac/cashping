@@ -3,7 +3,11 @@ import { ConfigService } from '@nestjs/config';
 import { Keypair, type Transaction, type xdr } from '@stellar/stellar-sdk';
 import { StellarNetwork } from '../../config/validation.schema.js';
 import { AccountLock } from './account-lock.js';
-import { STELLAR_ACCOUNT_SOURCE, type StellarAccountSource } from './account-source.js';
+import {
+  STELLAR_ACCOUNT_SOURCE,
+  type StellarAccountSource,
+  type StellarBalanceLine,
+} from './account-source.js';
 import { StellarAccountSession, type TransactionOptions } from './stellar-account-session.js';
 import { networkPassphraseFor, parseStellarNetwork } from './stellar-network.js';
 import {
@@ -148,6 +152,27 @@ export class StellarService {
     return this.withAccount(request.sourceAccount, (account) =>
       account.build(request.operations, request),
     );
+  }
+
+  /**
+   * The account's balance lines, exactly as Horizon reported them (Step 20).
+   *
+   * **No lock, deliberately.** The per-account queue exists because a *build* consumes a
+   * sequence number and two builds made from one snapshot collide; a balance read consumes
+   * nothing. Putting it behind the queue would make a balance screen wait for whatever
+   * payment is in flight for the same account, and would say the queue protects something
+   * it does not.
+   *
+   * The array is Horizon's own, passed through untouched: this method adds no default, no
+   * rounding and no filtering - so a caller cannot receive a `0` that Horizon did not
+   * report. What an unfunded account, a missing trustline or an unreachable Horizon should
+   * look like is decided one layer up, in `BalancesService`, where the signed-in user's
+   * account row is also known.
+   */
+  async loadBalances(accountId: string): Promise<readonly StellarBalanceLine[]> {
+    const account = await this.accounts.loadAccount(accountId);
+
+    return account.balances;
   }
 
   /**

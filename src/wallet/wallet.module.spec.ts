@@ -22,6 +22,8 @@ import { HorizonTransactionSubmitter } from './stellar/horizon-transaction-submi
 import { StellarService } from './stellar/stellar.service.js';
 import { STELLAR_TRANSACTION_SUBMITTER } from './stellar/transaction-submitter.js';
 import { WalletModule } from './wallet.module.js';
+import { BalancesService } from './balances/balances.service.js';
+import { WalletController } from './wallet.controller.js';
 
 /**
  * Step 17's other half: the wrapper has to be reachable from the module graph, and
@@ -47,6 +49,12 @@ import { WalletModule } from './wallet.module.js';
  * nothing. The same applies to `KmsKeyWrapper`, which reads its region, credentials and
  * key reference from config at construction - and to Step 19's three, which read the
  * funder URL, the USDC issuer and the provisioning ceiling the same way.
+ *
+ * Step 20 adds the module's first `controllers` entry, so the assertions below also cover a
+ * controller: it is instantiated with the module, and a provider missing behind it is a boot
+ * failure rather than a 500 on the first request. `strict: false` is how a controller is
+ * fetched from a compiled module (it is not a provider), and the endpoints themselves are
+ * exercised over HTTP in `test/wallet.e2e-spec.ts`.
  */
 
 const KMS_KEY_ARN = 'arn:aws:kms:eu-west-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab';
@@ -245,6 +253,26 @@ describe('WalletModule', () => {
     expect(moduleRef.get(AccountProvisioningService)).toBeInstanceOf(AccountProvisioningService);
     expect(moduleRef.get(UsdcTrustlineService)).toBeInstanceOf(UsdcTrustlineService);
     expect(moduleRef.get(PrismaService)).toBeDefined();
+  });
+
+  it('registers the wallet controller with everything it injects (step 20)', async () => {
+    moduleRef = await Test.createTestingModule({
+      imports: [importConfig(), WalletModule],
+    }).compile();
+
+    /**
+     * A controller is instantiated with the module that declares it, so a provider missing
+     * behind `GET /v1/wallet/*` is a boot failure rather than a 500 on the first request -
+     * and `BalancesService` injects `PrismaService`, `StellarService` and
+     * `UsdcTrustlineService`, which means this also asserts that the step-19 services are
+     * still reachable from inside the module after the step-20 additions.
+     *
+     * `strict: false` because a controller is not a provider: it is reachable through the
+     * module (`_controllers`), not through the injector's provider list, and asking for it
+     * strictly is how this test would fail for the wrong reason.
+     */
+    expect(moduleRef.get(WalletController, { strict: false })).toBeInstanceOf(WalletController);
+    expect(moduleRef.get(BalancesService)).toBeInstanceOf(BalancesService);
   });
 
   it('exports provisioning, which is the only provider an outside module may inject', async () => {

@@ -6,12 +6,16 @@ import {
   Networks,
   Operation,
   type Transaction,
-  type TransactionSource,
   type xdr,
 } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
 import { StellarNetwork } from '../../config/validation.schema.js';
-import type { StellarAccountSource } from './account-source.js';
+import {
+  StellarAccountNotFoundError,
+  type LoadedStellarAccount,
+  type StellarAccountSource,
+  type StellarBalanceLine,
+} from './account-source.js';
 import { StellarAccountSession } from './stellar-account-session.js';
 import { StellarService } from './stellar.service.js';
 import type { StellarTransactionSubmitter, SubmittedTransaction } from './transaction-submitter.js';
@@ -69,13 +73,22 @@ function afterEventLoopTurns(turns: number): Promise<void> {
 class SimulatedHorizon implements StellarAccountSource {
   sequence = 100n;
   readonly submitted: string[] = [];
+  /**
+   * What Horizon reports alongside the sequence number (Step 20).
+   *
+   * Empty by default: the tests below are about sequence numbers, and a fake that answered
+   * with lines nobody asked it for would be a fake that decides what a wallet holds. The
+   * field is here because the *port* promises it - a real load has both, so a fake that
+   * could only model one of them would not be the shape the app is compiled against.
+   */
+  balances: StellarBalanceLine[] = [];
   /** The highest number of loads that were ever in flight at once. */
   maxConcurrentLoads = 0;
   /** When set, loading fails with this instead of answering. */
   failWith: Error | undefined;
   private inFlight = 0;
 
-  async loadAccount(accountId: string): Promise<TransactionSource> {
+  async loadAccount(accountId: string): Promise<LoadedStellarAccount> {
     // The snapshot is taken when the request is *made*, which is what Horizon does:
     // two requests issued at the same instant both answer with the account's sequence
     // number as of that instant. That is exactly why a queue is needed, and it is the
@@ -93,8 +106,10 @@ class SimulatedHorizon implements StellarAccountSource {
       }
 
       // A copy, exactly like Horizon's answer: the builder mutates this one, and only
-      // a submission can really advance the account.
-      return new Account(accountId, snapshot);
+      // a submission can really advance the account. The balance lines ride along on the
+      // same answer, which is the shape the port promises (Step 20): `Account` on its own
+      // is the SDK's offline, sequence-only type, and is deliberately not that shape.
+      return Object.assign(new Account(accountId, snapshot), { balances: this.balances });
     } finally {
       this.inFlight -= 1;
     }
@@ -114,6 +129,9 @@ class SimulatedHorizon implements StellarAccountSource {
 
 const ACCOUNT = Keypair.random().publicKey();
 const OTHER_ACCOUNT = Keypair.random().publicKey();
+
+/** Circle's Testnet issuer: a USDC *line* is only this asset when the pair matches. */
+const USDC_ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 
 /**
  * The submitter the cycles below use.
@@ -350,5 +368,40 @@ describe('StellarService', () => {
     await expect(
       service.buildTransaction({ sourceAccount: ACCOUNT, operations: [payment()] }),
     ).resolves.toBeDefined();
+  });
+
+  it('reads balance lines off the loaded account, and does not queue behind the lock', async () => {
+    const horizon = new SimulatedHorizon();
+    horizon.balances = [
+      { asset_type: 'native', balance: '9999.9999900' },
+      {
+        asset_type: 'credit_alphanum4',
+        asset_code: 'USDC',
+        asset_issuer: USDC_ISSUER,
+        balance: '0.0000000',
+        limit: '922337203685.4775807',
+        is_authorized: true,
+      },
+    ];
+    const service = createService(horizon);
+
+    // Horizon's own answer, passed through untouched: the sums are *strings* and stay
+    // strings, because 7-decimal fixed point does not survive a double (and the API's
+    // balance DTOs exist to keep it that way).
+    await expect(service.loadBalances(ACCOUNT)).resolves.toEqual(horizon.balances);
+
+    // Two reads at once, both in flight, which is what makes "no lock" a fact rather
+    // than a claim: the queue above is for builds, and a balance screen must not wait
+    // for a payment being built for the same account.
+    horizon.maxConcurrentLoads = 0;
+    await Promise.all([service.loadBalances(ACCOUNT), service.loadBalances(ACCOUNT)]);
+    expect(horizon.maxConcurrentLoads).toBe(2);
+
+    // A failure is the source's own, unchanged - and no balance is invented for a
+    // Horizon that did not answer. That classification is `BalancesService`'s job, one
+    // layer up, where the user's account row is known too.
+    horizon.failWith = new StellarAccountNotFoundError(ACCOUNT);
+
+    await expect(service.loadBalances(ACCOUNT)).rejects.toBeInstanceOf(StellarAccountNotFoundError);
   });
 });

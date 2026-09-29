@@ -1,7 +1,11 @@
 import type { ConfigService } from '@nestjs/config';
-import { Keypair, NotFoundError, type TransactionSource } from '@stellar/stellar-sdk';
+import { Keypair, NotFoundError } from '@stellar/stellar-sdk';
 import { describe, expect, it, vi } from 'vitest';
-import { StellarAccountNotFoundError, StellarAccountSourceError } from './account-source.js';
+import {
+  StellarAccountNotFoundError,
+  StellarAccountSourceError,
+  type LoadedStellarAccount,
+} from './account-source.js';
 import {
   HorizonAccountSource,
   type HorizonServer,
@@ -37,7 +41,7 @@ function configWith(horizonUrl = HORIZON_URL): ConfigService {
 }
 
 /** A `Horizon.Server` with only the one method this source calls. */
-function horizonReturning(loadAccount: (accountId: string) => Promise<TransactionSource>): {
+function horizonReturning(loadAccount: (accountId: string) => Promise<LoadedStellarAccount>): {
   server: HorizonServer;
   loadAccount: ReturnType<typeof vi.fn>;
 } {
@@ -47,7 +51,7 @@ function horizonReturning(loadAccount: (accountId: string) => Promise<Transactio
 }
 
 function sourceWith(
-  loadAccount: (accountId: string) => Promise<TransactionSource>,
+  loadAccount: (accountId: string) => Promise<LoadedStellarAccount>,
   horizonUrl = HORIZON_URL,
 ): {
   source: HorizonAccountSource;
@@ -64,12 +68,19 @@ function sourceWith(
   };
 }
 
-/** The account as Horizon reports it: id plus current sequence number. */
+/**
+ * The account as Horizon reports it: id, current sequence number, and the balance lines
+ * that arrive in the same answer (Step 20).
+ *
+ * Both halves are present because the port promises both - the source is a pass-through,
+ * so a fake that omitted the balances would be a fake of a response Horizon never sends.
+ */
 const loadedAccount = {
   accountId: () => ACCOUNT,
   sequenceNumber: () => '100',
   incrementSequenceNumber: () => undefined,
-} as TransactionSource;
+  balances: [],
+} as LoadedStellarAccount;
 
 describe('HorizonAccountSource', () => {
   it('asks Horizon for the requested account and returns what it answered', async () => {

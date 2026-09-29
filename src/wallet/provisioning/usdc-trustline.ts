@@ -17,6 +17,18 @@ import type { SubmittedTransaction } from '../stellar/transaction-submitter.js';
 export const USDC_ASSET_CODE = 'USDC';
 
 /**
+ * An asset's identity: the pair that makes it unique on Stellar.
+ *
+ * `USDC:GBBD…` and `USDC:GDHU…` are two different assets that happen to share a code, so
+ * anything that answers "which USDC" has to carry the issuer too - the same argument
+ * `STELLAR_USDC_ISSUER`'s docstring makes for it being configuration.
+ */
+export interface UsdcAssetIdentity {
+  readonly code: string;
+  readonly issuer: string;
+}
+
+/**
  * The columns `ensureFor` needs - the shape a `StellarAccount` row has.
  *
  * `SealedAccountRow` plus the public key, and nothing else: the row is read once by
@@ -142,6 +154,19 @@ export class UsdcTrustlineService {
    */
   asset(): Asset {
     return new Asset(USDC_ASSET_CODE, this.issuer);
+  }
+
+  /**
+   * The same asset, as the two strings a response body can carry.
+   *
+   * `asset()` is what a transaction needs and this is what a body needs. The SDK types
+   * `Asset.getIssuer()` as `string | undefined` - it also models the *native* asset, which
+   * has no issuer - and an `undefined` must not reach a JSON response as a missing field,
+   * so the pair is built here from the same two values the `Asset` is built from, in one
+   * place, instead of a caller handling a case that cannot happen in this deployment.
+   */
+  assetIdentity(): UsdcAssetIdentity {
+    return { code: USDC_ASSET_CODE, issuer: this.issuer };
   }
 
   /**

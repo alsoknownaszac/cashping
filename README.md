@@ -264,6 +264,69 @@ nor credentials. The step's own audit - three accounts producing three different
 database row that reads as ciphertext, and a log grep for the seed pattern that comes back
 empty - is reproducible with the two commands in the section above.
 
+## Wallet endpoints (Step 20)
+
+Two endpoints, both authenticated, both about the caller's own wallet:
+
+```bash
+GET /v1/wallet/account   # { accountId, publicKey, network, createdAt, funded, nativeBalance }
+GET /v1/wallet/balance   # { asset: { code, issuer }, balance, trustline, funded }
+```
+
+`/account` is what the wallet *is* - the address it is paid at, the network that address is on,
+and whether the ledger knows it yet. `/balance` is what is in it, which for this product means the
+USDC line. Both read Horizon on the request: nothing is cached, and no balance is defaulted.
+
+| Situation | Answer |
+| --- | --- |
+| No wallet provisioned for the user | `404` |
+| Row exists, the ledger has never seen the key (funding did not complete) | `200`, `funded: false`, `null` balances |
+| Horizon unreachable | `503` - the balance is *unknown*, not zero |
+| No or invalid access token | `401` |
+| Account suspended | `403` |
+
+`balance` is Horizon's own decimal string, never a number: Stellar amounts are 7-decimal fixed
+point and `Number('922337203685.4775807')` is `922337203685.4775`, so parsing one would round
+every balance a user is shown. `null` means there is no line to read a balance *from*, and
+`trustline` says which of three states the USDC line is in - `active`, `unauthorized` (the line
+exists but the issuer has not authorised it, so payments to this wallet are rejected at the
+sender) or `missing` (nothing can be paid in at all). `0.0000000` with `active` is an empty
+wallet; the other two are states to do something about, and a response carrying only the number
+would collapse them into one.
+
+Where the pieces live, and why:
+
+- **`src/wallet/balances/balance-lines.ts`** - the projection from Horizon's lines to the two
+  numbers a wallet endpoint reports. Pure, total and offline, because this is the code that
+  decides what a balance *is* and Step 20's audit compares its output with Horizon.
+- **`src/wallet/balances/balances.service.ts`** - the one read both endpoints are projections of:
+  the `stellar_accounts` row (three columns - the sealed envelope is deliberately not selected)
+  and then Horizon. It is where the four states in the table above are decided.
+- **`src/wallet/stellar/account-source.ts`** - `loadAccount` now returns the *loaded account*,
+  balances included, because Horizon answers both in one response (`AccountResponse` is a
+  `TransactionSource` **and** a balance sheet). `StellarService.loadBalances` passes the lines
+  through untouched and takes no account lock: reading a balance consumes no sequence number, so
+  a balance screen does not queue behind an in-flight payment for the same account.
+- **`src/wallet/wallet.controller.ts`** - the HTTP surface. There is no `:userId` in either path,
+  on purpose: the account reported is always the token's own, so there is nothing to enumerate.
+  The guard is identity's `JwtAuthGuard`, read as a *file* import rather than by importing
+  `IdentityModule` - identity imports the wallet module (Step 19), so importing it back would be
+  a cycle.
+
+`npm test` covers the states offline: `balance-lines.spec.ts` (active, unauthorized, missing, a
+`USDC` line from a *different* issuer, other assets, a liquidity-pool share, and the largest
+legal balance surviving as a string), `balances.service.spec.ts` (the four states, and that the
+row read does not load the envelope) and `stellar.service.spec.ts` (the lines come off the loaded
+account, and two reads overlap rather than queue). The live check registers and verifies a number
+over HTTP - so provisioning really runs inside the verification - then compares both endpoints
+with a plain `fetch` to Horizon for the same account, and moves the ledger to show the number is
+a reading rather than a cache:
+
+```bash
+AWS_ENDPOINT_URL=http://localhost:5055 AWS_KMS_KEY_ID=<an arn in that endpoint> \
+  RUN_STELLAR_IT=1 npm run test:e2e test/wallet.e2e-spec.ts
+```
+
 ## Known gaps
 
 Recorded rather than fixed, so that they stay decisions instead of surprises. Neither one

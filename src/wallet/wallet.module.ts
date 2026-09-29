@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { PrismaModule } from '../prisma/prisma.module.js';
+import { BalancesService } from './balances/balances.service.js';
 import { KEY_WRAPPER } from './custody/key-wrapper.js';
 import { KMS_CLIENT_FACTORY, KmsKeyWrapper, createKmsClient } from './custody/kms-key-wrapper.js';
 import { SeedCustodyService } from './custody/seed-custody.service.js';
@@ -16,6 +17,7 @@ import {
 import { HorizonTransactionSubmitter } from './stellar/horizon-transaction-submitter.js';
 import { StellarService } from './stellar/stellar.service.js';
 import { STELLAR_TRANSACTION_SUBMITTER } from './stellar/transaction-submitter.js';
+import { WalletController } from './wallet.controller.js';
 
 /**
  * Wallet bounded context (Stellar account custody, signing, balances).
@@ -81,10 +83,32 @@ import { STELLAR_TRANSACTION_SUBMITTER } from './stellar/transaction-submitter.j
  * the future rather than a boundary - the same reasoning `IdentityModule` records.
  * The export arrives with the first consumer outside this module, which is
  * `PaymentsModule` in Step 23.
+ *
+ * Step 20 adds the module's first `controllers` entry, and `BalancesService` beside it:
+ *
+ * - `WalletController` is where the wallet becomes HTTP (`GET /v1/wallet/account`,
+ *   `GET /v1/wallet/balance`). It is registered here rather than in `IdentityModule`
+ *   because the endpoints are the wallet's own subject, and because a controller is
+ *   part of a module's public surface - the module that owns the data owns the routes.
+ *   It reads identity's `JwtAuthGuard` and `@CurrentUser` as a *file* import; see its
+ *   docstring for why that is not a module dependency, and why importing
+ *   `IdentityModule` here would be a cycle rather than a fix.
+ * - `BalancesService` is not exported and has no token: nothing substitutes it, because
+ *   what it does is read - the interesting seams (the account source, the network) are
+ *   already below it, and a fake above them would only be able to prove that a fake was
+ *   called. Its own spec substitutes `StellarService` and the account source instead,
+ *   which are the two things Step 20's audit is really about.
+ *
+ * `WalletModule` now serves both of the ways a wallet is reached - the trigger that
+ * provisions one (an exported provider, injected by identity) and the endpoints that
+ * report on one (a controller, reached by HTTP) - and `StellarService` is still not
+ * exported, which is the boundary holding: `BalancesService` uses it internally, and
+ * `PaymentsModule` will be the first module allowed to.
  */
 @Module({
   /** The `stellar_accounts` table, and nothing else: see the docstring above. */
   imports: [PrismaModule],
+  controllers: [WalletController],
   providers: [
     StellarService,
     { provide: STELLAR_ACCOUNT_SOURCE, useClass: HorizonAccountSource },
@@ -96,6 +120,7 @@ import { STELLAR_TRANSACTION_SUBMITTER } from './stellar/transaction-submitter.j
     UsdcTrustlineService,
     { provide: ACCOUNT_FUNDER, useClass: FriendbotFunder },
     AccountProvisioningService,
+    BalancesService,
   ],
   // `verifyOtp` is the only consumer, and it is in `IdentityModule`.
   exports: [AccountProvisioningService],
