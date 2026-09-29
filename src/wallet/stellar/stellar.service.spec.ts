@@ -41,6 +41,17 @@ import type { StellarTransactionSubmitter, SubmittedTransaction } from './transa
  * 3. Its counter-proof runs the identical two cycles with the queue removed and
  *    asserts the harness *does* catch the conflict - which is what makes step 2's
  *    assertion mean something instead of passing for want of a race.
+ *
+ * A live-Horizon version of this race was considered and deliberately not built: it
+ * would be a test of ledger-close timing rather than of the lock. Two concurrent
+ * submissions against a real account succeed or fail for reasons this service does not
+ * control, so a red run would not say which side broke and a green one would only say
+ * the network happened to be quick that day. The part a live test can prove about
+ * sequence handling is already proven where it cannot be faked:
+ * `test/provisioning.e2e-spec.ts` loads the account, builds, signs and submits a real
+ * `changeTrust` through `HorizonTransactionSubmitter`, with nothing substituted at the
+ * Horizon boundary. What is left over is the lock itself, and this is the altitude where
+ * the lock can be made to fail on demand.
  */
 
 /** Stellar's own rejection when a sequence number has already been used. */
