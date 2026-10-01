@@ -37,8 +37,11 @@
 
 databases:
   # The API's Postgres, on the private network only. Every DATABASE_URL this
-  # workspace hands out points at that private address, so the container, the
-  # pre-deploy step and nothing else can reach it.
+  # workspace hands out points at that private address, so the container and
+  # nothing else can reach it - `ipAllowList: []` below is what makes "nothing
+  # else" a fact rather than a hope. The migration that used to run as a
+  # separate pre-deploy step now runs inside that same container (see
+  # `dockerCommand` below), so "the container" covers both.
   #
   # `postgresMajorVersion: '16'` states what docker-compose.yml runs, which is
   # what every migration and every e2e run in this repository was executed
@@ -124,7 +127,10 @@ services:
     # inside this process, so queued work waits for whatever request wakes it.
     # Free web services also get no shell (SSH or Dashboard) and no one-off jobs,
     # so an incident is diagnosed from the log and the API rather than from a
-    # shell in the container - worth knowing before the first one. `1c-2g` (paid)
+    # shell in the container - worth knowing before the first one. A free
+    # instance also refuses `maxShutdownDelaySeconds` and `preDeployCommand`
+    # (both noted below), which is why the 30-second graceful-shutdown window is
+    # Render's default here rather than a value this file sets. `1c-2g` (paid)
     # is the upgrade path.
     plan: free
     # One instance, and this is not a cost decision. The BullMQ worker that
@@ -141,23 +147,56 @@ services:
     # no auth, no database call, no Redis call. Its own docblock records that
     # this is the URL a health check is aimed at - this is that health check.
     healthCheckPath: /v1/health
-    # Migrations run before the new version takes traffic, in the image that was
-    # just built, with this service's environment - so `DATABASE_URL` is the
-    # internal one and the database is a private-network hop away.
-    # `--no-install` keeps this on the Prisma version in the lockfile instead of
-    # whatever npx might fetch. The schema, the migrations and the Prisma 7
-    # config are copied into the runtime image for exactly this line - see the
-    # Dockerfile.
+    # The container's start command, and it is `dockerCommand` rather than
+    # `startCommand` because this service is `runtime: docker`: the schema
+    # describes this field as "the command to run when starting the
+    # Docker-based service. If omitted, uses the CMD defined in the
+    # Dockerfile." (`startCommand` is the native-runtime equivalent.)
     #
-    # A migration that fails fails the deploy, which is the order that matters:
-    # the previous version keeps serving and nothing takes traffic against a
-    # schema that was never applied.
-    preDeployCommand: npx --no-install prisma migrate deploy
-    # A deploy starts a new instance and stops the old one, which is a SIGTERM to
-    # the worker as well as to the HTTP server. 30s is Render's default, stated
-    # because this process holds in-flight payment submissions; one killed here
-    # is re-queued by BullMQ's stalled-job check rather than lost.
-    maxShutdownDelaySeconds: 30
+    # It overrides that CMD - `node dist/main.js`, matched exactly - and
+    # prefixes one step to it: the migration, which used to be
+    # `preDeployCommand`. Render refused that field on a free web service
+    # ("not supported for free tier services"), so the migration runs here
+    # instead, in the instance that is starting. Render runs this string
+    # through `/bin/sh -c`, so `&&` is a shell chain: if `migrate deploy` exits
+    # non-zero the app never starts, the instance never answers
+    # `healthCheckPath`, and the deploy fails while the previous version keeps
+    # serving - the outcome the pre-deploy step gave, reached through the
+    # health check instead of through a step that gates traffic.
+    #
+    # `DATABASE_URL` is this service's internal one, so the migration reaches
+    # the database over the private network; `--no-install` keeps it on the
+    # Prisma version in the lockfile instead of whatever `npx` might fetch. The
+    # schema, the migrations and the Prisma 7 config are copied into the
+    # runtime image for exactly this line - see the Dockerfile. No `--config`
+    # flag is needed: `prisma7.config.*` is the *first* candidate in the
+    # installed CLI's own config-file list, ahead of `prisma.config.*`.
+    #
+    # Running this on every start, and not once per deploy, is the part that
+    # had to be measured rather than assumed, because a free web service wakes
+    # from its 15-minute sleep by starting this very command again. Measured
+    # 2026-10-01 against a throwaway database (local Postgres 18.3; the
+    # blueprint pins 16): the first run applied 7 migrations and exited 0, a
+    # second run and a third behind `sh -c` printed "No pending migrations to
+    # apply" and exited 0, and `_prisma_migrations` still held exactly 7 rows.
+    # That is Prisma v7's documented behaviour - `migrate deploy` "Applies
+    # pending migrations" and "Does not reset the database" - and Prisma takes
+    # an advisory lock (10s timeout) around the run, so two instances cannot
+    # migrate at once.
+    #
+    # What it costs: the first request after a sleep now waits for the
+    # migration check on top of the ~1-minute spin-up.
+    dockerCommand: npx --no-install prisma migrate deploy && node dist/main.js
+    # `maxShutdownDelaySeconds: 30` was here and is gone for the same reason:
+    # a free web service refuses it ("not supported for free tier
+    # services"). The 30-second window still applies - it is Render's default -
+    # but it is a default now rather than a value this file sets, and a free
+    # instance can also be restarted at any time or slept for 15 idle minutes.
+    # An in-flight submission cut off by a SIGKILL is still re-queued by
+    # BullMQ's stalled-job check (`maxStalledCount`, 1 by default) rather than
+    # lost; what the field bought was the buffer that made that the rare case
+    # instead of the ordinary one. The README records it as a known free-tier
+    # gap, so this is a stated trade rather than a silent removal.
     autoDeploy: true
 
     envVars:
@@ -174,8 +213,9 @@ services:
 
       # --- Datastores --------------------------------------------------------
       # Internal connection strings: Render injects each datastore's
-      # private-network address, which is what the pre-deploy step and the
-      # running service both read.
+      # private-network address, which the running service reads - the
+      # migration in its start command included, since that is now the same
+      # process rather than a separate pre-deploy step.
       - key: DATABASE_URL
         fromDatabase:
           name: cashping-staging-db

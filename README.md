@@ -931,8 +931,9 @@ pointed at this repository - the Blueprint Path is `render.yaml`, which is the d
 whole environment in one sync - a Postgres database, a Key Value instance, and the API built from the
 Dockerfile that is already here. A `main` push redeploys the API (`autoDeploy: true`); a change to the file
 is applied by re-syncing the Blueprint. Render builds and deploys on that push whether or not CI on
-that commit passed: the deploy's own gates are the image build and the pre-deploy migration, which is
-why the workflow is the check that is supposed to fail first rather than one Render consults.
+that commit passed: the deploy's own gates are the image build and the migration the container runs as it
+starts, which is why the workflow is the check that is supposed to fail first rather than one Render
+consults.
 
 ### What it costs, and what `free` takes away
 
@@ -941,7 +942,7 @@ remembered: the published Blueprint schema (`https://render.com/schema/render.ya
 all three of its plan enums - `postgresPlan`, `keyValuePlan` and `serverPlan` - so it is the same slug on a
 database, a Key Value instance and a web service. The bill for the three of them is **$0**.
 
-Free is not a smaller version of the same thing, and three differences change how this environment behaves:
+Free is not a smaller version of the same thing, and four differences change how this environment behaves:
 
 - **The API sleeps.** A Free web service is spun down after 15 minutes with no inbound traffic (HTTP
   requests and WebSocket messages are what count) and takes about a minute to wake on the next request.
@@ -953,6 +954,15 @@ Free is not a smaller version of the same thing, and three differences change ho
   only warning there is. It is also fixed at 1 GB of storage (0.1 CPU, 256 MB, up to 100 connections), gets
   **no backups** and no managed connection pooling, and may be restarted or taken down for maintenance at
   any time.
+- **The shutdown window is Render's default, not a promise.** The free tier also refuses
+  `maxShutdownDelaySeconds`, so the 30-second window this file used to set explicitly is now only Render's
+  default - and a free instance may additionally be restarted at any time, or slept for 15 idle minutes. The
+  API still asks for a clean shutdown (`app.enableShutdownHooks()` in `main.ts` closes the Prisma pool and the
+  queue producer), but a submission whose process is killed mid-flight is recovered by BullMQ's stalled-job
+  check rather than finished: the lock stops being renewed, the job returns to `waiting`, and `maxStalledCount`
+  (1 by default) is how many times that may happen before it is failed instead. That recovery is the same
+  mechanism the paid configuration relied on - what the field bought was the buffer that made it the rare case
+  rather than the ordinary one, and this file no longer buys it.
 - **Key Value keeps nothing.** A Free Key Value instance is **25 MB** with a 50-connection limit, and Render
   does not persist it: its free tier forces `persistenceMode` off, and Render reserves the right to restart
   the instance at any time, which deletes every key in it.
@@ -1003,7 +1013,8 @@ staging: the frontend calls the real API and reads `/api/docs` while they do it.
 | `maxmemoryPolicy: noeviction` | BullMQ holds job state in keys, and Render's default (`allkeys-lru`) could evict a queued submission. Not a plan restriction - the setting is available on a free instance too (the policy table's third column asks "can memory fill up?", not "is this paid"), and the 25 MB is what makes it matter: with `noeviction` a full instance returns an error on a write, where an eviction drops a queued job silently. A rejected write is visible; an evicted job was not. |
 | `postgresMajorVersion: '16'` | The version `docker-compose.yml` runs, and therefore the one every migration and every e2e run in this repository was executed against. Left unset, Render would use its newest supported major. |
 | `healthCheckPath: /v1/health` | The liveness endpoint: no auth, no database call, no Redis call. It is the URL `HealthController`'s own docblock says a load balancer is pointed at. |
-| `preDeployCommand` | `npx --no-install prisma migrate deploy` runs in the newly built image, with this service's environment, *before* it takes traffic - so a failed migration fails the deploy and the previous version keeps serving. The Dockerfile copies `prisma/`, the migrations and `prisma7.config.ts` into the runtime stage for this one line (and `dotenv`, which that config imports). Render's free-tier documentation does not list pre-deploy commands among the features free web services lack (it counts them as pipeline minutes, which a free workspace gets an included amount of), and the schema attaches no plan condition to the field - so the migration step survives the move to `free`, and a failed `migrate deploy` still fails the deploy. |
+| `dockerCommand` | `npx --no-install prisma migrate deploy && node dist/main.js` - the Dockerfile's `CMD` matched exactly, with the migration prefixed - runs through `/bin/sh -c`, so a failed migration means the app never starts, the instance never answers `healthCheckPath`, and the deploy fails with the previous version serving. It is a *start* command rather than a pre-deploy step because **Render's sync-time validator rejected `preDeployCommand` on a free web service** ("not supported for free tier services"), which falsified this row's earlier claim that the field survived the move to `free`: the published schema attaches no plan condition to `preDeployCommand`, and `/docs/free` does not list pre-deploy commands, and the field was still refused - plan gating is enforced when the Blueprint is synced and appears in neither document. Re-running it on every start (a free instance wakes by starting this command again) is safe, and that was measured rather than assumed: against a throwaway Postgres, the first run applied 7 migrations and exited 0, a second run and a third behind `sh -c` printed `No pending migrations to apply` and exited 0, and `_prisma_migrations` still held exactly 7 rows. That matches Prisma v7's own description - `migrate deploy` "Applies pending migrations" and "**Does not** reset the database" - and Prisma takes an advisory lock (10s timeout) so two instances cannot migrate at once. The Dockerfile copies `prisma/`, the migrations and `prisma7.config.ts` into the runtime stage for this one line (and `dotenv`, which that config imports); no `--config` flag is needed because `prisma7.config.*` is the first candidate in the installed CLI's own config-file list. |
+| No `maxShutdownDelaySeconds` | Removed on the same sync, for the same reason - a free web service refuses it ("not supported for free tier services"). The 30-second graceful-shutdown window still applies, but it is Render's default now rather than a value this file sets, and a free instance may be restarted at any time on top of that. An in-flight submission killed by a SIGKILL is still re-queued by BullMQ's stalled-job check (`maxStalledCount`, 1 by default) rather than lost; what is gone is the buffer that made that the rare case. Stated in the cost section above and in the known gaps below rather than dropped silently. |
 
 ### The values that are not in the file
 
@@ -1229,7 +1240,7 @@ blocks a step in `docs/build-sequence.md`.
   during the first incident.
 
 - **The Render blueprint has been checked against Render's schema and docs, and never synced to a
-  workspace.** `render.yaml` parses, and every key in it — `preDeployCommand`, `maxmemoryPolicy:
+  workspace.** `render.yaml` parses, and every key in it — `dockerCommand`, `maxmemoryPolicy:
   noeviction`, `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
   (`https://render.com/schema/render.yaml.json`). The three `plan: free` values are the `free` entry in
   that same file's `postgresPlan`, `keyValuePlan` and `serverPlan` enums, and the free-tier limits this
@@ -1241,16 +1252,31 @@ blocks a step in `docs/build-sequence.md`.
   750 Free instance hours per workspace per month, at which point Render suspends all of your Free web
   services until the start of the next month, and the service-initiated-traffic threshold that permits
   suspending a free web service calling external APIs at uncommonly high volume — which this one does, on
-  Horizon, KMS, Africa's Talking and Sentry. None of that is a deployment: no sync has been run, so the
-  behaviour a reader would test first — that a failing `prisma migrate deploy` aborts the deploy and
-  leaves the previous version serving — remains Render's documented answer rather than anything this
-  repository has seen. What has been observed is the image: the Dockerfile's runtime stage now carries
-  `prisma/`, the migrations, `prisma7.config.ts` and `dotenv`, so `npx --no-install prisma migrate deploy`
-  has a schema and a datasource to read instead of dying on an unresolved import. The environment the e2e
-  suites run against is still `docker-compose.yml`'s Postgres and Redis on their own ports, and no API
+  Horizon, KMS, Africa's Talking and Sentry. None of that is a deployment, and the first Create attempt was
+  refused before anything was created — which is itself the finding this bullet now records. **Render's
+  sync-time validator rejected two fields the schema check had passed**: `preDeployCommand` and
+  `maxShutdownDelaySeconds`, both "not supported for free tier services". The published schema encodes no plan
+  conditions at all and mentions a plan requirement in prose exactly once (`maintenanceMode`, "Requires a paid
+  web service instance"), so "the schema attaches no plan condition to this field" was never evidence that a
+  field survives `free` — and this bullet previously drew that conclusion from it. `/docs/free` does not list
+  pre-deploy commands either: the refusal is enforced when the Blueprint is synced and appears in neither
+  document, so the sync is the only check that counts. The migration now runs as `dockerCommand` instead, and
+  its idempotency is the one part of this that has been *measured* rather than read: against a throwaway
+  local database on 2026-10-01 (Postgres 18.3, where the blueprint pins 16), the first run applied 7
+  migrations and exited 0, a second run and a third behind `sh -c` printed `No pending migrations to apply`
+  and exited 0, and `_prisma_migrations` still held exactly 7 rows. What remains Render's documented answer
+  rather than this repository's observation is the failure path — that a failing `prisma migrate deploy` in
+  the start command fails the deploy and leaves the previous version serving — and the same is true of the
+  startup-side uncertainty a sync will settle: a free web service is documented to accept `dockerCommand`
+  because every service has a start command, and that has not been exercised either. What has also been
+  observed is the image: the Dockerfile's runtime stage carries `prisma/`, the migrations, `prisma7.config.ts`
+  and `dotenv`, so `npx --no-install prisma migrate deploy` has a schema and a datasource to read instead of
+  dying on an unresolved import — and the installed CLI resolves that config by name, because
+  `prisma7.config.*` is the first entry in its own candidate list, ahead of `prisma.config.*`. The environment
+  the e2e suites run against is still `docker-compose.yml`'s Postgres and Redis on their own ports, and no API
   request in this repository has ever been served by the staging service. An earlier revision of this file
-  named Render's smallest paid plans instead; Render's Create page priced *that* file at $27.50/month,
-  which is what going back costs.
+  named Render's smallest paid plans instead; Render's Create page priced *that* file at $27.50/month, which
+  is what going back costs — and $27.50/month would also buy back both fields above.
 
 - **On the free tier, staging can lose a queued payment, and its database is on a clock.** Both are the
   price of free and neither is hypothetical. A free Key Value instance is not persisted and Render may
@@ -1265,7 +1291,11 @@ blocks a step in `docs/build-sequence.md`.
   the Redis record is only the replay, so the failure a client sees is a worse retry answer rather than a
   second payment. Separately, a free Postgres database expires 30 days after creation and is deleted 14
   days after that unless it is upgraded first — and free web services have no shell and no one-off jobs,
-  so an operator diagnosing any of this has the log and the API and nothing else.
+  so an operator diagnosing any of this has the log and the API and nothing else. The graceful-shutdown
+  window is part of the same bill: `maxShutdownDelaySeconds` is refused on free, so the 30 seconds this file
+  used to set is Render's default rather than a promise, an in-flight submission cut off by a restart or a
+  sleep is re-queued by BullMQ's stalled-job recovery (`maxStalledCount`, 1 by default) instead of being
+  finished, and nothing in this file can widen the window without leaving the free plan.
 
 ## Deployment
 
