@@ -930,7 +930,9 @@ and order (two rows in one millisecond are the only rows whose page order is the
 pointed at this repository - the Blueprint Path is `render.yaml`, which is the default), it provisions the
 whole environment in one sync - a Postgres database, a Key Value instance, and the API built from the
 Dockerfile that is already here. A `main` push redeploys the API (`autoDeploy: true`); a change to the file
-is applied by re-syncing the Blueprint.
+is applied by re-syncing the Blueprint. Render builds and deploys on that push whether or not CI on
+that commit passed: the deploy's own gates are the image build and the pre-deploy migration, which is
+why the workflow is the check that is supposed to fail first rather than one Render consults.
 
 **It is staging, and three things in the file say so.** `STELLAR_NETWORK=TESTNET`, with the Horizon URL and
 the USDC issuer that exist on that network, so nothing in this environment can move real money.
