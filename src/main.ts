@@ -1,9 +1,9 @@
-import { writeSync } from 'node:fs';
 import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import * as Sentry from '@sentry/nestjs';
 import { Redis } from 'ioredis';
 import { AppModule } from './app.module.js';
+import { describeError, markBootStage, reportFatal } from './common/boot/boot-log.js';
 import { configureCors } from './common/http/cors.js';
 import { GLOBAL_PREFIX } from './common/http/prefix.js';
 import { createValidationPipe } from './common/pipes/validation.pipe.js';
@@ -11,6 +11,33 @@ import { SWAGGER_PATH, setupSwagger } from './common/http/swagger.js';
 import configuration, { type AppConfig } from './config/configuration.js';
 import { NodeEnvironment } from './config/validation.schema.js';
 import { PrismaService } from './prisma/prisma.service.js';
+
+/**
+ * Fatal-error handlers, registered as the first executable statements in this module.
+ *
+ * They have to be in place before `bootstrap()` can fail, which is why they sit above
+ * everything else in the file body. The one gap they cannot cover is a crash while this
+ * module's *imports* are still being evaluated: ESM hoists and evaluates every import
+ * before a single statement here runs, so no placement inside this file can precede them.
+ * That case is not silent, though - with no handler registered yet, Node prints the
+ * module-evaluation error and its stack to stderr itself and exits non-zero. The silent
+ * case is a *hang*, which prints nothing, and that is what the boot probe's timeout in
+ * `KmsKeyWrapper` exists for.
+ *
+ * Both handlers report and then exit non-zero rather than continuing: an uncaught
+ * exception during startup leaves the app in a state nobody designed, and Render reads a
+ * non-zero exit as a failed deploy instead of an instance that might answer a health check.
+ * The `[FATAL` token is there so one grep separates a dead boot from a slow one.
+ */
+process.on('uncaughtException', (error) => {
+  reportFatal(`[FATAL uncaughtException] ${describeError(error)}`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  reportFatal(`[FATAL unhandledRejection] ${describeError(reason)}`);
+  process.exit(1);
+});
 
 const logger = new Logger('Bootstrap');
 
@@ -137,27 +164,6 @@ async function verifyDependencies(app: INestApplication, config: AppConfig): Pro
   await verifyRedis(config.redis.url);
 }
 
-/**
- * Writes a boot-stage marker to stderr, synchronously.
- *
- * Boot progress goes to stderr rather than through the Nest logger because the
- * failure this exists for is a module that never finishes constructing, and the
- * Nest logger writes to `process.stdout` - a pipe under Render, and therefore
- * buffered - so the last line it managed to write may not have landed before the
- * stage it names gave way to a hang. `writeSync(2, ...)` is synchronous, so the
- * marker is in the pipe before this returns: the last marker that appears names
- * the stage that completed, and the one that should have followed names the call
- * that never returned. A free instance offers no shell, so a greppable line in
- * the log is the whole of the diagnosis.
- */
-function markBootStage(stage: string): void {
-  try {
-    writeSync(2, `[boot] ${stage}\n`);
-  } catch {
-    // stderr is gone (a closed pipe) - there is no log left to write to.
-  }
-}
-
 async function bootstrap(): Promise<void> {
   markBootStage('bootstrap entered');
   loadEnvironmentFile();
@@ -225,50 +231,15 @@ async function bootstrap(): Promise<void> {
   }
 }
 
-/**
- * Writes a line to stderr synchronously.
- *
- * Node writes to `process.stdout`/`process.stderr` asynchronously when they are
- * pipes - which is what they are under Render - and `process.exit()` does not
- * wait for such a write to land. A boot that dies before Nest prints its first
- * line therefore leaves an empty log, which is a failed deploy with no cause in
- * it. `writeSync` is synchronous, so the message is in the pipe before the
- * process goes away: a failure is readable even when it is the last thing to
- * run.
- */
-function reportFatal(message: string): void {
-  try {
-    writeSync(2, `${message}\n`);
-  } catch {
-    // stderr is gone (a closed pipe) - there is nothing left to report to.
-  }
-}
-
-/** Renders an unknown thrown value into the single line a fatal log can carry. */
-function describeError(error: unknown): string {
-  return error instanceof Error
-    ? (error.stack ?? `${error.name}: ${error.message}`)
-    : String(error);
-}
-
-// A throw that escapes a callback, or a rejection nothing awaited, ends the
-// process the same silent way the bare `await bootstrap()` used to: the deploy
-// shows only "exited early" or a port scan timing out, and names no cause. Both
-// handlers report and then exit non-zero, so a start-command failure is never an
-// empty log again.
-process.on('uncaughtException', (error) => {
-  reportFatal(`Uncaught exception during startup - ${describeError(error)}`);
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason) => {
-  reportFatal(`Unhandled rejection during startup - ${describeError(reason)}`);
-  process.exit(1);
-});
-
+// Everything above runs inside this `try`, and it has to. `bootstrap` is the function that
+// `await`s `app.init()`, where a stalled `onModuleInit` - the KMS boot probe is one - would
+// otherwise hang with nothing written anywhere. Catching around the call rather than inside
+// the function body is what makes it total, because an async function cannot catch its own
+// rejection; the `catch` then writes the full stack synchronously before exiting non-zero,
+// so a start-command failure is never an empty log again.
 try {
   await bootstrap();
 } catch (error) {
-  reportFatal(`Bootstrap failed - ${describeError(error)}`);
+  reportFatal(`[FATAL bootstrap failed] ${describeError(error)}`);
   process.exit(1);
 }

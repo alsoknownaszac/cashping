@@ -6,6 +6,7 @@ import {
   GenerateDataKeyCommand,
   KMSClient,
 } from '@aws-sdk/client-kms';
+import { describeError, markBootStage } from '../../common/boot/boot-log.js';
 import { NodeEnvironment } from '../../config/validation.schema.js';
 import {
   KmsKeyNotFoundError,
@@ -60,6 +61,58 @@ export const createKmsClient: KmsClientFactory = (options) =>
       secretAccessKey: options.secretAccessKey,
     },
   });
+
+/**
+ * How long the boot probe waits for `DescribeKey` before it calls the endpoint dead.
+ *
+ * A hard cap rather than a nicety. Without one, an endpoint that accepts the socket and
+ * then never answers leaves `onModuleInit` pending forever, which stalls `app.init()`,
+ * which means the port never binds, which ends the deploy as "no open HTTP ports detected"
+ * with nothing in the log - a hang wearing the costume of a network problem.
+ *
+ * Ten seconds is chosen from both ends: comfortably above the SDK's own connect timeout, so
+ * a merely slow answer still arrives and is reported as itself rather than as a timeout, and
+ * far below the point where a health check has already given up, so the failure lands in the
+ * log as a named line instead of as silence.
+ */
+const KMS_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * Fails `operation` with a named error once `timeoutMs` passes without an answer.
+ *
+ * The timer is unref'd and cleared, so a prompt answer never leaves a stray callback keeping
+ * the event loop open - which would surface as a slow shutdown rather than a slow boot, and
+ * be blamed on something else entirely. The operation is abandoned rather than cancelled
+ * (a promise cannot be cancelled), which is safe for the one caller: `Promise.race` has
+ * already attached a rejection handler to the loser, so a late failure is observed by
+ * nobody and crashes nothing, and the call being abandoned is a read that leaves no
+ * half-applied state behind.
+ */
+async function withBootTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  what: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${what} did not answer within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 
 /**
  * The AWS KMS implementation of `KeyWrapper` (Step 18) - the only file in the app
@@ -268,7 +321,7 @@ export class KmsKeyWrapper implements KeyWrapper, OnModuleInit {
     let described: KeyDescription;
 
     try {
-      described = await this.describeMasterKey();
+      described = await this.probeMasterKey();
     } catch (cause) {
       this.reportUnusableKey(
         cause instanceof Error ? cause.message : String(cause),
@@ -291,6 +344,44 @@ export class KmsKeyWrapper implements KeyWrapper, OnModuleInit {
     }
 
     this.logger.log(`KMS master key ready: ${described.arn} (${described.keyState})`);
+  }
+
+  /**
+   * `describeMasterKey`, narrated and bounded - the probe's own body.
+   *
+   * Three lines, and the one *before* the call is the point: it is what separates "KMS
+   * never answered" from "KMS answered and the answer was wrong", and it is the last marker
+   * that will print at all if everything downstream of it stops printing. The timeout turns
+   * an endpoint that accepts a connection and then goes quiet into a named failure instead
+   * of a boot that never finishes.
+   *
+   * The elapsed time is included because it is free and it is the one number that says which
+   * of the two happened: ~10 000ms is the cap being hit (unreachable), tens of milliseconds
+   * is a real answer (wrong key, wrong region, dead key state).
+   */
+  private async probeMasterKey(): Promise<KeyDescription> {
+    markBootStage('calling KMS DescribeKey...');
+    const startedAt = Date.now();
+
+    try {
+      const described = await withBootTimeout(
+        this.describeMasterKey(),
+        KMS_PROBE_TIMEOUT_MS,
+        'KMS DescribeKey',
+      );
+
+      markBootStage(
+        `KMS DescribeKey answered in ${Date.now() - startedAt}ms: ${described.arn} (${described.keyState})`,
+      );
+
+      return described;
+    } catch (cause) {
+      markBootStage(
+        `KMS DescribeKey failed after ${Date.now() - startedAt}ms - ${describeError(cause)}`,
+      );
+
+      throw cause;
+    }
   }
 
   /**
