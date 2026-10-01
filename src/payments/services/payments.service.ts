@@ -13,6 +13,7 @@ import { PrismaService } from '../../prisma/prisma.service.js';
 import { BalancesService } from '../../wallet/balances/balances.service.js';
 import { type CreatePaymentDto } from '../dto/create-payment.dto.js';
 import { PaymentCreatedResponseDto } from '../dto/payment-created-response.dto.js';
+import { PaymentsQueueService } from '../jobs/payments-queue.service.js';
 import { RecipientsService } from './recipients.service.js';
 
 /**
@@ -52,10 +53,12 @@ interface CreatedTransaction {
  *
  * ## What this step is responsible for, and what it is not
  *
- * A payment is created as a `PENDING` `transactions` row, and nothing else happens: no key is
- * opened, nothing is signed, and Horizon is not told anything. Those are Day 4's (Steps 27-29),
- * and keeping them out is what makes this step's two claims testable on their own - exactly one
- * row per idempotency key, and no overdraft under concurrency.
+ * A payment is created as a `PENDING` `transactions` row, and a submission job for it is put on
+ * the queue in the same transaction (Step 27) - that enqueue is the one line of Day 4 that belongs
+ * here, because it is the last thing that can be made atomic with the row's creation. Nothing else
+ * happens: no key is opened, nothing is signed, and Horizon is not told anything. Those are
+ * `PaymentsSubmissionService`'s, and keeping them out is what makes this step's two claims testable
+ * on their own - exactly one row per idempotency key, and no overdraft under concurrency.
  *
  * The money question this step *does* answer is "may the sender spend this much right now", and
  * the answer is computed rather than remembered:
@@ -109,12 +112,18 @@ export class PaymentsService {
     private readonly prisma: PrismaService,
     private readonly balances: BalancesService,
     private readonly recipients: RecipientsService,
+    /**
+     * Where the submission job goes (Step 27). Injected as the service rather than as BullMQ's
+     * `Queue`, so that this file adds a *payment* to the queue and never learns a job name, a
+     * payload shape or a retry policy - see `PaymentsQueueService`.
+     */
+    private readonly queue: PaymentsQueueService,
   ) {}
 
   /**
    * `POST /v1/payments`: validate, reserve, write, answer with the id.
    *
-   * The order of the four checks is the order of what they cost and what they mean:
+   * The order of the checks is the order of what they cost and what they mean:
    *
    * 1. **The amount**, parsed server-side. Cheap, purely local, and nothing else can be judged
    *    before it is known.
@@ -122,8 +131,9 @@ export class PaymentsService {
    *    never reads Horizon and never writes a row.
    * 3. **The sender's balance**, a Horizon read (through `BalancesService`, the one definition of
    *    what a wallet holds), which also refuses a wallet that cannot hold USDC at all.
-   * 4. **The lock, the in-flight sum and the insert**, together, because that is the part that
-   *    has to be atomic.
+   * 4. **The lock, the in-flight sum, the insert and the enqueue**, together, because that is the
+   *    part that has to be atomic - and the enqueue is inside it because a committed row with no
+   *    job is the one failure here that nothing would ever report (see the comment on the call).
    *
    * `idempotencyKey` reaches the column rather than living only in Redis, so "one key, one
    * payment" survives a claim that was never written (see `IdempotencyInterceptor`). It is
@@ -157,16 +167,37 @@ export class PaymentsService {
          * `PENDING` is stated rather than left to the column's default so that the status a
          * payment is created in is visible in the code that creates it.
          */
-        return tx.transaction.create({
+        const row = await tx.transaction.create({
           data: {
             senderId: sender.id,
             recipientId: recipient.id,
             amount: amount.toString(),
-            status: TransactionStatus.PENDING,
             idempotencyKey,
+            status: TransactionStatus.PENDING,
           },
           select: { id: true, status: true, amount: true, createdAt: true },
         });
+
+        /**
+         * The submission job, added *inside* this transaction and last, before the commit
+         * (Step 27). The ordering is the whole decision, and both of its failure modes are
+         * survivable - but only one of them is silent:
+         *
+         * - Commit first, enqueue after: a crash in between leaves a `PENDING` row with no job on
+         *   the queue. Nothing retries it, nothing reports it, and it looks exactly like a payment
+         *   that is about to be submitted. That is the failure this ordering refuses.
+         * - Enqueue first, commit after (this): a rollback - or a crash before the commit - leaves
+         *   a job for a payment that does not exist. The handler throws on that ("this job has no
+         *   row"), it is retried and then logged as failed by the processor, and no money moves.
+         *
+         * The enqueue is awaited rather than fired and forgotten, because a caller that answered
+         * `202` before the job was on the queue would be promising a submission nobody had agreed
+         * to attempt - and because the Redis command behind it is bounded (see
+         * `PAYMENTS_QUEUE_COMMAND_TIMEOUT_MS`), so it cannot hold this row lock for long.
+         */
+        await this.queue.enqueueSubmission(row.id);
+
+        return row;
       });
     } catch (error) {
       throw asKeyReuse(error, idempotencyKey);

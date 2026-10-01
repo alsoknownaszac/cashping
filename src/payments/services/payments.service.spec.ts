@@ -6,6 +6,7 @@ import { type SessionUser } from '../../identity/token/token.service.js';
 import { type PrismaService } from '../../prisma/prisma.service.js';
 import { type BalanceResponseDto } from '../../wallet/dto/balance-response.dto.js';
 import { type BalancesService } from '../../wallet/balances/balances.service.js';
+import { type PaymentsQueueService } from '../jobs/payments-queue.service.js';
 import { type RecipientsService } from './recipients.service.js';
 import { PaymentsService } from './payments.service.js';
 
@@ -52,6 +53,8 @@ interface HarnessOptions {
   recipient?: { id: string } | Error;
   /** What the insert raises, if anything. */
   insertError?: unknown;
+  /** What the enqueue raises, if anything. */
+  enqueueError?: unknown;
   /** The amount the *row* holds, when the response should be read from it. */
   storedAmount?: string;
 }
@@ -99,7 +102,28 @@ function harness(options: HarnessOptions = {}) {
     $transaction: vi.fn(async (work: (client: unknown) => Promise<unknown>) => {
       calls.push('begin');
 
-      return work(tx);
+      const result = await work(tx);
+
+      calls.push('commit');
+
+      return result;
+    }),
+  };
+
+  /**
+   * The queue, as this service sees it: one method, called with the id of the row that was just
+   * inserted. `commit` is recorded by the `$transaction` fake above, which is what makes "the job
+   * goes on the queue before the transaction commits" an assertion rather than a comment.
+   */
+  const queue = {
+    enqueueSubmission: vi.fn(async (transactionId: string) => {
+      calls.push(`enqueue:${transactionId}`);
+
+      if (options.enqueueError !== undefined) {
+        throw options.enqueueError;
+      }
+
+      return { id: transactionId };
     }),
   };
 
@@ -139,10 +163,12 @@ function harness(options: HarnessOptions = {}) {
     prisma,
     balances,
     recipients,
+    queue,
     service: new PaymentsService(
       prisma as unknown as PrismaService,
       balances as unknown as BalancesService,
       recipients as unknown as RecipientsService,
+      queue as unknown as PaymentsQueueService,
     ),
   };
 }
@@ -183,8 +209,8 @@ describe('the row it writes', () => {
         // The shortest exact form: `Amount.toString()`, which is also what JSON carries. A
         // trailing-zero spelling never reaches the column.
         amount: '10',
-        status: TransactionStatus.PENDING,
         idempotencyKey: KEY,
+        status: TransactionStatus.PENDING,
       },
       select: { id: true, status: true, amount: true, createdAt: true },
     });
@@ -204,14 +230,16 @@ describe('the row it writes', () => {
     });
   });
 
-  it('reads the balance before it opens the transaction, then locks, sums and inserts', async () => {
+  it('reads the balance before it opens the transaction, then locks, sums, inserts and enqueues', async () => {
     const harnessed = harness();
 
-    await create(harnessed);
+    const created = await create(harnessed);
 
     // The order is the design: the recipient is checked before anything expensive, the network
     // read happens *outside* the lock (a Horizon round trip is not something to hold a row lock
-    // across), and the sum comes after the lock, because that is the read the lock serialises.
+    // across), the sum comes after the lock because that is the read the lock serialises - and the
+    // submission job is the last thing before the commit, so a committed row always has one (Step
+    // 27; the argument for that ordering is on the call itself).
     expect(harnessed.calls).toEqual([
       'recipient',
       'balance',
@@ -219,7 +247,25 @@ describe('the row it writes', () => {
       'lock',
       'in-flight',
       'insert',
+      `enqueue:${created.id}`,
+      'commit',
     ]);
+
+    // And the job names the row the response names: a client that was told about a payment and a
+    // queue that was told about a different one would be two payments, not one.
+    expect(harnessed.queue.enqueueSubmission).toHaveBeenCalledWith(created.id);
+  });
+
+  it('fails the payment when the queue will not take the job, and never reaches the commit', async () => {
+    // The bound `PAYMENTS_QUEUE_COMMAND_TIMEOUT_MS` puts on a sick Redis, seen from the caller: the
+    // rejection travels out of the transaction, the row is rolled back with it, and the sender is
+    // told the payment failed rather than being told `202` for a job nobody agreed to run.
+    const timeout = new Error('Command timed out');
+    const harnessed = harness({ enqueueError: timeout });
+
+    await expect(create(harnessed)).rejects.toBe(timeout);
+
+    expect(harnessed.calls).not.toContain('commit');
   });
 });
 

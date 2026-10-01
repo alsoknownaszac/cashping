@@ -1,3 +1,5 @@
+import { type Queue } from 'bullmq';
+
 /**
  * The payments queue's contract: its name, its job names, and the shapes those jobs move
  * (Step 26).
@@ -62,3 +64,88 @@ export interface PaymentsQueueProbeResult {
   pong: true;
   workerPid: number;
 }
+
+/**
+ * The job that submits a payment (Step 27) - the first thing on this queue that is about money.
+ *
+ * It coexists with the probe above deliberately: they answer different questions (the probe asks
+ * whether the plumbing works, this asks whether a payment moved), and a queue whose only job is a
+ * health check is a queue nobody has tested under load.
+ */
+export const PAYMENTS_QUEUE_SUBMISSION_JOB = 'submit-payment';
+
+/**
+ * What a submission job carries: the id of the payment to submit, and nothing else.
+ *
+ * The payload is deliberately a *reference* rather than a description. Every fact the handler
+ * needs - the amount, the two accounts, the record of any transaction already built - is in the
+ * `transactions` row, read fresh on each attempt, which is what makes the handler a pure function
+ * of that row. Copying any of it into the payload would create a second, older version of the
+ * truth, and a job that could disagree with the row it is about.
+ */
+export interface PaymentsQueueSubmissionJobData {
+  readonly transactionId: string;
+}
+
+/**
+ * What one submission attempt did, as the job's stored result.
+ *
+ * The five answers are the ones `PaymentsSubmissionService` produces; the union is repeated here
+ * rather than imported from the service because this is the *queue's* contract (what a caller
+ * reading Redis, or the processor, sees) and the service's is the domain's - and the processor's
+ * translation between them is a plain assignment, so the compiler fails the build the day the two
+ * drift apart.
+ *
+ * `detail` is a short machine code, never free text: for a failed payment it is the reason stored
+ * in the row (`landed-unsuccessful:op_underfunded`), and for every other answer it names the
+ * condition (`recorded-transaction-still-valid`, `claimed-elsewhere`).
+ */
+export interface PaymentsQueueSubmissionResult {
+  readonly transactionId: string;
+  readonly status: 'accepted' | 'failed' | 'skipped' | 'deferred' | 'superseded';
+  readonly stellarTxHash: string | null;
+  readonly ledger: number | null;
+  readonly detail: string | null;
+}
+
+/** Every job name on this queue, as one type - which job names exist is a fact about the queue. */
+export type PaymentsQueueJobName =
+  | typeof PAYMENTS_QUEUE_PROBE_JOB
+  | typeof PAYMENTS_QUEUE_SUBMISSION_JOB;
+
+/**
+ * The payloads this queue carries, as one type.
+ *
+ * BullMQ types one payload/result pair per `Queue` instance, and this queue carries two jobs, so
+ * the honest type at the queue's boundary is a union. The enqueue methods narrow it back to the
+ * single job they add (see `PaymentsQueueService`), which is where a caller gets the precision
+ * back.
+ */
+export type PaymentsQueueJobData =
+  | PaymentsQueueProbeJobData
+  | PaymentsQueueSubmissionJobData;
+
+/** The results this queue's jobs produce, as one type - the result half of the same union. */
+export type PaymentsQueueJobResult =
+  | PaymentsQueueProbeResult
+  | PaymentsQueueSubmissionResult;
+
+/**
+ * The producer-side handle on this queue, as the enqueue path needs it.
+ *
+ * An interface rather than the `PaymentsQueueProducer` class, for a reason that is structural
+ * rather than stylistic: `PaymentsQueueService` depends on the producer, the producer is provided
+ * by `PaymentsQueueModule`, and that module depends on the service - so injecting the *class* would
+ * make the two files import each other and make DI depend on which one ESM happened to evaluate
+ * first. The service asks for a token and this shape; the module is free to provide a class that
+ * satisfies it (it does, and the shape is one field wide on purpose).
+ */
+export interface PaymentsQueueHandle {
+  readonly queue: Queue<PaymentsQueueJobData, PaymentsQueueJobResult, PaymentsQueueJobName>;
+}
+
+/**
+ * The token `PaymentsQueueHandle` is provided under (`useExisting: PaymentsQueueProducer`, so both
+ * names resolve to the same instance and there is one connection, not two).
+ */
+export const PAYMENTS_QUEUE_PRODUCER = Symbol('PAYMENTS_QUEUE_PRODUCER');

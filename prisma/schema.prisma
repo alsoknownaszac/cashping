@@ -202,9 +202,11 @@ model StellarAccount {
 /// test that registers senders has to delete its transactions *first*, which is the
 /// honest order.
 ///
-/// The columns Step 27-29 add - the submitted transaction's hash, the failure reason,
-/// the poll timestamps - are deliberately absent: each arrives with the step that
-/// writes it, the same way every other model here grew.
+/// Step 27 added the four submission columns above - the submitted transaction's hash,
+/// the sequence it consumed, the deadline the fence turns on, and the failure reason -
+/// together with the unique index over the hash. What is still deliberately absent is
+/// Step 28's poll bookkeeping (when the row was last polled, and how many times): it
+/// arrives with the step that writes it, the same way every other model here grew.
 model Transaction {
   id             String            @id @default(uuid()) @db.Uuid
   senderId       String            @map("sender_id") @db.Uuid
@@ -214,6 +216,51 @@ model Transaction {
   status         TransactionStatus @default(PENDING)
   /// The client's `Idempotency-Key` for this payment, unique per sender.
   idempotencyKey String            @map("idempotency_key")
+  /// The hash of the *signed* transaction this payment carries (Step 27).
+  ///
+  /// `NULL` until a transaction has been built and its hash committed; once written it
+  /// is written *before* the signed transaction is handed to Horizon, so a submission
+  /// that crashed mid-flight leaves a row that says "this transaction may exist" -
+  /// the only reading that is safe to act on (see `PaymentsSubmissionService`).
+  /// Horizon echoes the same hash back on acceptance, and it is the value an operator
+  /// pastes into an explorer.
+  ///
+  /// Unique because a hash identifies exactly one transaction: two payments sharing
+  /// one would mean one of them is not the payment it claims to be. Postgres treats
+  /// `NULL`s as distinct, so the constraint applies only where a transaction exists.
+  stellarTxHash      String?           @unique @map("stellar_tx_hash")
+  /// The sequence number the built transaction consumed, as text (Step 27).
+  ///
+  /// A string, not a number, for the reason `StellarAccountSession` records about
+  /// sequence numbers: a Stellar sequence is an int64 and `Number` silently rounds it
+  /// above 2^53. The comparison the rebuild fence makes (`fresh === recorded`) is made
+  /// with `BigInt` on this text. `varchar(20)` holds every int64 the network can issue
+  /// (19 digits at most).
+  stellarTxSequence  String?           @map("stellar_tx_sequence") @db.VarChar(20)
+  /// The moment the recorded transaction stops being valid: its `maxTime` (Step 27).
+  ///
+  /// The fence's first half. While `now <= submissionDeadline` the recorded
+  /// transaction might still land, so no second transaction may be built for this
+  /// payment; only after it may a rebuild be considered, and then only if the fresh
+  /// sequence number still matches `stellarTxSequence`.
+  submissionDeadline DateTime?         @map("submission_deadline")
+  /// Why this payment failed, as a short machine code (Step 27).
+  ///
+  /// `landed-unsuccessful:op_underfunded`, `submission-rejected:tx_bad_auth`,
+  /// `secret-envelope:authentication-failed` - never Horizon's prose: an error body carries
+  /// URLs and unbounded length, and this text is stored and rendered. `NULL` unless the
+  /// status is `FAILED`.
+  ///
+  /// The two prefixes say **whether a ledger closed this transaction**, never which caller
+  /// learned the outcome (Step 28's audit of Step 27's names):
+  /// `landed-unsuccessful:<code>` is a transaction the ledger closed unsuccessfully - the
+  /// fee is charged and the sequence consumed, which is why a `FAILED` row's hash is worth
+  /// asking Horizon about rather than assuming it is absent - while
+  /// `submission-rejected:<code>` is reserved for codes that are refusals about the
+  /// envelope and were never in a ledger (`submission-triage.ts` holds that list, and its
+  /// spec asserts the reservation over it). An unrecognised code gets no prefix at all.
+  /// See `docs/step-28-29-proposal.md` §6 for the measurement behind the split.
+  failureReason      String?           @map("failure_reason")
   createdAt      DateTime          @default(now()) @map("created_at")
   updatedAt      DateTime          @updatedAt @map("updated_at")
 

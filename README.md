@@ -343,7 +343,7 @@ npm run lint:money   # node src/common/money/check-money-discipline.ts
 ```
 
 ```
-Money discipline: 131 files scanned, 0 violations
+Money discipline: 148 files scanned, 0 violations    (the tool's output, as of Step 27)
 ```
 
 It exits non-zero, naming `file:line` and the reason, on each of four shapes:
@@ -534,25 +534,29 @@ It creates its own accounts, writes their wallet rows, and deletes its transacti
 ## The payments queue (Step 26)
 
 Step 26 registers the queue and the worker that drains it, and deliberately nothing else: no code in
-this application puts a *payment* on it yet, because that is Step 27 - the step the build sequence
-gates on a written proposal. What exists is the plumbing, live end to end.
+this application put a *payment* on it, because that is Step 27 - which is also why the queue was
+handed over with no `defaultJobOptions` and no submission job. What exists here is the plumbing, live
+end to end; the section that follows is what now puts payments on it.
 
 | File | What it is |
 | --- | --- |
-| `src/payments/jobs/payments-queue.ts` | The names: `payments` (the queue), `probe` (the one job), and the shapes they move - literals here rather than in each of the three files that need them. |
-| `src/payments/jobs/payments-queue.module.ts` | The connection (`redis.url`, read through `ConfigService`), `forRootAsync` (registered once for the whole app), `registerQueue`, and the providers. |
-| `src/payments/jobs/payments.processor.ts` | The worker: answers a probe, and **throws** on any job name it does not recognise. |
-| `src/payments/jobs/payments-queue.service.ts` | The only way onto the queue - `enqueueProbe()` today, the submission enqueue at Step 27. |
+| `src/payments/jobs/payments-queue.ts` | The names: `payments` (the queue), `probe` and `submit-payment` (the jobs), and the shapes they move - literals here rather than in each of the three files that need them. |
+| `src/payments/jobs/payments-queue.module.ts` | The shared connection (`redis.url`, read through `ConfigService`), `forRootAsync` (registered once for the whole app), `registerQueue`, the producer (`PaymentsQueueProducer`) and the providers. |
+| `src/payments/jobs/payments-queue-connection.ts` | The producer's *own* connection: the same Redis, with one command bounded - see *The bound on Redis* in the next section. |
+| `src/payments/jobs/payments.processor.ts` | The worker: answers a probe, hands a submission to `PaymentsSubmissionService`, and **throws** on any other job name. |
+| `src/payments/jobs/payments-queue.service.ts` | The only way onto the queue - `enqueueProbe()` and `enqueueSubmission(transactionId)`, with the submission job's retry policy in `submissionJobOptions`. |
 
 Three decisions, each recorded where it was made:
 
 - **BullMQ gets its own connections, from the same URL.** It cannot share `RedisService.client`:
   BullMQ blocks on connections and needs `maxRetriesPerRequest: null`, while that client sets `2` on
   purpose so a rate-limit or idempotency command *rejects* instead of hanging forever. Same Redis,
-  separate sockets, one shared value.
-- **The queue has no `defaultJobOptions`.** Attempts, backoff and retention *are* the retry policy,
-  and the retry policy is what decides whether "the job ran twice" is survivable on a money path.
-  That is Step 27's proposal to write, not a default inherited from whoever wired the queue.
+  separate sockets, one shared value. Step 27 added a second BullMQ connection for the producer, for a
+  different reason, and that is argued in the next section.
+- **The queue has no `defaultJobOptions`, and it still does not.** Attempts, backoff and retention
+  *are* the retry policy, and the retry policy is what decides whether "the job ran twice" is
+  survivable on a money path. Step 27 wrote it where the job is added instead
+  (`submissionJobOptions`), so each job carries exactly the options it was argued for.
 - **The worker runs inside the API process**, at BullMQ's default concurrency of 1. A second
   deployable buys nothing at one payment at a time, and its two costs are stated rather than
   discovered: a redeploy restarts the consumer (BullMQ's stalled-job check re-queues what was in
@@ -572,7 +576,7 @@ without Redis growing by one job per question asked.
 ### Running the proofs
 
 ```bash
-npm test                                  # 640 tests (38 files); 11 of them are new here
+npm test                                  # 692 tests (42 files) as of Step 27
 npm run test:e2e test/queue.e2e-spec.ts   # 3 tests: real Redis, real worker, no substitutions
 ```
 
@@ -590,6 +594,102 @@ answers is how you learn there is more than one consumer - but the assertion is 
 answered", not "this one did".
 
 
+## Submission (Step 27)
+
+This is the step where the application signs a real key and moves real money, so it was proposed and
+approved before it was written: `docs/step-27-proposal.md` is the design, and this section is what
+shipped. Scope is submission only - `PENDING` → `PROCESSING`, and `PROCESSING` → `FAILED` for a
+definitive no. Resolving to `SUCCESSFUL` is Step 28's polling, and the guard around every write is
+Step 29's.
+
+| File | What it is |
+| --- | --- |
+| `src/payments/services/payments-submission.service.ts` | The whole of the write path: claim, fence, build, record, submit, triage. A pure function of the row, so "the job ran twice" is a question about Postgres and not about Redis. |
+| `src/payments/services/submission-triage.ts` | A pure function from one failure (plus two facts about the attempt) to `accepted` / `retry` / `rebuild` / `superseded` / `failed`. Every row is a test; the default is "do not conclude anything". |
+| `src/payments/services/transaction-status.ts` | The state machine as data, and `assertTransition` - the guard the two writes here go through. |
+| `src/payments/jobs/payments-submission.*` (queue, service, processor) | The enqueue (`enqueueSubmission`), the handler (a payload check and one call), and the job's options. |
+
+### The invariant
+
+> **At most one live Stellar transaction per payment, and a payment whose transaction was never built
+> is never reported as submitted.**
+
+Two failure modes, and the second is the one that is easy to overlook: a **double submission** (a
+stalled-job retry, a redeploy mid-flight, a Horizon timeout that did land) and a **silent
+non-submission** (a `PENDING` row with no job on the queue, which looks exactly like a payment about
+to be submitted, forever). Where they conflict, this chooses the loud failure - which is why the job
+is enqueued *inside* `PaymentsService.create`'s transaction, before the commit: a rollback can leave a
+job for a payment that does not exist (the handler throws "does not exist, so there is nothing to
+submit"), while a committed row can never be left without one.
+
+### The fence
+
+The hash, the sequence number the transaction consumed, and its own `maxTime` are written to
+`transactions` **before** Horizon is told anything, so a crash between the two leaves a row that says
+"this transaction may exist" - the only reading that is safe to act on. That record is then a fence:
+
+- While `now <= submissionDeadline` the recorded transaction may still land, so an attempt **defers**
+  to it and does nothing at all - not even opening the seed.
+- After the deadline a rebuild is allowed **only** if a freshly loaded sequence still equals the
+  recorded one, which means the recorded transaction never consumed it. A sequence that has moved
+  past it means the recorded transaction landed, so there is nothing to rebuild.
+- A `tx_bad_seq` on a rebuild means the *recorded* transaction landed in the gap: the previous record
+  is put back and the attempt stops, because that is the hash a poller has to look for.
+
+### What a failure becomes
+
+`retry` (the row is untouched and the error travels, so BullMQ prices the attempt) covers every case
+with no verdict - including `StellarSubmissionUnavailableError`, whose fate is unknown and may have
+landed. `failed` is reserved for a definitive no: an unopenable stored secret with nothing recorded,
+or a permanent operation code, written as `failure_reason = landed-unsuccessful:op_underfunded`.
+`rebuild` is a retry whose next attempt the fence decides. The rule behind the split: retrying costs
+an attempt, concluding wrongly costs money.
+
+The prefix on that reason belongs to a vocabulary the whole payment path shares, and it records what the
+*network* did rather than which caller asked: `landed-unsuccessful:<code>` for a transaction a ledger closed
+unsuccessfully (every operation code, and `tx_failed` itself), `submission-rejected:<code>` for a refusal no
+ledger ever saw (`tx_bad_seq`, `tx_too_late`, `tx_malformed`, `tx_insufficient_fee`, `tx_bad_auth`,
+`tx_no_source_account`, `tx_insufficient_balance`, `tx_internal_error`), and no prefix at all
+(`unknown:<code>`) for a code outside both lists - because a code nobody in this app has classified is
+evidence of neither story, and guessing is the mistake with a money-shaped consequence. A submit-time refusal
+and a poll that reads the same code back therefore write the same name: as the gated run measured, Horizon's
+`submitTransaction` blocks until the ledger closes the transaction, so the 400 is the *outcome* of a
+transaction the ledger has, not the absence of one. See `docs/step-28-29-proposal.md` §6.
+
+### The bound on Redis
+
+The enqueue runs inside the sender's `SELECT ... FOR UPDATE`, so its duration *is* the duration of
+that row lock - an unbounded hang there is an availability cascade onto every payment from that
+sender. The producer's connection therefore carries `commandTimeout: 3000`
+(`PAYMENTS_QUEUE_COMMAND_TIMEOUT_MS`). It is a **second** connection, and that is the interesting
+part: ioredis arms a command timeout for blocking commands too, and BullMQ's worker blocks for
+`drainDelay` (5s idle, up to 10s with a delayed job pending), so a few-second bound on the shared
+connection would turn every idle worker tick into an error plus a retry delay. `@nestjs/bullmq`
+cannot express that split (`registerQueue` and `@Processor` both exclude `connection`), so the
+producer is constructed as a provider of its own, closed on shutdown, while the worker keeps the
+shared connection untouched - still pinned by `payments-queue.module.spec.ts` to `{ connection: { url } }`
+and nothing else.
+
+### Running the proofs
+
+```bash
+npm run test:e2e test/submission.e2e-spec.ts   # 4 tests: 1 ungated (the enqueue bound), 3 gated
+RUN_STELLAR_IT=1 npm run test:e2e test/submission.e2e-spec.ts
+```
+
+The ungated test boots the real application, writes a real payment row, wedges Redis with
+`CLIENT PAUSE` and asserts that the payment fails *inside the bound* (`3044`, `3122`, `3206`, `3251`, `3353` ms
+across runs, against `PAYMENTS_QUEUE_COMMAND_TIMEOUT_MS = 3000`), that no row was written, that the
+producer recovers, and that the orphan job Redis eventually runs is rejected by the handler.
+
+The gated test is the Day 4 audit item, and the run it was written after is quoted in
+`docs/build-sequence.md`: a real signed submission to Testnet (`e9da1c48…36ec0d`, ledger `4943111`)
+with Horizon asked directly for the transaction and both balances; the same `transactionId` submitted
+a second time answering `deferred` with the sender's **sequence unchanged** on the network; and the
+sender's seed - opened through the real KMS for the sweep - absent from all 46 captured log lines,
+both rows and the job result. The only substitution is the USDC issuer: Circle's Testnet USDC has no
+programmatic faucet, so the run creates and funds its own issuer and mints from it.
+
 ## Documentation conventions
 
 Rules these docs and this repository's commit messages follow. They exist because a document that is
@@ -602,7 +702,8 @@ right when it is written and quietly wrong later is worse than one that never cl
   the log. A count that is re-measured later is *appended* with its own label rather than edited in
   place: the Step 23 audit line in `docs/build-sequence.md` carries both `121 files, 0 violations as
   of Step 23` and `131 files, 0 violations as of Step 25`, because the older number is evidence about
-  a smaller tree, not a mistake to be corrected.
+  a smaller tree, not a mistake to be corrected. Re-measured again at Step 27: **148 files scanned, 0
+  violations as of Step 27**.
 - **A heading that names a step does not label the counts inside it.** `## Money precision and the
   money rule (Step 23)` says when the *feature* landed; it says nothing about when the *number* under
   it was measured. The number needs its own label.
@@ -652,7 +753,7 @@ blocks a step in `docs/build-sequence.md`.
   completed by calling the service again.** `AccountProvisioningService.provisionFor` still has
   exactly one caller in `src` - `AuthService.verifyOtp` (`src/identity/auth.service.ts:404`) - and
   nothing puts it on the queue: `@nestjs/schedule` is still not a dependency, the payments queue
-  (Step 26) carries a single job **as of Step 26** and it is a probe rather than any kind of
+  (Step 26) carries two jobs **as of Step 27** - a probe, and `submit-payment` - and neither is any
   provisioning work, and the only `setTimeout` calls in `src` are the provisioning deadline and the
   Stellar SDK's transaction timeout. So a verify that comes back `incomplete` (a friendbot `429` or
   `5xx`, a Horizon `5xx`, or the 30s deadline) is still the last *automatic* attempt that user's
@@ -768,10 +869,13 @@ blocks a step in `docs/build-sequence.md`.
 - **Nothing tells Sentry about a failed job.** The global exception filter (Step 6) reports what a
   *request* did, and the worker has no equivalent: `PaymentsProcessor` logs a failed job with its
   name, id and attempt count, which is enough to find it in Redis and in the log and not enough to
-  be paged about. Step 27 owns what a failed *submission* reports, and the argument for wiring a
-  reporter there is that a submission which failed is money that did not move - a different category
-  from a probe that failed. Recorded so that it stays a decision instead of a surprise during the
-  first incident.
+  be paged about. Step 27 shipped what a failed *submission* reports without wiring a reporter: the
+  row carries `failure_reason` (`landed-unsuccessful:op_underfunded`), the processor logs the job with
+  its id, name and attempt count, and the job result records the decision - three places to find it,
+  and still no page. Wiring a reporter here stays the open decision this bullet records, and the
+  argument for it is unchanged: a submission that failed is money that did not move - a different
+  category from a probe that failed. Recorded so that it stays a decision instead of a surprise
+  during the first incident.
 
 ## Deployment
 

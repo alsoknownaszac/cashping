@@ -1,19 +1,24 @@
 import { Logger } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { type Job } from 'bullmq';
+import { PaymentsSubmissionService } from '../services/payments-submission.service.js';
 import {
   PAYMENTS_QUEUE,
   PAYMENTS_QUEUE_PROBE_JOB,
+  PAYMENTS_QUEUE_SUBMISSION_JOB,
   type PaymentsQueueProbeResult,
+  type PaymentsQueueSubmissionJobData,
+  type PaymentsQueueSubmissionResult,
 } from './payments-queue.js';
 
 /**
  * The worker for the payments queue (Step 26).
  *
- * Nothing here moves money yet, and that is the whole state of this step: what exists is the
- * plumbing a submission will run on - a queue, a consumer, and one handler that proves the two
- * are talking - and the single handler below is that proof. Step 27 adds the submission
- * handler to this class, which is the step the build sequence gates on a proposal.
+ * Nothing here moves money itself, and that is deliberate: this class is the seam between BullMQ
+ * and the code that does, and it keeps that seam thin. What Step 27 added is one branch in
+ * `process` - a name check, a payload check, and a call to `PaymentsSubmissionService`, which is
+ * where every decision about a payment lives. If a reader of this file ever has to think about
+ * sequences, deadlines or custody, the boundary has been drawn in the wrong place.
  *
  * ## Where the worker runs
  *
@@ -51,22 +56,79 @@ export class PaymentsProcessor extends WorkerHost {
   private readonly logger = new Logger(PaymentsProcessor.name);
 
   /**
+   * The submission service is the only collaborator this class has, and it is injected rather than
+   * constructed: the decisions about a payment are its, and a worker that could reach past it to a
+   * `PrismaService` or a key would be a second place submission logic could grow.
+   */
+  constructor(
+    private readonly submissions: PaymentsSubmissionService,
+  ) {
+    super();
+  }
+
+  /**
    * Handles one job. The return value is what BullMQ stores as the job's result.
    *
-   * An unknown job name **throws** rather than returning quietly, and the reason is the whole
-   * discipline of this queue: a job that is acknowledged without being attempted is worse than
-   * one that fails, because a failure is visible and an acknowledgement is not. A submission
-   * job that no handler recognised - renamed on one side, added before its handler exists, or
-   * pointed at the wrong queue - must not be reported as done.
+   * Three outcomes, and the last is the one that matters:
+   *
+   * - the probe answers with the process that handled it;
+   * - the submission branch hands the payment id to `PaymentsSubmissionService` and returns what it
+   *   decided, which is the value an operator reads back from Redis;
+   * - **anything else throws**. A job that is acknowledged without being attempted is worse than
+   *   one that fails, because a failure is visible and an acknowledgement is not. A submission job
+   *   that no handler recognised - renamed on one side, added before its handler exists, or pointed
+   *   at the wrong queue - must not be reported as done.
    */
-  async process(job: Job): Promise<PaymentsQueueProbeResult> {
+  async process(
+    job: Job,
+  ): Promise<
+    PaymentsQueueProbeResult | PaymentsQueueSubmissionResult
+  > {
     if (job.name === PAYMENTS_QUEUE_PROBE_JOB) {
       return { pong: true, workerPid: process.pid };
+    }
+
+    if (job.name === PAYMENTS_QUEUE_SUBMISSION_JOB) {
+      return this.submit(job);
     }
 
     throw new Error(
       `No handler for job "${job.name}" (id ${job.id ?? 'unknown'}) on the "${PAYMENTS_QUEUE}" queue`,
     );
+  }
+
+  /**
+   * The submission branch, guarded by a payload check.
+   *
+   * A submission job whose payload has no `transactionId` (a hand-written entry, a renamed field, a
+   * version skew between two deployments) **throws** rather than being reported as a submission
+   * that found nothing to do. The alternative - treating a missing id as "no payment" - is the one
+   * failure this whole step cannot afford: a job that claims to have looked and found nothing,
+   * while in fact it looked at the wrong thing.
+   *
+   * The translation from the service's outcome to this queue's result type is a field-for-field
+   * assignment, which is deliberate: the compiler fails the build if the two ever disagree about
+   * the answers a submission can have.
+   */
+  private async submit(job: Job): Promise<PaymentsQueueSubmissionResult> {
+    const transactionId = (job.data as Partial<PaymentsQueueSubmissionJobData> | undefined)
+      ?.transactionId;
+
+    if (typeof transactionId !== 'string' || transactionId === '') {
+      throw new Error(
+        `Submission job (id ${job.id ?? 'unknown'}) carries no transactionId, so there is no payment to submit`,
+      );
+    }
+
+    const outcome = await this.submissions.submit(transactionId);
+
+    return {
+      transactionId,
+      status: outcome.status,
+      stellarTxHash: outcome.stellarTxHash,
+      ledger: outcome.ledger,
+      detail: outcome.detail,
+    };
   }
 
   /**

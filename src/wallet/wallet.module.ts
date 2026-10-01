@@ -130,6 +130,26 @@ import { WalletController } from './wallet.controller.js';
     BalancesService,
   ],
   // `verifyOtp` is the only consumer, and it is in `IdentityModule`.
-  exports: [AccountProvisioningService, BalancesService],
+  exports: [
+    AccountProvisioningService,
+    BalancesService,
+    /**
+     * Step 27 is the first caller outside this module, and it is what moves these three from
+     * "private to the wallet" to "part of the wallet's API":
+     *
+     * - `SeedCustodyService` and `StellarService` are what a submission needs - a signed
+     *   transaction requires a key (custody) and a sequence number (the service), and there is no
+     *   way to build one from outside without both. Exporting them is the boundary being widened
+     *   deliberately rather than worked around: the alternative is a second path to a signature,
+     *   which is exactly what the one-door rule in `StellarService` exists to prevent.
+     * - `UsdcTrustlineService` is exported for its *asset*, not its trustline: `asset()` is where
+     *   "which USDC this deployment is paid in" is answered, and a payment operation that built its
+     *   own `Asset` from the config key would be a second answer that could drift from the one the
+     *   trustline was created for.
+     */
+    SeedCustodyService,
+    StellarService,
+    UsdcTrustlineService,
+  ],
 })
 export class WalletModule {}
