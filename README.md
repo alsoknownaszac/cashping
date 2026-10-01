@@ -1172,6 +1172,21 @@ blocks a step in `docs/build-sequence.md`.
   category from a probe that failed. Recorded so that it stays a decision instead of a surprise
   during the first incident.
 
+- **The Render blueprint has been checked against Render's schema, never against a workspace.**
+  `render.yaml` parses, and every key in it — `preDeployCommand`, `maxmemoryPolicy: noeviction`,
+  `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
+  (`https://render.com/schema/render.yaml.json`), which is a statement about the file and not
+  about a deployment: no sync has been run, so the plan slugs (`0.1c-256mb` for Postgres, and
+  `0.5c-512mb` and `256mb` for the API and the Key Value instance), the `frankfurt` region and
+  the behaviour a reader would test first — that a failing `prisma migrate deploy` aborts the
+  deploy and leaves the previous version serving — are Render's documented answers rather than
+  anything this repository has seen. What has been observed is the image: the Dockerfile's
+  runtime stage now carries `prisma/`, the migrations, `prisma7.config.ts` and `dotenv`, so
+  `npx --no-install prisma migrate deploy` has a schema and a datasource to read instead of
+  dying on an unresolved import. The environment the e2e suites run against is still
+  `docker-compose.yml`'s Postgres and Redis on their own ports, and no API request in this
+  repository has ever been served by the staging service.
+
 ## Deployment
 
 When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
