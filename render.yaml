@@ -165,12 +165,17 @@ services:
     # health check instead of through a step that gates traffic.
     #
     # `DATABASE_URL` is this service's internal one, so the migration reaches
-    # the database over the private network; `--no-install` keeps it on the
-    # Prisma version in the lockfile instead of whatever `npx` might fetch. The
-    # schema, the migrations and the Prisma 7 config are copied into the
-    # runtime image for exactly this line - see the Dockerfile. No `--config`
-    # flag is needed: `prisma7.config.*` is the *first* candidate in the
-    # installed CLI's own config-file list, ahead of `prisma.config.*`.
+    # the database over the private network. The CLI is addressed by its local
+    # path, `./node_modules/.bin/prisma`, rather than `npx --no-install prisma`:
+    # both resolve to the version pinned in the lockfile (`prisma` is a
+    # production dependency, so the binary is in the runtime image), but `npx`
+    # puts a whole npm process in front of the migration, and a free instance
+    # offers no shell - the container log is the only diagnosis there is, so
+    # nothing is put between the migration's output and it. The schema, the
+    # migrations and the Prisma 7 config are copied into the runtime image for
+    # exactly this line - see the Dockerfile. No `--config` flag is needed:
+    # `prisma7.config.*` is the *first* candidate in the installed CLI's own
+    # config-file list, ahead of `prisma.config.*`.
     #
     # Running this on every start, and not once per deploy, is the part that
     # had to be measured rather than assumed, because a free web service wakes
@@ -186,7 +191,7 @@ services:
     #
     # What it costs: the first request after a sleep now waits for the
     # migration check on top of the ~1-minute spin-up.
-    dockerCommand: npx --no-install prisma migrate deploy && node dist/main.js
+    dockerCommand: ./node_modules/.bin/prisma migrate deploy && node dist/main.js
     # `maxShutdownDelaySeconds: 30` was here and is gone for the same reason:
     # a free web service refuses it ("not supported for free tier
     # services"). The 30-second window still applies - it is Render's default -

@@ -137,11 +137,36 @@ async function verifyDependencies(app: INestApplication, config: AppConfig): Pro
   await verifyRedis(config.redis.url);
 }
 
+/**
+ * Writes a boot-stage marker to stderr, synchronously.
+ *
+ * Boot progress goes to stderr rather than through the Nest logger because the
+ * failure this exists for is a module that never finishes constructing, and the
+ * Nest logger writes to `process.stdout` - a pipe under Render, and therefore
+ * buffered - so the last line it managed to write may not have landed before the
+ * stage it names gave way to a hang. `writeSync(2, ...)` is synchronous, so the
+ * marker is in the pipe before this returns: the last marker that appears names
+ * the stage that completed, and the one that should have followed names the call
+ * that never returned. A free instance offers no shell, so a greppable line in
+ * the log is the whole of the diagnosis.
+ */
+function markBootStage(stage: string): void {
+  try {
+    writeSync(2, `[boot] ${stage}\n`);
+  } catch {
+    // stderr is gone (a closed pipe) - there is no log left to write to.
+  }
+}
+
 async function bootstrap(): Promise<void> {
+  markBootStage('bootstrap entered');
   loadEnvironmentFile();
   const config = configuration();
 
+  markBootStage(`config validated (NODE_ENV=${config.nodeEnv})`);
+
   initializeSentry(config);
+  markBootStage('Sentry initialised');
 
   // `abortOnError: false` is what makes a boot failure *readable*. Left at its
   // default, Nest logs an initialization error and then, from inside
@@ -154,6 +179,7 @@ async function bootstrap(): Promise<void> {
   // dependency, a KMS key that is not in the configured region - now reports
   // itself, rather than leaving an empty log and a port scan timing out.
   const app = await NestFactory.create(AppModule, { abortOnError: false });
+  markBootStage('Nest application created (module graph constructed)');
   // Lets onModuleDestroy close the Prisma pool on SIGTERM/SIGINT, instead of the
   // process being cut off with connections still open.
   app.enableShutdownHooks();
@@ -175,10 +201,23 @@ async function bootstrap(): Promise<void> {
   // as everything else.
   configureCors(app, config.cors.allowedOrigins);
   const docsMounted = setupSwagger(app, config.swagger.enabled);
+  markBootStage('HTTP layer configured (global prefix, pipes, CORS, Swagger)');
 
   await verifyDependencies(app, config);
+  markBootStage('dependencies verified (Postgres, Redis)');
+
+  // `init()` runs here rather than being left to `listen()`, because the two do
+  // different things and only one of them can hang. `init()` constructs nothing
+  // further - the module graph exists by now - but it invokes every module's
+  // `onModuleInit` (the KMS boot probe is one) and registers routes; `listen()`
+  // then binds the port. A marker either side of this call names which of those
+  // a stalled boot stalled in, which is the difference between a dependency that
+  // never answered and a socket that never opened.
+  await app.init();
+  markBootStage('modules initialised (every onModuleInit resolved)');
 
   await app.listen(config.port);
+  markBootStage(`listening on port ${config.port}`);
   logger.log(`API listening on http://localhost:${config.port} (routes under /${GLOBAL_PREFIX})`);
 
   if (docsMounted) {
