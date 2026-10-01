@@ -690,6 +690,98 @@ sender's seed - opened through the real KMS for the sweep - absent from all 46 c
 both rows and the job result. The only substitution is the USDC issuer: Circle's Testnet USDC has no
 programmatic faucet, so the run creates and funds its own issuer and mints from it.
 
+## Confirmation and the status rule (Steps 28–29)
+
+Submitting a payment gets it *accepted* by Horizon; it does not put it in a ledger. Steps 28–29 are the
+half that turns acceptance into an answer — and the rule that keeps the answer in one place.
+
+### The sweep
+
+A repeatable BullMQ job (`confirm-payments`, one schedule registered under the id `confirmation-sweep`)
+polls Horizon for every `PROCESSING` row that has a hash and resolves it. It is a *sweep* rather than a
+timer per payment because the work list is then the `transactions` table: a flushed Redis, a redeploy or a
+retention policy costs a delay rather than a payment nothing will ever look at again.
+
+**It is off by default.** `PAYMENTS_CONFIRMATION_INTERVAL_MS=0` registers no schedule at all — not a
+zero-delay one, which would be a spin loop of Horizon calls — and says so at boot:
+
+```
+The confirmation sweep is off (payments.confirmationIntervalMs=0), so payments stay PROCESSING until a
+sweep is run - see the README
+```
+
+To poll, set the interval in milliseconds (`30000` is a sensible start) and restart the API. To run a
+single tick on demand — during an incident, or to see what a deployment is holding — add the job through
+the same path the schedule uses (`PaymentsQueueService.enqueueConfirmation()`, which is also what a
+script or a REPL would call).
+
+### What a tick decides
+
+| what Horizon says | the row's deadline | the row becomes |
+| --- | --- | --- |
+| it is in a ledger, successful | — | `SUCCESSFUL` |
+| it is in a ledger, not successful | — | `FAILED`, reason `landed-unsuccessful:<tx code>` |
+| it has never seen the hash | still ahead, or within 60s past | unchanged — `PROCESSING` |
+| it has never seen the hash | past by more than 60s | `FAILED`, reason `not-found-after-deadline` |
+| it did not answer | — | unchanged, counted as `unresolved` |
+| it has never seen the hash | no deadline recorded | unchanged, counted as `unresolved` |
+
+The 60-second grace window past the deadline reads Horizon's own ingest lag: the ledger has closed the
+transaction and Horizon has not served it yet. Waiting costs a minute; deciding early claims a payment
+failed that then appears in a ledger with the money moved.
+
+The tick's result is its counters and nothing else — `{ polled, confirmed, failed, waiting, unresolved,
+stuckWithoutHash }` — which is how "quiet" and "broken" are told apart: `polled > 0` with everything
+`waiting` is an ordinary minute on a slow network, `unresolved` alongside `polled` is Horizon not
+answering, and `stuckWithoutHash` is the one case this step cannot fix (see *Known gaps*).
+
+The sender is told **after** the row is written, and from the row rather than from the request, so the
+message cannot disagree with the database. A provider failure is logged with the payment id and does not
+undo the resolution — the money fact is the row.
+
+### The status rule
+
+`src/payments/services/transaction-status.ts` is the only file in the repository that writes a payment's
+`status`, and `npm run lint:status` is what keeps that true:
+
+```bash
+npm run lint:status
+# Status discipline: 158 files scanned, 3 status writes in the sanctioned writer, 0 violations
+```
+
+A `data: { status: ... }` on a `transaction.create` / `createMany` / `update` / `updateMany` / `upsert`
+anywhere else — or raw SQL that does `SET status = ...` — fails that command, and therefore `npm run lint`,
+and therefore CI, with the `file:line` and the writer to call instead. A payment's *initial* status is not
+a write: it is the column's own `@default(PENDING)` in `schema.prisma`, which leaves one statement of what
+a payment starts as and one writer of what it becomes.
+
+### Running the proofs
+
+```bash
+npm test                       # the decisions: 753 unit tests, 46 files
+npm run lint                   # oxlint, then lint:money, then lint:status
+RUN_STELLAR_IT=1 npm run test:e2e test/submission.e2e-spec.ts   # the real-network half
+```
+
+The decision itself is what the unit tests pin, and they pin it on the boundaries rather than in the
+middle: `confirmation-triage.spec.ts` walks every row of the table above, including `now == deadline + 60s`
+(waiting) and one millisecond later (failed); `payments-confirmation.service.spec.ts` asserts the
+work-list query whole, that each resolution is exactly one compare-and-set, that `waiting` and
+`unresolved` write nothing and notify nobody, that a resolution won by another caller sends no second
+message, and that a provider outage cannot un-resolve a payment; `horizon-transaction-lookup.spec.ts`
+pins Horizon's 404 as a normal `not-found` and a 5xx as `unavailable`. The gated run is the Day 4 audit
+item: it submits a real transaction to Testnet, shows that same row leaving `PROCESSING` for
+`SUCCESSFUL`, and shows a payment the network refuses outright — `op_underfunded`, answered with an HTTP
+400 — landing on `FAILED` with a readable reason instead of waiting on a poll that has nothing left to find
+out. That refusal is worth reading the way the run reads it, because the run is where the difference
+showed up: Horizon's 400 is its answer to the *submission*, while the ledger still closes the envelope as
+unsuccessful and charges its fee, so the hash on a refused `FAILED` row resolves on an explorer — and the
+reason's prefix, `landed-unsuccessful:op_underfunded`, is the same one the poll writes when it reads that
+code back off a record, because both describe the ledger rather than the caller. `docs/build-sequence.md`
+records the run
+that was made and what it showed: the hashes, the ledgers, and the balances read back from Horizon by
+something other than this codebase.
+
 ## Documentation conventions
 
 Rules these docs and this repository's commit messages follow. They exist because a document that is
@@ -703,7 +795,9 @@ right when it is written and quietly wrong later is worse than one that never cl
   place: the Step 23 audit line in `docs/build-sequence.md` carries both `121 files, 0 violations as
   of Step 23` and `131 files, 0 violations as of Step 25`, because the older number is evidence about
   a smaller tree, not a mistake to be corrected. Re-measured again at Step 27: **148 files scanned, 0
-  violations as of Step 27**.
+  violations as of Step 27**, where the status rule prints a finer line of its own - `158 files scanned, 3
+  status writes in the sanctioned writer, 0 violations` - because for that rule "nothing was found" and "nothing was read"
+  have to be different sentences.
 - **A heading that names a step does not label the counts inside it.** `## Money precision and the
   money rule (Step 23)` says when the *feature* landed; it says nothing about when the *number* under
   it was measured. The number needs its own label.
@@ -719,6 +813,15 @@ right when it is written and quietly wrong later is worse than one that never cl
 
 Recorded rather than fixed, so that they stay decisions instead of surprises. None of them
 blocks a step in `docs/build-sequence.md`.
+
+- **A `PROCESSING` row with no recorded hash is reported, never resolved.** It is the one case Steps 27–28
+  leave open: a claim (`PENDING → PROCESSING`) whose process died before `recordEnvelope` wrote the hash,
+  the sequence and the deadline. There is no hash to poll, and the three ways out — re-submit, fail it, or
+  release the claim back to `PENDING` — are all submission decisions that interact with the sequence fence
+  and with custody, so a poller taking any of them would be a second path to a signature. The sweep counts
+  such rows (`stuckWithoutHash`, `updatedAt` older than five minutes) and logs a warning naming them, and
+  that is the whole of its handling: deciding what to do with one needs an operator or a later re-drive
+  step. `docs/step-28-29-proposal.md` §5 is where the case is argued.
 
 - **The money rule matches names, so it can only see money that is named like money.** A value of
   an amount called `total` or `x` typed `number` is invisible to it, and so is a `Float` column

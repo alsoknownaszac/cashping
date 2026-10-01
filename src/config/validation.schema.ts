@@ -45,7 +45,11 @@ export enum StellarNetwork {
  * able to say anything useful: left as a string it would fail as "must be an integer
  * number" for *every* value, including correct ones.
  */
-const NUMERIC_KEYS = ['PORT', 'STELLAR_PROVISIONING_TIMEOUT_MS'] as const;
+const NUMERIC_KEYS = [
+  'PORT',
+  'STELLAR_PROVISIONING_TIMEOUT_MS',
+  'PAYMENTS_CONFIRMATION_INTERVAL_MS',
+] as const;
 
 /**
  * Environment variables that hold a boolean but arrive as strings via
@@ -425,6 +429,25 @@ export class EnvironmentVariables {
   @Min(1)
   @Max(600_000)
   STELLAR_PROVISIONING_TIMEOUT_MS?: number;
+
+  /**
+   * [optional] How often the confirmation sweep runs (Step 28), in milliseconds.
+   *
+   * Zero is a legal value and it means "no schedule": the sweep's code is still there
+   * (`PaymentsQueueService.enqueueConfirmation()`), and a deployment that has not switched the
+   * timer on simply has to run a tick by hand. That is deliberate - a background process that
+   * writes payment verdicts is opted into, not inherited - so `@Min(0)` rather than the
+   * provisioning timeout's `@Min(1)`, where zero would read as a working timeout and behave like
+   * a disabled one.
+   *
+   * The upper bound is an hour: anything slower is not a poll of payments in flight, and a
+   * deployment that wants one should schedule it outside this API.
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(3_600_000)
+  PAYMENTS_CONFIRMATION_INTERVAL_MS?: number;
 }
 
 /**

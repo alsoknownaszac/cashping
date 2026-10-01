@@ -202,6 +202,10 @@ describe('the row it writes', () => {
     const harnessed = harness();
     await create(harnessed, { amount: '10.0000000' });
 
+    // The status is deliberately absent from the write (Step 29): a payment is created `PENDING` by
+    // the column's own `@default(PENDING)`, which is the one place that fact is declared now that
+    // status *writes* belong to `transaction-status.ts`. The `select` still reads it back, because
+    // the response carries it.
     expect(harnessed.tx.transaction.create).toHaveBeenCalledWith({
       data: {
         senderId: SENDER.id,
@@ -210,7 +214,6 @@ describe('the row it writes', () => {
         // trailing-zero spelling never reaches the column.
         amount: '10',
         idempotencyKey: KEY,
-        status: TransactionStatus.PENDING,
       },
       select: { id: true, status: true, amount: true, createdAt: true },
     });

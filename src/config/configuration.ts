@@ -266,6 +266,26 @@ export function resolveFriendbotUrl(override: string | undefined): string {
 export const DEFAULT_PROVISIONING_TIMEOUT_MS = 30_000;
 
 /**
+ * How often the confirmation sweep runs (Step 28), in milliseconds. `0` means no schedule at all.
+ *
+ * Off by default, and that is a decision rather than an omission: the sweep is a background
+ * process that writes *payment verdicts*, so a deployment switches it on deliberately
+ * (`PAYMENTS_CONFIRMATION_INTERVAL_MS=5000`) instead of inheriting a timer nobody chose. It also
+ * means a test run - which boots the real application, with the real worker, against the real
+ * database - does not sweep the in-flight payments another test is asserting about.
+ *
+ * `0` disables the schedule without disabling the code: `PaymentsQueueService.enqueueConfirmation()`
+ * runs one tick on demand, which is what an operator does when the sweep is off and a payment needs
+ * an answer.
+ *
+ * Five seconds is the interesting value in production, and it is chosen against the network rather
+ * than against a CPU budget: a Testnet ledger closes every ~5 seconds and Horizon ingests shortly
+ * after, so polling faster than a ledger close mostly re-asks a question whose answer cannot have
+ * changed. It is also the interval the README's Step 28 audit run used.
+ */
+export const DEFAULT_CONFIRMATION_INTERVAL_MS = 0;
+
+/**
  * Resolves the fallback Horizon host.
  *
  * Unset (or blank, which is what `STELLAR_HORIZON_FALLBACK_URL=` in an `.env`
@@ -465,6 +485,17 @@ export default function configuration() {
       /** Wall-clock ceiling on one account's provisioning. See `DEFAULT_PROVISIONING_TIMEOUT_MS`. */
       provisioningTimeoutMs: Number(
         process.env.STELLAR_PROVISIONING_TIMEOUT_MS ?? DEFAULT_PROVISIONING_TIMEOUT_MS,
+      ),
+    },
+
+    /** The payments queue's own settings (Step 28). */
+    payments: {
+      /**
+       * How often the confirmation sweep runs. See `DEFAULT_CONFIRMATION_INTERVAL_MS` for why the
+       * default is off and why five seconds is the value to use in production.
+       */
+      confirmationIntervalMs: Number(
+        process.env.PAYMENTS_CONFIRMATION_INTERVAL_MS ?? DEFAULT_CONFIRMATION_INTERVAL_MS,
       ),
     },
   };

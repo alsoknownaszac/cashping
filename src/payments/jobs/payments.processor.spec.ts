@@ -1,12 +1,18 @@
 import { Logger } from '@nestjs/common';
 import { type Job } from 'bullmq';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  type ConfirmationSweepResult,
+  type PaymentsConfirmationService,
+} from '../services/payments-confirmation.service.js';
 import { type PaymentsSubmissionService } from '../services/payments-submission.service.js';
 import { type SubmissionOutcome } from '../services/payments-submission.service.js';
 import {
   PAYMENTS_QUEUE,
+  PAYMENTS_QUEUE_CONFIRMATION_JOB,
   PAYMENTS_QUEUE_PROBE_JOB,
   PAYMENTS_QUEUE_SUBMISSION_JOB,
+  type PaymentsQueueConfirmationResult,
 } from './payments-queue.js';
 import { PaymentsProcessor } from './payments.processor.js';
 
@@ -22,6 +28,10 @@ import { PaymentsProcessor } from './payments.processor.js';
  * id throws rather than reporting "nothing to do", and a failure or a worker-level error reaches
  * the log rather than passing silently.
  *
+ * Step 28 adds the confirmation branch to that list, and it is the shortest branch in the file: one
+ * sweep, no payload, and the service's counters handed back as the job's result. What is worth
+ * asserting is that the tick runs exactly once per job (the interval is the repetition, not the
+ * handler) and that a sweep which cannot read its rows *fails* rather than reporting a quiet minute.
  */
 
 /** The job fields the processor reads, and nothing else - a whole `Job` would be a fixture. */
@@ -51,20 +61,62 @@ function fakeSubmissions(outcome: SubmissionOutcome | Error = accepted()) {
   return { asked, submit };
 }
 
+/** One tick's counters, all zero: the shape is what the branch tests are about, not the numbers. */
+function sweepResult(overrides: Partial<ConfirmationSweepResult> = {}): ConfirmationSweepResult {
+  return {
+    polled: 0,
+    confirmed: 0,
+    failed: 0,
+    waiting: 0,
+    unresolved: 0,
+    stuckWithoutHash: 0,
+    ...overrides,
+  };
+}
+
+/** A sweep that records how often it was asked and answers with `result`. */
+function fakeSweeps(result: ConfirmationSweepResult = sweepResult()) {
+  const sweeps: Date[] = [];
+
+  const sweep = async (now: Date = new Date()): Promise<ConfirmationSweepResult> => {
+    sweeps.push(now);
+
+    return result;
+  };
+
+  return { sweeps, sweep };
+}
+
 /**
- * One processor over one fake - the submission service - because that is the collaborator it has,
- * and it is injected rather than constructed: the decision is not the worker's.
+ * One processor over two fakes - a submission service and a confirmation service - because those are
+ * the two collaborators it has as of Step 28, and both are injected rather than constructed for the
+ * same reason: neither decision is the worker's.
  */
-function processor(submissions = fakeSubmissions()): {
+function processor(submissions = fakeSubmissions(), confirmations = fakeSweeps()): {
   processor: PaymentsProcessor;
   asked: string[];
+  sweeps: Date[];
 } {
   return {
     processor: new PaymentsProcessor(
       { submit: submissions.submit } as unknown as PaymentsSubmissionService,
+      { sweep: confirmations.sweep } as unknown as PaymentsConfirmationService,
     ),
     asked: submissions.asked,
+    sweeps: confirmations.sweeps,
   };
+}
+
+/** One processor whose sweep throws, for the branch a *query* failure takes. */
+function processorWithFailingSweep(failure: Error): PaymentsProcessor {
+  return new PaymentsProcessor(
+    { submit: fakeSubmissions().submit } as unknown as PaymentsSubmissionService,
+    {
+      sweep: async (): Promise<ConfirmationSweepResult> => {
+        throw failure;
+      },
+    } as unknown as PaymentsConfirmationService,
+  );
 }
 
 /** One captured `logger.error` call: the message, and the stack passed beside it. */
@@ -137,6 +189,38 @@ describe('PaymentsProcessor.process', () => {
 
     await expect(
       worker.process(job(PAYMENTS_QUEUE_SUBMISSION_JOB, { data: { transactionId: 'tx-1' } })),
+    ).rejects.toBe(failure);
+  });
+
+  it('runs exactly one sweep for a confirmation job and stores its counters as the result', async () => {
+    const counters = sweepResult({ polled: 3, confirmed: 1, failed: 1, waiting: 1 });
+    const { processor: worker, sweeps, asked } = processor(
+      fakeSubmissions(),
+      fakeSweeps(counters),
+    );
+
+    const result = await worker.process(job(PAYMENTS_QUEUE_CONFIRMATION_JOB, { id: '77' }));
+
+    // One tick, no payload needed - the work list is the `PROCESSING` rows, read inside the sweep -
+    // and no submission: a poller that could submit would be a second path to a signature.
+    expect(sweeps).toHaveLength(1);
+    expect(asked).toEqual([]);
+
+    // The counters the job stores are the service's own, field for field. This assignment is also
+    // the compile-time check that the queue's result type still agrees with the service's.
+    const agreed: PaymentsQueueConfirmationResult = counters;
+    expect(result).toEqual(agreed);
+  });
+
+  it('lets a sweep that cannot read its rows fail the job, so BullMQ owns that retry', async () => {
+    const failure = new Error('Prisma: connection refused');
+
+    // A *query* failure is different from a row Horizon cannot answer yet: the service counts and
+    // swallows the per-row case (the tick still has other rows to work through), while a tick that
+    // cannot read anything throws - and that has to reach BullMQ as a failed job rather than be
+    // reported as a tick that found nothing to do.
+    await expect(
+      processorWithFailingSweep(failure).process(job(PAYMENTS_QUEUE_CONFIRMATION_JOB, { id: '78' })),
     ).rejects.toBe(failure);
   });
 

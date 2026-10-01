@@ -15,6 +15,11 @@ import {
   type StellarTransactionSubmitter,
   type SubmittedTransaction,
 } from './transaction-submitter.js';
+import {
+  STELLAR_TRANSACTION_LOOKUP,
+  type StellarTransactionLookup,
+  type TransactionLookupResult,
+} from './transaction-lookup.js';
 
 /** A transaction request: which account pays, and what it should do. */
 export interface BuildTransactionRequest extends TransactionOptions {
@@ -41,10 +46,11 @@ export interface BuildTransactionRequest extends TransactionOptions {
  * 3. **Nothing here holds a secret.** `generateKeypair` returns a keypair to its
  *    caller and keeps no reference to it; custody (KMS-encrypted seeds) is Step
  *    18's problem, and no key material reaches this class's fields or any log.
- * 4. **There is one way to reach Horizon.** Loading a sequence number and submitting
- *    a signed transaction are both ports this class owns, so no other file imports a
- *    Horizon client, and a submission failure is classified the same way wherever it
- *    happens.
+ * 4. **There is one way to reach Horizon.** Loading a sequence number, submitting a
+ *    signed transaction and looking up what became of one are all ports this class
+ *    owns, so no other file imports a Horizon client, and a submission failure is
+ *    classified the same way wherever it happens. (Step 28 added the third port: the
+ *    confirmation poll asks "did it settle" in this class's vocabulary too.)
  *
  * ## The two ways in, and why both exist
  *
@@ -82,6 +88,8 @@ export class StellarService {
     @Inject(STELLAR_ACCOUNT_SOURCE) private readonly accounts: StellarAccountSource,
     @Inject(STELLAR_TRANSACTION_SUBMITTER)
     private readonly submitter: StellarTransactionSubmitter,
+    @Inject(STELLAR_TRANSACTION_LOOKUP)
+    private readonly transactions: StellarTransactionLookup,
   ) {
     // Read and validated once, at construction: boot fails on a bad
     // `STELLAR_NETWORK`, not the first payment of the day.
@@ -192,5 +200,23 @@ export class StellarService {
    */
   submitTransaction(transaction: Transaction): Promise<SubmittedTransaction> {
     return this.submitter.submit(transaction);
+  }
+
+  /**
+   * What the network has to say about a transaction hash (Step 28): in a ledger or not, and if
+   * it landed, whether the ledger accepted it.
+   *
+   * The read half of `submitTransaction`, and here rather than in the caller for the same reason:
+   * this class owns the only Horizon clients in the app, and "did it settle" is a question about
+   * Stellar that every caller should have to ask in the same vocabulary. It takes no lock and no
+   * passphrase - looking a transaction up consumes no sequence number and signs nothing - so it
+   * is safe to call while another build is in flight for the same account.
+   *
+   * Resolves for all three answers (see `TransactionLookupResult`), and never throws for a
+   * Horizon that did not answer: a poller reads this repeatedly, and "Horizon is down" must be a
+   * value it can count rather than an exception it has to catch.
+   */
+  lookupTransaction(hash: string): Promise<TransactionLookupResult> {
+    return this.transactions.lookup(hash);
   }
 }

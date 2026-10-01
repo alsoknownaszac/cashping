@@ -1,0 +1,47 @@
+created key: arn:aws:kms:eu-west-1:123456789012:key/8a4d00e9-0139-44f3-8db1-26e0ec6a27dc
+The plugin "vite-tsconfig-paths" is detected. Vite now supports tsconfig paths resolution natively via the resolve.tsconfigPaths option. You can remove the plugin and set resolve.tsconfigPaths: true in your Vite config instead.
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90m/Users/tom/Desktop/Builders HQ/cashping/cashping-backend[39m
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe enqueue bound (Step 27)
+[22m[39m[step 27] bound test: sender GBWYGV3A7NNQR7HW6RVKJUD4Z7X4MHAL4TP5QFDI53TQNIKYNGHKAIEL
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe enqueue bound (Step 27)[2m > [22m[2mfails the payment inside the bound when Redis stops answering, and the producer recovers
+[22m[39m[step 27] wedged Redis: payment failed after 3602ms (bound 3000ms), no row written, orphan job rejected loudly, producer recovered
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe submission job, against Testnet (Step 27)
+[22m[39m[step 27] testnet run: issuer=GA2YZZBELTT4SLSZN3CY2NTRTJHRD5HAPST646HIQXL7SU7NBWJ6RGBL sender=GBAOHC3BP3VJ56KGEE264IZQ7UGEOKSIBEEHLKMTOVJJPNEOFDPJ43X4
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe submission job, against Testnet (Step 27)[2m > [22m[2msubmits a real transaction, records it, and the network agrees it landed
+[22m[39m[step 27] submitted payment=c049ecbd-8c8f-47ee-a2c2-bd2d7886ae12 hash=4273807222da539ed9d53d7d1af6ba5cdeffc62bbf2d4f5ad52e4fca76974a8e ledger=4951050 sequence=21264576356024321 sender_usdc=98.7500000 recipient_usdc=1.2500000
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe submission job, against Testnet (Step 27)[2m > [22m[2mproduces no second transaction when the job is deliberately run again
+[22m[39m[step 27] re-ran the job: outcome=deferred (recorded-transaction-still-valid) hash=4273807222da539ed9d53d7d1af6ba5cdeffc62bbf2d4f5ad52e4fca76974a8e sequence=21264576356024322 (unchanged)
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe submission job, against Testnet (Step 27)[2m > [22m[2mnever lets the account's secret seed reach a log line, a row or a payload
+[22m[39m[step 27] key-material sweep: 47 log lines, 1 wallet row, 1 payment row and 1 result searched - seed absent
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe submission job, against Testnet (Step 27)[2m > [22m[2mStep 28: the sweep resolves the submitted payment to SUCCESSFUL against the real ledger
+[22m[39m[step 28] sweep: payment=c049ecbd-8c8f-47ee-a2c2-bd2d7886ae12 hash=4273807222da539ed9d53d7d1af6ba5cdeffc62bbf2d4f5ad52e4fca76974a8e PROCESSING -> SUCCESSFUL (polled=1 confirmed=1)
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe submission job, against Testnet (Step 27)[2m > [22m[2mStep 28: a transaction that lands but fails on-ledger resolves to FAILED with a readable reason
+[22m[39m[step 28] FAILED case: payment=f7bdbbb9-e03b-4ba4-a0ac-b327b12adf64 hash=c51dac0f015e04a12e9c5c635c12e2a4e580a12283b5795387086867feabfadc PROCESSING -> FAILED (landed-unsuccessful:tx_failed)
+
+[90mstdout[2m | test/submission.e2e-spec.ts[2m > [22m[2mthe submission job, against Testnet (Step 27)[2m > [22m[2mStep 28: a deliberately-invalid payment is refused at submission, and the row still records a landed failure
+[22m[39m[step 28] deliberately-invalid case: payment=a17a84d4-8e7d-4fd8-9df6-b5767d2d0c88 PENDING -> FAILED (landed-unsuccessful:op_underfunded) hash=b49bf0f798dd66818df2b31a4cb7b3da496f364ce576ab7125f4ea3f498f5664 closed unsuccessful in ledger 4951053, sender USDC unchanged at 98.7500000, second attempt skipped
+
+ [32m✓[39m test/submission.e2e-spec.ts [2m([22m[2m7 tests[22m[2m)[22m[33m 59901[2mms[22m[39m
+     [33m[2m✓[22m[39m fails the payment inside the bound when Redis stops answering, and the producer recovers [33m 6134[2mms[22m[39m
+     [33m[2m✓[22m[39m submits a real transaction, records it, and the network agrees it landed [33m 5459[2mms[22m[39m
+     [33m[2m✓[22m[39m produces no second transaction when the job is deliberately run again [33m 1086[2mms[22m[39m
+     [33m[2m✓[22m[39m never lets the account's secret seed reach a log line, a row or a payload [33m 462[2mms[22m[39m
+     [33m[2m✓[22m[39m Step 28: the sweep resolves the submitted payment to SUCCESSFUL against the real ledger [33m 974[2mms[22m[39m
+     [33m[2m✓[22m[39m Step 28: a transaction that lands but fails on-ledger resolves to FAILED with a readable reason [33m 5024[2mms[22m[39m
+     [33m[2m✓[22m[39m Step 28: a deliberately-invalid payment is refused at submission, and the row still records a landed failure [33m 7750[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m7 passed[39m[22m[90m (7)[39m
+[2m   Start at [22m 15:33:01
+[2m   Duration [22m 72.39s[2m (transform 2.30s, setup 0ms, import 11.17s, tests 59.90s, environment 1ms)[22m
+
+VITEST_EXIT=0

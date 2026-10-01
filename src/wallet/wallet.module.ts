@@ -15,8 +15,10 @@ import {
   createHorizonServer,
 } from './stellar/horizon-account-source.js';
 import { HorizonTransactionSubmitter } from './stellar/horizon-transaction-submitter.js';
+import { HorizonTransactionLookup } from './stellar/horizon-transaction-lookup.js';
 import { StellarService } from './stellar/stellar.service.js';
 import { STELLAR_TRANSACTION_SUBMITTER } from './stellar/transaction-submitter.js';
+import { STELLAR_TRANSACTION_LOOKUP } from './stellar/transaction-lookup.js';
 import { WalletController } from './wallet.controller.js';
 
 /**
@@ -121,6 +123,13 @@ import { WalletController } from './wallet.controller.js';
     { provide: STELLAR_ACCOUNT_SOURCE, useClass: HorizonAccountSource },
     { provide: HORIZON_SERVER_FACTORY, useValue: createHorizonServer },
     { provide: STELLAR_TRANSACTION_SUBMITTER, useClass: HorizonTransactionSubmitter },
+    /**
+     * Step 28's third Horizon port. A token for the same reason as the submitter's: the fake the
+     * confirmation service's unit spec and `test/submission.e2e-spec.ts` hang off it is what lets
+     * the poller's three answers be exercised without the network, while `StellarService` stays
+     * the only thing in the app that knows a `Horizon.Server` exists.
+     */
+    { provide: STELLAR_TRANSACTION_LOOKUP, useClass: HorizonTransactionLookup },
     SeedCustodyService,
     { provide: KEY_WRAPPER, useClass: KmsKeyWrapper },
     { provide: KMS_CLIENT_FACTORY, useValue: createKmsClient },

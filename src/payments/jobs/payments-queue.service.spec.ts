@@ -1,13 +1,21 @@
+import { Logger } from '@nestjs/common';
+import { type ConfigService } from '@nestjs/config';
 import { type Job, type JobsOptions } from 'bullmq';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
+  PAYMENTS_QUEUE_CONFIRMATION_JOB,
   PAYMENTS_QUEUE_PROBE_JOB,
   PAYMENTS_QUEUE_SUBMISSION_JOB,
   type PaymentsQueueHandle,
   type PaymentsQueueProbeJobData,
   type PaymentsQueueProbeResult,
 } from './payments-queue.js';
-import { PaymentsQueueService, submissionJobOptions } from './payments-queue.service.js';
+import {
+  CONFIRMATION_SCHEDULER_ID,
+  PaymentsQueueService,
+  confirmationJobOptions,
+  submissionJobOptions,
+} from './payments-queue.service.js';
 
 /**
  * The enqueue path with BullMQ substituted: what is added, with which options, and what a refused
@@ -20,15 +28,28 @@ import { PaymentsQueueService, submissionJobOptions } from './payments-queue.ser
  * so what is asserted here is that the policy that shipped is the policy that was approved - a
  * sixth option appearing has to be argued with rather than absorbed.
  *
- * The live proof that the path really reaches a worker is `test/queue.e2e-spec.ts` (the probe)
+ * The live proof that either path really reaches a worker is `test/queue.e2e-spec.ts` (the probe)
  * and `test/submission.e2e-spec.ts` (the enqueue's bound, against a wedged Redis).
  *
+ * Step 28 adds the queue's first *schedule* to the same treatment (`ensureConfirmationScheduler` and
+ * the boot hook that calls it), with the scheduler API faked the way `add` is. The policy worth
+ * pinning there is a pair of negatives: a deployment whose interval is `0` registers nothing and
+ * says so, and a deployment that does poll upserts the *same* id on every replica and restart - a
+ * scheduler that quietly ran anyway, or that accumulated one entry per instance, would look exactly
+ * like a working one from outside.
  */
 
 interface AddCall {
   name: string;
   data: unknown;
   options: JobsOptions | undefined;
+}
+
+/** One captured `upsertJobScheduler` call: the id it upserts, the cadence, and the job it adds. */
+interface ScheduleCall {
+  id: string;
+  repeat: { every?: number };
+  template: { name: string; data: unknown; opts: JobsOptions | undefined } | undefined;
 }
 
 type PaymentsQueue = PaymentsQueueHandle['queue'];
@@ -39,6 +60,7 @@ type PaymentsQueue = PaymentsQueueHandle['queue'];
  */
 function fakeQueue(behaviour: { failWith?: Error } = {}) {
   const calls: AddCall[] = [];
+  const schedules: ScheduleCall[] = [];
   const job = { id: '41' } as unknown as Job<PaymentsQueueProbeJobData, PaymentsQueueProbeResult>;
 
   const queue = {
@@ -51,21 +73,48 @@ function fakeQueue(behaviour: { failWith?: Error } = {}) {
 
       return job;
     },
+    /**
+     * The scheduler API, captured the way `add` is. Nothing is asserted about BullMQ here - what a
+     * schedule *is* is the server's business - so the fake records the three arguments and hands
+     * back a job, which is all `ensureConfirmationScheduler` reads (`next.id` for its log line).
+     */
+    upsertJobScheduler: async (
+      id: string,
+      repeat: { every?: number },
+      template?: { name: string; data: unknown; opts: JobsOptions | undefined },
+    ) => {
+      schedules.push({ id, repeat, template });
+
+      return job;
+    },
   } as unknown as PaymentsQueue;
 
-  return { queue, calls, job };
+  return { queue, calls, schedules, job };
 }
 
 /**
- * One service over a fake queue: the two enqueue methods are what this file pins, and the fake is
- * the only collaborator the service has.
+ * One service over a fake queue and a stubbed reader of the one config key it asks for.
+ *
+ * The config is a stub for the same reason the queue is: what this file pins is which of the
+ * service's decisions are *its* (register or not, with which cadence) and which are the
+ * deployment's (the number in `.env`). A key the service does not ask for throws, so a new config
+ * read cannot arrive unnoticed.
  */
-function serviceOver(behaviour: { failWith?: Error } = {}) {
+function serviceOver(behaviour: { failWith?: Error; confirmationIntervalMs?: number } = {}) {
   const fake = fakeQueue(behaviour);
+  const config = {
+    getOrThrow: (key: string) => {
+      if (key !== 'payments.confirmationIntervalMs') {
+        throw new Error(`unexpected config key ${key}`);
+      }
+
+      return behaviour.confirmationIntervalMs ?? 0;
+    },
+  } as unknown as ConfigService;
 
   return {
     ...fake,
-    service: new PaymentsQueueService({ queue: fake.queue }),
+    service: new PaymentsQueueService({ queue: fake.queue }, config),
   };
 }
 
@@ -150,3 +199,74 @@ describe('PaymentsQueueService.enqueueSubmission', () => {
   });
 });
 
+describe('PaymentsQueueService.ensureConfirmationScheduler', () => {
+  it('registers nothing when the interval is zero, which is what "off" means here', async () => {
+    const { service, schedules } = serviceOver({ confirmationIntervalMs: 0 });
+
+    // The default deployment does not poll: the sweep writes payment verdicts on a timer, so opting
+    // in is a deployment's decision, and `0` has to mean "no scheduler at all" rather than a
+    // zero-delay one (which would be a spin loop spending money on Horizon calls).
+    await expect(service.ensureConfirmationScheduler(0)).resolves.toBe(false);
+    expect(schedules).toEqual([]);
+  });
+
+  it('upserts one schedule under a stable id, for the job the worker already handles', async () => {
+    const { service, schedules } = serviceOver({ confirmationIntervalMs: 30_000 });
+
+    await expect(service.ensureConfirmationScheduler(30_000)).resolves.toBe(true);
+
+    // The stable id is the whole reason for `upsertJobScheduler` over `add({ repeat })`: every
+    // replica and every restart writes the *same* Redis key, so a second instance adds no second
+    // schedule and a changed interval replaces the old one instead of running beside it. An
+    // id per instance - or per boot - would multiply the ticks by the size of the deployment.
+    expect(schedules).toEqual([
+      {
+        id: CONFIRMATION_SCHEDULER_ID,
+        repeat: { every: 30_000 },
+        template: {
+          name: PAYMENTS_QUEUE_CONFIRMATION_JOB,
+          data: {},
+          opts: confirmationJobOptions(),
+        },
+      },
+    ]);
+  });
+
+  it('gives a tick no retry policy of its own - the interval is the retry policy', () => {
+    // An exact comparison, so an `attempts` or a `backoff` appearing here has to be argued with: a
+    // failing Horizon asked twice per interval, by every replica, is how one outage becomes a storm.
+    expect(confirmationJobOptions()).toEqual({ removeOnComplete: true, removeOnFail: true });
+  });
+});
+
+describe('PaymentsQueueService.onApplicationBootstrap', () => {
+  it('schedules the sweep from the configured interval', async () => {
+    const { service, schedules } = serviceOver({ confirmationIntervalMs: 15_000 });
+
+    await service.onApplicationBootstrap();
+
+    expect(schedules.map((call) => call.repeat)).toEqual([{ every: 15_000 }]);
+  });
+
+  it('says out loud that the sweep is off, so a quiet deployment is a stated choice', async () => {
+    const { service, schedules } = serviceOver({ confirmationIntervalMs: 0 });
+    const logged: string[] = [];
+    const spy = vi.spyOn(Logger.prototype, 'log').mockImplementation((message: unknown) => {
+      logged.push(String(message));
+    });
+
+    try {
+      await service.onApplicationBootstrap();
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(schedules).toEqual([]);
+
+    // The line has to name the config key and point at the README: a deployment where payments sit
+    // PROCESSING for ever is a deployment whose log must be able to explain itself, because the
+    // alternative is an operator discovering it from a customer.
+    expect(logged.join('\n')).toContain('payments.confirmationIntervalMs=0');
+    expect(logged.join('\n')).toContain('README');
+  });
+});

@@ -2,10 +2,13 @@ import { Logger } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { type Job } from 'bullmq';
 import { PaymentsSubmissionService } from '../services/payments-submission.service.js';
+import { PaymentsConfirmationService } from '../services/payments-confirmation.service.js';
 import {
   PAYMENTS_QUEUE,
+  PAYMENTS_QUEUE_CONFIRMATION_JOB,
   PAYMENTS_QUEUE_PROBE_JOB,
   PAYMENTS_QUEUE_SUBMISSION_JOB,
+  type PaymentsQueueConfirmationResult,
   type PaymentsQueueProbeResult,
   type PaymentsQueueSubmissionJobData,
   type PaymentsQueueSubmissionResult,
@@ -62,6 +65,12 @@ export class PaymentsProcessor extends WorkerHost {
    */
   constructor(
     private readonly submissions: PaymentsSubmissionService,
+    /**
+     * Step 28's collaborator, injected on the same principle as the submission service above: the
+     * poll's decisions are `PaymentsConfirmationService`'s, and a worker that could reach past it
+     * to a `PrismaService` or a Horizon client would be a second place polling logic could grow.
+     */
+    private readonly confirmations: PaymentsConfirmationService,
   ) {
     super();
   }
@@ -69,11 +78,13 @@ export class PaymentsProcessor extends WorkerHost {
   /**
    * Handles one job. The return value is what BullMQ stores as the job's result.
    *
-   * Three outcomes, and the last is the one that matters:
+   * Four outcomes, and the last is the one that matters:
    *
    * - the probe answers with the process that handled it;
    * - the submission branch hands the payment id to `PaymentsSubmissionService` and returns what it
    *   decided, which is the value an operator reads back from Redis;
+   * - the confirmation branch (Step 28) runs one poll of the in-flight set and returns its
+   *   counters, the same way;
    * - **anything else throws**. A job that is acknowledged without being attempted is worse than
    *   one that fails, because a failure is visible and an acknowledgement is not. A submission job
    *   that no handler recognised - renamed on one side, added before its handler exists, or pointed
@@ -82,7 +93,7 @@ export class PaymentsProcessor extends WorkerHost {
   async process(
     job: Job,
   ): Promise<
-    PaymentsQueueProbeResult | PaymentsQueueSubmissionResult
+    PaymentsQueueProbeResult | PaymentsQueueSubmissionResult | PaymentsQueueConfirmationResult
   > {
     if (job.name === PAYMENTS_QUEUE_PROBE_JOB) {
       return { pong: true, workerPid: process.pid };
@@ -90,6 +101,10 @@ export class PaymentsProcessor extends WorkerHost {
 
     if (job.name === PAYMENTS_QUEUE_SUBMISSION_JOB) {
       return this.submit(job);
+    }
+
+    if (job.name === PAYMENTS_QUEUE_CONFIRMATION_JOB) {
+      return this.confirm();
     }
 
     throw new Error(
@@ -129,6 +144,18 @@ export class PaymentsProcessor extends WorkerHost {
       ledger: outcome.ledger,
       detail: outcome.detail,
     };
+  }
+
+  /**
+   * The confirmation branch (Step 28), which takes no payload and needs none.
+   *
+   * A tick's work list is the `PROCESSING` rows, read inside the sweep, so there is nothing to
+   * validate here - and unlike the submission branch there is no failure mode a missing field
+   * could hide. The service's result is returned as the job's result, counters and all, which is
+   * how an operator asks "is the sweep finding anything" without opening the application log.
+   */
+  private async confirm(): Promise<PaymentsQueueConfirmationResult> {
+    return this.confirmations.sweep();
   }
 
   /**

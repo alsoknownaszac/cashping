@@ -20,6 +20,7 @@ import {
   HorizonAccountSource,
   createHorizonServer,
 } from './../src/wallet/stellar/horizon-account-source.js';
+import { HorizonTransactionLookup } from './../src/wallet/stellar/horizon-transaction-lookup.js';
 import { HorizonTransactionSubmitter } from './../src/wallet/stellar/horizon-transaction-submitter.js';
 import { StellarService } from './../src/wallet/stellar/stellar.service.js';
 
@@ -192,6 +193,9 @@ async function harness(): Promise<Harness> {
     config,
     new HorizonAccountSource(config, createHorizonServer),
     new HorizonTransactionSubmitter(config, createHorizonServer),
+    // Step 28's third port, wired as `WalletModule` wires it. Nothing in this run polls; the point
+    // is that the service under test is built the way the app builds it.
+    new HorizonTransactionLookup(config, createHorizonServer),
   );
   const custody = new SeedCustodyService(new KmsKeyWrapper(config, createKmsClient), stellar);
   const funder = new RecordingFunder(new FriendbotFunder(config));

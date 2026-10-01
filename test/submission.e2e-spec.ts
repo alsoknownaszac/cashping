@@ -13,11 +13,20 @@ import {
 } from './../src/config/configuration.js';
 import { UserStatus } from './../src/generated/prisma/enums.js';
 import { type SessionUser } from './../src/identity/token/token.service.js';
+import {
+  type NotificationsService,
+  type PaymentResultNotice,
+} from './../src/notifications/notifications.service.js';
 import { PAYMENTS_QUEUE } from './../src/payments/jobs/payments-queue.js';
 import { PAYMENTS_QUEUE_COMMAND_TIMEOUT_MS } from './../src/payments/jobs/payments-queue-connection.js';
 import { PaymentsQueueService } from './../src/payments/jobs/payments-queue.service.js';
+import { PaymentsConfirmationService } from './../src/payments/services/payments-confirmation.service.js';
 import { PaymentsService } from './../src/payments/services/payments.service.js';
 import { PaymentsSubmissionService } from './../src/payments/services/payments-submission.service.js';
+import {
+  claimForSubmission,
+  recordEnvelope,
+} from './../src/payments/services/transaction-status.js';
 import { PrismaService } from './../src/prisma/prisma.service.js';
 import { KmsKeyWrapper, createKmsClient } from './../src/wallet/custody/kms-key-wrapper.js';
 import { SeedCustodyService } from './../src/wallet/custody/seed-custody.service.js';
@@ -30,6 +39,10 @@ import {
   HorizonAccountSource,
   createHorizonServer,
 } from './../src/wallet/stellar/horizon-account-source.js';
+import {
+  HorizonTransactionLookup,
+  transactionCodeOf,
+} from './../src/wallet/stellar/horizon-transaction-lookup.js';
 import { HorizonTransactionSubmitter } from './../src/wallet/stellar/horizon-transaction-submitter.js';
 import { StellarService } from './../src/wallet/stellar/stellar.service.js';
 
@@ -490,6 +503,89 @@ async function horizonTransaction(
   return (await response.json()) as never;
 }
 
+/**
+ * `horizonTransaction`, given the seconds Horizon's history can lag its ledgers by.
+ *
+ * A transaction that fails on-ledger reaches a closed ledger *before* Horizon answers its
+ * submission - `tx_failed` is a ledger's answer, and it is why the fee is charged - but the record
+ * is written by Horizon's ingester rather than by the ledger, so a fetch a moment later can still
+ * answer 404. Only the index is late; the assertion this feeds stays exact.
+ */
+async function horizonTransactionEventually(
+  hash: string,
+  timeoutMs = 15_000,
+): Promise<{ successful: boolean; ledger: number } | null> {
+  const deadline = Date.now() + timeoutMs;
+
+  let record = await horizonTransaction(hash);
+
+  while (record === null && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    record = await horizonTransaction(hash);
+  }
+
+  return record;
+}
+
+/**
+ * A hash Horizon has recorded as landed-and-refused, preferring the common `tx_failed`.
+ *
+ * The FAILED branch of the poll needs a row that is `PROCESSING` and holding the hash of a
+ * transaction a ledger closed as unsuccessful, and the app's own submission path never leaves one.
+ * A transaction whose operation fails *is* closed by a ledger - that is what `tx_failed` is - and
+ * Horizon answers the submission that produced it with an HTTP 400 carrying the operation code,
+ * which Step 27's triage acts on as a verdict: the row goes straight to `FAILED` and no poll is
+ * ever owed for it. The third test below drives exactly that payment, and reads its hash back from
+ * Horizon, which is where this was learned.
+ *
+ * So the test arranges the two halves of the row by hand, and only one of them is a question of
+ * fact: the *hash* must name a real ledger entry, which is why it is read out of Testnet's own
+ * history, while the *row* around it is written the way a submission writes one. That is also the
+ * honest shape of the poll's contract - "resolve the network's verdict on a hash" - and a hash the
+ * network has already answered for is that verdict with no timing left to arrange.
+ */
+async function horizonFailedTransaction(): Promise<{
+  hash: string;
+  sequence: string;
+  code: string;
+} | null> {
+  const response = await fetch(
+    `${horizonUrl()}/transactions?include_failed=true&order=desc&limit=200`,
+    { headers: { accept: 'application/json' } },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Horizon answered HTTP ${response.status} for failed transactions`);
+  }
+
+  const page = (await response.json()) as {
+    _embedded?: {
+      records?: ReadonlyArray<{
+        hash: string;
+        successful: boolean;
+        result_xdr: string;
+        source_account_sequence?: string;
+      }>;
+    };
+  };
+
+  const decodable = (page._embedded?.records ?? []).filter(
+    (record) => record.successful === false && transactionCodeOf(record.result_xdr) !== null,
+  );
+  const wanted =
+    decodable.find((record) => transactionCodeOf(record.result_xdr) === 'tx_failed') ??
+    decodable[0];
+
+  if (wanted === undefined) {
+    return null;
+  }
+
+  return {
+    hash: wanted.hash,
+    sequence: wanted.source_account_sequence ?? '0',
+    code: transactionCodeOf(wanted.result_xdr) as string,
+  };
+}
 function usdcLineOf(
   account: { balances: ReadonlyArray<{ asset_code?: string; asset_issuer?: string; balance: string }> },
   issuer: string,
@@ -576,6 +672,8 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
   /** The third row: a payment the network refuses outright, so the poll never has a hash to look up. */
   let refusedPaymentId = '';
 
+  /** The recipient's user id, kept because the failed-case row needs a real recipient relation. */
+  let recipientUserId = '';
 
   /** The trustline service, so the failed-case transaction pays the same asset the mint did. */
   let usdc: UsdcTrustlineService;
@@ -602,6 +700,11 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
       config,
       new HorizonAccountSource(config, createHorizonServer),
       new HorizonTransactionSubmitter(config, createHorizonServer),
+      // Step 28's third port, wired here as `WalletModule` wires it. This run never polls - the
+      // sweep is a separate suite's subject and `PaymentsConfirmationService` is not constructed
+      // below - but the service under test takes it, and passing a fake would make this file's
+      // `StellarService` a different object from the one the app builds.
+      new HorizonTransactionLookup(config, createHorizonServer),
     );
 
     custody = new SeedCustodyService(new KmsKeyWrapper(config, createKmsClient), stellar);
@@ -652,6 +755,7 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
 
     senderUserId = senderUser.id;
     userIds.push(senderUser.id, recipientUser.id);
+    recipientUserId = recipientUser.id;
 
     // Two real wallets, sealed by the real KMS, funded by the real friendbot, trusting the real
     // asset - the same three steps provisioning performs, in the same order.
@@ -866,4 +970,228 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
     );
   }, 60_000);
 
+  it('Step 28: the sweep resolves the submitted payment to SUCCESSFUL against the real ledger', async () => {
+    const before = await prisma.transaction.findUniqueOrThrow({
+      where: { id: paymentId },
+      select: { status: true, stellarTxHash: true, failureReason: true },
+    });
+
+    expect(before.status).toBe('PROCESSING');
+    expect(before.stellarTxHash).toMatch(/^[0-9a-f]{64}$/);
+
+    // The real confirmation service, with only the SMS provider substituted (this run is about the
+    // poll, not the message). Horizon is real, the row is real, and the writers are the app's.
+    const notices: PaymentResultNotice[] = [];
+    const confirmations = new PaymentsConfirmationService(
+      prisma,
+      stellar,
+      {
+        sendPaymentResult: async (
+          _phoneNumber: string,
+          notice: PaymentResultNotice,
+        ): Promise<void> => {
+          notices.push(notice);
+        },
+      } as unknown as NotificationsService,
+    );
+
+    const result = await confirmations.sweep();
+
+    const after = await prisma.transaction.findUniqueOrThrow({
+      where: { id: paymentId },
+      select: { status: true, failureReason: true, stellarTxHash: true },
+    });
+
+    expect(after.status).toBe('SUCCESSFUL');
+    expect(after.failureReason).toBeNull();
+
+    // The ledger outcome, asked independently of the row and of the poll: the hash the sweep looked
+    // up is the hash the network holds, and the network said "successful".
+    const onLedger = await horizonTransaction(after.stellarTxHash as string);
+    expect(onLedger?.successful).toBe(true);
+
+    expect(result.confirmed).toBeGreaterThanOrEqual(1);
+
+    // The sender was told, from the row.
+    expect(notices.some((notice) => notice.status === 'SUCCESSFUL')).toBe(true);
+
+    console.log(
+      `[step 28] sweep: payment=${paymentId} hash=${after.stellarTxHash} PROCESSING -> SUCCESSFUL (polled=${result.polled} confirmed=${result.confirmed})`,
+    );
+  }, 120_000);
+
+  it('Step 28: a transaction that lands but fails on-ledger resolves to FAILED with a readable reason', async () => {
+    // A second payment row, over the existing sender and recipient, as the vehicle for a poll. It
+    // starts PENDING (the column default) and is moved only through the writers - the same path the
+    // submission job uses, which is the only path Step 29 leaves to a status write.
+    const failedRow = await prisma.transaction.create({
+      data: {
+        senderId: senderUserId,
+        recipientId: recipientUserId,
+        amount: '60.0000000',
+        idempotencyKey: randomUUID(),
+      },
+      select: { id: true },
+    });
+
+    failedPaymentId = failedRow.id;
+
+    // A transaction the ledger has refused, read from the network's own history - see
+    // `horizonFailedTransaction` for why it is read rather than submitted.
+    const failed = await horizonFailedTransaction();
+
+    expect(failed, 'Testnet had no landed-but-failed transaction to read').not.toBeNull();
+
+    const onLedger = failed as { hash: string; sequence: string; code: string };
+
+    // The same question the sweep will ask, asked first: Horizon has it, and the ledger refused it.
+    const landed = await horizonTransaction(onLedger.hash);
+
+    expect(landed).not.toBeNull();
+    expect(landed?.successful).toBe(false);
+
+    // Move the row exactly the way a submission does: claim, then record the envelope.
+    expect(await claimForSubmission(prisma, failedPaymentId)).toBe(true);
+    expect(
+      await recordEnvelope(prisma, failedPaymentId, null, {
+        hash: onLedger.hash,
+        sequence: onLedger.sequence,
+        // The deadline the row would have recorded had this app submitted it. The poll does not read
+        // it for a transaction the ledger already has, but a row with a hash and no deadline is a
+        // shape `recordEnvelope` never writes.
+        deadline: new Date(Date.now() + 180_000),
+      }),
+    ).toBe(true);
+
+    const before = await prisma.transaction.findUniqueOrThrow({
+      where: { id: failedPaymentId },
+      select: { status: true },
+    });
+
+    expect(before.status).toBe('PROCESSING');
+
+    const notices: PaymentResultNotice[] = [];
+    const confirmations = new PaymentsConfirmationService(
+      prisma,
+      stellar,
+      {
+        sendPaymentResult: async (
+          _phoneNumber: string,
+          notice: PaymentResultNotice,
+        ): Promise<void> => {
+          notices.push(notice);
+        },
+      } as unknown as NotificationsService,
+    );
+
+    const result = await confirmations.sweep();
+
+    const after = await prisma.transaction.findUniqueOrThrow({
+      where: { id: failedPaymentId },
+      select: { status: true, failureReason: true },
+    });
+
+    expect(after.status).toBe('FAILED');
+
+    // The readable reason: the transaction-level code the decoded result XDR names, in the same
+    // vocabulary - and under the same prefix - the submit path writes for the same code, because
+    // both describe a transaction a ledger closed (`landedPrefixFor` in `submission-triage.ts`).
+    // A fetched Horizon record has no `result_codes` field, so the code is decoded from
+    // `result_xdr` - `tx_failed` for the usual op-level refusal, and whatever real `tx_*` code the
+    // record carries.
+    expect(after.failureReason).toBe(`landed-unsuccessful:${onLedger.code}`);
+
+    expect(result.failed).toBeGreaterThanOrEqual(1);
+    expect(notices.some((notice) => notice.status === 'FAILED')).toBe(true);
+
+    console.log(
+      `[step 28] FAILED case: payment=${failedPaymentId} hash=${onLedger.hash} PROCESSING -> FAILED (${after.failureReason})`,
+    );
+  }, 120_000);
+
+  it('Step 28: a deliberately-invalid payment is refused at submission, and the row still records a landed failure', async () => {
+    // The audit item's other half: a payment the network refuses, rather than one the poll
+    // discovers. The sender holds ~98 USDC, so 1,000,000 USDC cannot be paid - Horizon answers the
+    // submission with an HTTP 400 naming `op_underfunded` - and a permanent operation code is a
+    // verdict in Step 27's triage: the row is `FAILED` immediately, never `PROCESSING`, so there is
+    // no poll to owe for it.
+    //
+    // A refusal is not the same as the envelope disappearing, though, and that is what this test is
+    // careful about: the ledger still closes the transaction, as unsuccessful and with its fee
+    // charged, so the hash the row keeps resolves on Horizon. The assertions below read that back
+    // instead of assuming what a rejected submission leaves behind - and it is why the reason below
+    // wears the *landed* prefix, the one the second case's poll writes as well: the two paths differ
+    // in when the app learned the outcome, and in nothing else.
+    const refusedRow = await prisma.transaction.create({
+      data: {
+        senderId: senderUserId,
+        recipientId: recipientUserId,
+        amount: '1000000.0000000',
+        idempotencyKey: randomUUID(),
+      },
+      select: { id: true },
+    });
+
+    refusedPaymentId = refusedRow.id;
+
+    const balanceBefore = usdcLineOf(await horizonAccount(senderPublicKey), issuerPublicKey);
+
+    // The app's own submission path: the same claim, build, sign and submit the job runs.
+    const outcome = await submission.submit(refusedPaymentId);
+
+    expect(outcome.status).toBe('failed');
+
+    // The *outcome* carries no hash: the attempt ended in a refusal, and a refused submission is
+    // not a landed one, so there is nothing for the outcome to report. What the row holds is a
+    // different question - `markFailed` deliberately keeps the hash of the envelope that was built
+    // as the fingerprint of the attempt - and the two statements are not in conflict.
+    expect(outcome.stellarTxHash).toBeNull();
+
+    const after = await prisma.transaction.findUniqueOrThrow({
+      where: { id: refusedPaymentId },
+      select: { status: true, failureReason: true, stellarTxHash: true },
+    });
+
+    // FAILED, with the operation code the network itself named - a verdict rather than an attempt,
+    // because `op_underfunded` is a permanent code. Not `PROCESSING`, and not waiting on a poll:
+    // the network has already answered, so there is nothing left for one to find out. The prefix is
+    // `landed-unsuccessful:` rather than `submission-rejected:` - the correction Step 28's audit of
+    // the vocabulary made: the transaction *is* in a ledger, closed unsuccessfully, and the network
+    // charged the fee for it. Which caller learned that first is not what the prefix records.
+    expect(after.status).toBe('FAILED');
+    expect(after.failureReason).toBe('landed-unsuccessful:op_underfunded');
+
+    // The row keeps the hash of the envelope this app built - `markFailed` keeps it on purpose, as
+    // the fingerprint of the attempt - and this case is what says what such a hash *is*, which is
+    // not what the first version of this test assumed: Horizon has a record under it. The network
+    // evaluated the operations, refused them in a ledger and charged the fee, so the transaction
+    // landed unsuccessfully even though what Horizon answered the *submission* with was a refusal.
+    // The reason's prefix is what says so; the hash alone never would.
+    const recordedHash = after.stellarTxHash ?? '';
+
+    expect(recordedHash).toMatch(/^[0-9a-f]{64}$/);
+
+    const refusedOnLedger = await horizonTransactionEventually(recordedHash);
+
+    expect(refusedOnLedger, `Horizon has no record of ${recordedHash}`).not.toBeNull();
+    expect(refusedOnLedger?.successful).toBe(false);
+
+    // The money provably did not move, in both halves of that claim: the transaction under the hash
+    // was closed as unsuccessful, and the sender's USDC line is unchanged. (The fee is XLM, charged
+    // by the network rather than moved by the payment.)
+    expect(usdcLineOf(await horizonAccount(senderPublicKey), issuerPublicKey)).toBe(balanceBefore);
+
+    // And the row is terminal: a second attempt through a fresh load is `skipped` rather than a
+    // second debit, which is the state machine's answer and not an error. The hash it reports is the
+    // recorded one, unchanged - a skip builds nothing.
+    const again = await submission.submit(refusedPaymentId);
+
+    expect(again.status).toBe('skipped');
+    expect(again.detail).toBe('status:FAILED');
+    expect(again.stellarTxHash).toBe(recordedHash);
+
+    console.log(
+      `[step 28] deliberately-invalid case: payment=${refusedPaymentId} PENDING -> FAILED (${after.failureReason}) hash=${recordedHash} closed unsuccessful in ledger ${refusedOnLedger?.ledger}, sender USDC unchanged at ${balanceBefore}, second attempt skipped`,
+    );
+  }, 120_000);
 });

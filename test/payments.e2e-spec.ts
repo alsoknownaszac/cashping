@@ -669,13 +669,14 @@ describe('Payment creation (e2e)', () => {
       await resetWallet(sender);
 
       // A PENDING row written straight into the table, as a previous request would have left it:
-      // the wallet's 10 is unchanged on the network, and 4.0000001 more must not be allowed.
+      // the wallet's 10 is unchanged on the network, and 4.0000001 more must not be allowed. The
+      // status is left to the column's `@default(PENDING)` - the one place it is declared now that
+      // Step 29's rule reserves status *writes* for `transaction-status.ts`.
       await prisma.transaction.create({
         data: {
           senderId: sender.userId,
           recipientId: recipient.userId,
           amount: '6',
-          status: 'PENDING',
           idempotencyKey: freshKey(),
         },
         select: { id: true },

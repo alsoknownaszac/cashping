@@ -3,7 +3,9 @@ import { Injectable, Logger, Module, type OnApplicationShutdown } from '@nestjs/
 import { ConfigService } from '@nestjs/config';
 import { Queue } from 'bullmq';
 import { PrismaModule } from '../../prisma/prisma.module.js';
+import { NotificationsModule } from '../../notifications/notifications.module.js';
 import { WalletModule } from '../../wallet/wallet.module.js';
+import { PaymentsConfirmationService } from '../services/payments-confirmation.service.js';
 import { PaymentsSubmissionService } from '../services/payments-submission.service.js';
 import { PaymentsProcessor } from './payments.processor.js';
 import {
@@ -154,6 +156,13 @@ export class PaymentsQueueProducer implements OnApplicationShutdown {
     BullModule.registerQueue({ name: PAYMENTS_QUEUE }),
     PrismaModule,
     WalletModule,
+    /**
+     * Step 28: the confirmation sweep tells the sender what happened, and `NotificationsService`
+     * is the app's only door to that (it owns the SMS template and the `SMS_SENDER` seam). The
+     * module is imported rather than the provider configured again, because two bindings for one
+     * sender would be two answers to "which provider".
+     */
+    NotificationsModule,
   ],
   providers: [
     PaymentsQueueService,
@@ -164,6 +173,12 @@ export class PaymentsQueueProducer implements OnApplicationShutdown {
     { provide: PAYMENTS_QUEUE_PRODUCER, useExisting: PaymentsQueueProducer },
     PaymentsProcessor,
     PaymentsSubmissionService,
+    /**
+     * Step 28's sweep. Provided here rather than in `PaymentsModule` for exactly the reason the
+     * submission service is (see `PaymentsQueueModule`'s docblock): the arrow only ever points
+     * this way, and the processor below is its consumer.
+     */
+    PaymentsConfirmationService,
   ],
   exports: [PaymentsQueueService],
 })

@@ -163,9 +163,14 @@ export class PaymentsService {
 
         /**
          * One row, with the amount written as the string `Amount` produced. Prisma parses that
-         * string into a `Decimal` for the `numeric(20, 7)` column without a float anywhere, and
-         * `PENDING` is stated rather than left to the column's default so that the status a
-         * payment is created in is visible in the code that creates it.
+         * string into a `Decimal` for the `numeric(20, 7)` column without a float anywhere.
+         *
+         * The status is deliberately *not* written here any more (Step 29). A payment is created
+         * `PENDING`, which the column's own `@default(PENDING)` declares, and the rule this step
+         * added is that the state machine is the only code that writes a status: this file no longer
+         * names the column at all, which leaves one statement of what a payment starts as
+         * (`schema.prisma`) and one writer of what it becomes (`transaction-status.ts`).
+         * `npm run lint:status` is what keeps it that way.
          */
         const row = await tx.transaction.create({
           data: {
@@ -173,7 +178,6 @@ export class PaymentsService {
             recipientId: recipient.id,
             amount: amount.toString(),
             idempotencyKey,
-            status: TransactionStatus.PENDING,
           },
           select: { id: true, status: true, amount: true, createdAt: true },
         });

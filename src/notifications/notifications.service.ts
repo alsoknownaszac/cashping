@@ -52,4 +52,51 @@ export class NotificationsService {
       })`,
     );
   }
+
+  /**
+   * Tells the sender how a payment ended (Step 28).
+   *
+   * The two sentences, and nothing else: a payment has two endings a customer cares about, and
+   * the *failure* wording says what a failure means for the money ("no USDC left your wallet")
+   * rather than naming a code - the machine code belongs in the row (`failure_reason`), not in a
+   * text to a customer.
+   *
+   * `amount` arrives as a decimal string from the money module, never a number, and is passed
+   * through untouched: this is a template, and rounding or reformatting here would be a second
+   * opinion about what the database holds.
+   *
+   * Rejects when the provider did not accept the message, like `sendOtp` - the caller decides
+   * what an undeliverable notice means, and the confirmation sweep's answer is to log it and
+   * keep the resolution, because the payment is already written.
+   */
+  async sendPaymentResult(phoneNumber: string, notice: PaymentResultNotice): Promise<void> {
+    const to = notice.recipientHandle === null ? '' : ` to @${notice.recipientHandle}`;
+    const body =
+      notice.status === 'SUCCESSFUL'
+        ? `Cashping: your payment of ${notice.amount} USDC${to} went through.`
+        : `Cashping: your payment of ${notice.amount} USDC${to} did not go through. No USDC left your wallet.`;
+
+    const result = await this.smsSender.send({ to: phoneNumber, body });
+
+    this.logger.log(
+      `Payment ${notice.status} SMS accepted by the provider (to=${maskPhoneNumber(phoneNumber)}${
+        result.providerMessageId === undefined ? '' : `, messageId=${result.providerMessageId}`
+      })`,
+    );
+  }
+}
+
+/**
+ * What a settlement notice says, as the one shape both endings share.
+ *
+ * `status` is the `TransactionStatus` the row now holds, narrowed to the two that are answers -
+ * a notice is only ever sent for an answer, which is Step 28's invariant: nothing notifies about
+ * a payment that is still in flight.
+ */
+export interface PaymentResultNotice {
+  readonly status: 'SUCCESSFUL' | 'FAILED';
+  /** The amount as stored, as a decimal string (7 decimals at most). */
+  readonly amount: string;
+  /** The recipient's handle, or `null` - the message simply omits it rather than inventing one. */
+  readonly recipientHandle: string | null;
 }

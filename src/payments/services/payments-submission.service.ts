@@ -125,7 +125,7 @@ const WALLET_COLUMNS = {
  *    sequence conflict. Both conditional on the status still being `PROCESSING`, so a payment
  *    another attempt has already resolved is never overwritten by a stale conclusion.
  *
- * None of those writes is *here*: each one is a named writer in
+ * As of Step 29 none of those writes is *here* any more: each one is a named writer in
  * `transaction-status.ts` (`claimForSubmission`, `recordEnvelope`, `restoreEnvelope`,
  * `markFailed`), which is the only file in the repository allowed to write the `status` column -
  * a property `check-status-discipline.ts` checks on every lint run. This file calls them and
@@ -207,7 +207,7 @@ export class PaymentsSubmissionService {
     }
 
     if (payment.status === TransactionStatus.PENDING) {
-      // The claim goes through the state machine's writer - the only code allowed to
+      // The claim goes through the state machine's writer (Step 29) - the only code allowed to
       // write the `status` column - which keeps the guard and the compare-and-set condition with
       // the transition they belong to rather than in every caller.
       const claimed = await claimForSubmission(this.prisma, transactionId);
@@ -475,7 +475,7 @@ export class PaymentsSubmissionService {
   /**
    * Records the payment as failed, with the reason, and answers.
    *
-   * The write is `markFailed` in `transaction-status.ts` - the state machine's guard and
+   * The write is `markFailed` in `transaction-status.ts` (Step 29) - the state machine's guard and
    * its compare-and-set condition - and what this method adds is what a lost race means *here*:
    * the row stopped being `PROCESSING` before the write landed, so somebody else has already
    * answered the payment and this attempt must not report a failure the row does not show.

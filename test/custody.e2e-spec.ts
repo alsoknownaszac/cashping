@@ -77,7 +77,7 @@ function wrapperWith(overrides: Record<string, string | undefined> = {}): KmsKey
   return new KmsKeyWrapper(configWith(overrides), createKmsClient);
 }
 
-/** The real service. `StellarService` is real too, with two ports it never reaches. */
+/** The real service. `StellarService` is real too, with three ports it never reaches. */
 function serviceWith(overrides: Record<string, string | undefined> = {}): SeedCustodyService {
   const stellar = new StellarService(
     configWith(overrides),
@@ -96,6 +96,15 @@ function serviceWith(overrides: Record<string, string | undefined> = {}): SeedCu
        */
       submit: () => {
         throw new Error('custody never submits a transaction: this spec has no Horizon');
+      },
+    },
+    {
+      /**
+       * Step 28's third port, on exactly the same terms: custody neither submits nor polls, so a
+       * lookup would mean this spec wandered somewhere it has no Horizon to wander to.
+       */
+      lookup: () => {
+        throw new Error('custody never looks a transaction up: this spec has no Horizon');
       },
     },
   );

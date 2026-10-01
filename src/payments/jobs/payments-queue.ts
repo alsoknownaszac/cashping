@@ -75,6 +75,49 @@ export interface PaymentsQueueProbeResult {
 export const PAYMENTS_QUEUE_SUBMISSION_JOB = 'submit-payment';
 
 /**
+ * The job that asks Horizon what became of the transactions this queue submitted (Step 28).
+ *
+ * The counterpart of `submit-payment`, and the reason Step 27 could record a hash and walk away:
+ * a submission's accepted answer is not a settlement, so *something* has to ask later whether the
+ * transaction is in a ledger. This job is that something, and it carries no payload at all - the
+ * work list is the `PROCESSING` rows themselves, so a job that never ran costs a delay rather
+ * than a payment (see `PaymentsConfirmationService` for why that is the whole design).
+ *
+ * It is the queue's first *repeatable* job: `PaymentsQueueService` registers it with BullMQ's job
+ * scheduler, one entry per deployment, and every tick adds one instance of this job. That is why
+ * it is named for the thing it does (`confirm-payments`) rather than for a payment: one tick
+ * confirms as many as it can decide.
+ */
+export const PAYMENTS_QUEUE_CONFIRMATION_JOB = 'confirm-payments';
+
+/**
+ * What a confirmation job carries: nothing.
+ *
+ * The same argument as the probe's, for a different reason: the set of payments to poll is not
+ * something a producer can know at enqueue time - it is whatever is `PROCESSING` when the tick
+ * runs - so a payload would be a stale list at best. `Record<string, never>` keeps the compiler's
+ * help in saying so.
+ */
+export type PaymentsQueueConfirmationJobData = Record<string, never>;
+
+/**
+ * What one confirmation tick did, as the job's stored result.
+ *
+ * The counters are `ConfirmationSweepResult`'s, repeated here rather than imported for the same
+ * reason the submission result repeats the service's union: this is the *queue's* contract (what
+ * an operator reading Redis sees), and the processor's translation between the two is a
+ * field-for-field assignment, so the compiler fails the build the day they drift apart.
+ */
+export interface PaymentsQueueConfirmationResult {
+  readonly polled: number;
+  readonly confirmed: number;
+  readonly failed: number;
+  readonly waiting: number;
+  readonly unresolved: number;
+  readonly stuckWithoutHash: number;
+}
+
+/**
  * What a submission job carries: the id of the payment to submit, and nothing else.
  *
  * The payload is deliberately a *reference* rather than a description. Every fact the handler
@@ -111,24 +154,27 @@ export interface PaymentsQueueSubmissionResult {
 /** Every job name on this queue, as one type - which job names exist is a fact about the queue. */
 export type PaymentsQueueJobName =
   | typeof PAYMENTS_QUEUE_PROBE_JOB
-  | typeof PAYMENTS_QUEUE_SUBMISSION_JOB;
+  | typeof PAYMENTS_QUEUE_SUBMISSION_JOB
+  | typeof PAYMENTS_QUEUE_CONFIRMATION_JOB;
 
 /**
  * The payloads this queue carries, as one type.
  *
- * BullMQ types one payload/result pair per `Queue` instance, and this queue carries two jobs, so
+ * BullMQ types one payload/result pair per `Queue` instance, and this queue carries three jobs, so
  * the honest type at the queue's boundary is a union. The enqueue methods narrow it back to the
  * single job they add (see `PaymentsQueueService`), which is where a caller gets the precision
  * back.
  */
 export type PaymentsQueueJobData =
   | PaymentsQueueProbeJobData
-  | PaymentsQueueSubmissionJobData;
+  | PaymentsQueueSubmissionJobData
+  | PaymentsQueueConfirmationJobData;
 
 /** The results this queue's jobs produce, as one type - the result half of the same union. */
 export type PaymentsQueueJobResult =
   | PaymentsQueueProbeResult
-  | PaymentsQueueSubmissionResult;
+  | PaymentsQueueSubmissionResult
+  | PaymentsQueueConfirmationResult;
 
 /**
  * The producer-side handle on this queue, as the enqueue path needs it.

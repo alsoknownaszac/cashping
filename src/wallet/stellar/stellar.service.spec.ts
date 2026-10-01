@@ -19,6 +19,7 @@ import {
 import { StellarAccountSession } from './stellar-account-session.js';
 import { StellarService } from './stellar.service.js';
 import type { StellarTransactionSubmitter, SubmittedTransaction } from './transaction-submitter.js';
+import type { StellarTransactionLookup, TransactionLookupResult } from './transaction-lookup.js';
 
 /**
  * Step 17's audit item, **forced rather than assumed**.
@@ -173,10 +174,33 @@ class RecordingSubmitter implements StellarTransactionSubmitter {
 
 const UNUSED_SUBMITTER = new RecordingSubmitter();
 
+/**
+ * The lookup the cycles below never depend on.
+ *
+ * Step 28 put a third Horizon port on this class, and it is injected here the same way the submitter
+ * is: real, so the constructor is exercised with the four collaborators `WalletModule` supplies, and
+ * silent, because what this file tests is the lock and the pass-through. The port's own mapping -
+ * `NotFoundError` into `not-found`, every other failure into `unavailable` - is
+ * `horizon-transaction-lookup.spec.ts`'s subject, and the live answer is the Step 28 audit item.
+ */
+class RecordingLookup implements StellarTransactionLookup {
+  readonly looked: string[] = [];
+  answer: TransactionLookupResult = { kind: 'not-found' };
+
+  async lookup(hash: string): Promise<TransactionLookupResult> {
+    this.looked.push(hash);
+
+    return this.answer;
+  }
+}
+
+const UNUSED_LOOKUP = new RecordingLookup();
+
 function createService(
   horizon: StellarAccountSource,
   network = 'TESTNET',
   submitter: StellarTransactionSubmitter = UNUSED_SUBMITTER,
+  lookup: StellarTransactionLookup = UNUSED_LOOKUP,
 ): StellarService {
   const config = {
     getOrThrow: (key: string) => {
@@ -193,7 +217,7 @@ function createService(
     },
   } as unknown as ConfigService;
 
-  return new StellarService(config, horizon, submitter);
+  return new StellarService(config, horizon, submitter, lookup);
 }
 
 function payment(amount = '1'): xdr.Operation {
@@ -414,5 +438,42 @@ describe('StellarService', () => {
     horizon.failWith = new StellarAccountNotFoundError(ACCOUNT);
 
     await expect(service.loadBalances(ACCOUNT)).rejects.toBeInstanceOf(StellarAccountNotFoundError);
+  });
+});
+
+/**
+ * The pass-through Step 28 added: `lookupTransaction` is the app's second question to Stellar ("did
+ * it land?") and this class is where that question's vocabulary is pinned.
+ *
+ * All four answers are exercised in one test rather than the happy path alone, because the claim
+ * being made is about the *quiet* ones: `not-found` and `unavailable` are what a poller meets on an
+ * ordinary morning, and neither may become an exception or a verdict on the way through. What an
+ * answer means for a payment is `confirmation-triage.ts`'s decision, one layer up; what Horizon's
+ * HTTP means is the port's own spec. This method is also deliberately lock-free - it consumes no
+ * sequence number and signs nothing, so a poll never queues behind a build for the same account -
+ * which is visible in its body rather than assertable from here.
+ */
+describe('StellarService.lookupTransaction', () => {
+  it('hands back every answer the port gives, including the two quiet ones', async () => {
+    const lookup = new RecordingLookup();
+    const service = createService(new SimulatedHorizon(), 'TESTNET', UNUSED_SUBMITTER, lookup);
+    const hash = 'b'.repeat(64);
+
+    const answers: TransactionLookupResult[] = [
+      { kind: 'settled', ledger: 42, successful: true, transactionCode: null },
+      { kind: 'settled', ledger: 43, successful: false, transactionCode: 'tx_failed' },
+      { kind: 'not-found' },
+      { kind: 'unavailable', detail: 'Horizon answered HTTP 503' },
+    ];
+
+    for (const answer of answers) {
+      lookup.answer = answer;
+
+      await expect(service.lookupTransaction(hash)).resolves.toEqual(answer);
+    }
+
+    // Every call reached the port, and every call carried the hash the row recorded - the one fact
+    // a poll has to get right, and the only argument this method takes.
+    expect(lookup.looked).toEqual(answers.map(() => hash));
   });
 });
