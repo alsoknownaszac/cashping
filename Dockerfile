@@ -32,6 +32,19 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /usr/src/app/dist ./dist
 
+# The Prisma schema, its migrations and the Prisma 7 config are not inputs to
+# `nest build` (the *generated client* is) so the runtime stage would otherwise
+# carry none of them, and `prisma migrate deploy` - the pre-deploy step
+# render.yaml runs - would have nothing to read. `prisma` itself is a production
+# dependency, so the CLI is already here; the schema, the migrations and the
+# config that names the datasource URL are what have to travel. That config
+# imports "dotenv/config", which is a dev-only package, so `dotenv` comes along
+# too - without it the CLI dies on an unresolved import before it reads a single
+# migration.
+COPY --from=build /usr/src/app/node_modules/dotenv ./node_modules/dotenv
+COPY prisma ./prisma
+COPY prisma7.config.ts ./
+
 EXPOSE 3000
 USER node
 

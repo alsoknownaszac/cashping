@@ -924,6 +924,44 @@ row's `createdAt`. The control pair is both assertions at once: membership (it i
 and filter, its detail request 404s for everyone else, and each of its two parties reads its own side)
 and order (two rows in one millisecond are the only rows whose page order is the tiebreak itself).
 
+## Staging on Render (render.yaml)
+
+`render.yaml` at the repository root is a Render Blueprint: created once in a workspace (`New -> Blueprint`,
+pointed at this repository - the Blueprint Path is `render.yaml`, which is the default), it provisions the
+whole environment in one sync - a Postgres database, a Key Value instance, and the API built from the
+Dockerfile that is already here. A `main` push redeploys the API (`autoDeploy: true`); a change to the file
+is applied by re-syncing the Blueprint.
+
+**It is staging, and three things in the file say so.** `STELLAR_NETWORK=TESTNET`, with the Horizon URL and
+the USDC issuer that exist on that network, so nothing in this environment can move real money.
+`NODE_ENV=production`, so the custody guards (Step 18) are *exercised* rather than bypassed - which is why
+`AWS_ENDPOINT_URL` is absent from the file and has to stay absent: the validator refuses to boot when it is
+set in production, and that refusal on a misconfigured staging is the guard working. And
+`ENABLE_SWAGGER=true`, which `.env.example` advises against on a public production host but is the point of
+staging: the frontend calls the real API and reads `/api/docs` while they do it.
+
+| Decision | Why |
+| --- | --- |
+| `numInstances: 1` | The BullMQ worker and the confirmation sweep run *inside the API process* (Step 26). A second replica would be a second consumer of one queue and a second registrant of one schedule, for throughput this stage does not need. |
+| Paid datastore plans | A Free Postgres instance expires 30 days after creation, and a Free Key Value instance keeps nothing on disk - a staging database that disappears mid-demo, and jobs plus idempotency records lost on any restart. |
+| `maxmemoryPolicy: noeviction` | BullMQ holds job state in keys, and Render's default (`allkeys-lru`) could evict a queued submission. Step 26 makes the work list the `transactions` table, so an eviction costs a delay rather than a payment nothing will look at again - a preference, not a load-bearing setting. |
+| `postgresMajorVersion: '16'` | The version `docker-compose.yml` runs, and therefore the one every migration and every e2e run in this repository was executed against. Left unset, Render would use its newest supported major. |
+| `healthCheckPath: /v1/health` | The liveness endpoint: no auth, no database call, no Redis call. It is the URL `HealthController`'s own docblock says a load balancer is pointed at. |
+| `preDeployCommand` | `npx --no-install prisma migrate deploy` runs in the newly built image, with this service's environment, *before* it takes traffic - so a failed migration fails the deploy and the previous version keeps serving. The Dockerfile copies `prisma/`, the migrations and `prisma7.config.ts` into the runtime stage for this one line (and `dotenv`, which that config imports). |
+
+### The values that are not in the file
+
+`sync: false` marks the variables prompted for in the Dashboard on the first sync, because none of them can
+live in a repository: `CORS_ALLOWED_ORIGINS`, `AFRICASTALKING_API_KEY`, `AFRICASTALKING_USERNAME`,
+`SENTRY_DSN`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_KMS_KEY_ID`. `JWT_SECRET`
+is not on that list because Render generates it (`generateValue: true`), and `PORT` is not either because
+Render supplies it and `main.ts` listens on the validated `PORT` rather than a hardcoded 3000.
+`AFRICASTALKING_USERNAME` is prompted for next to the key on purpose: the username is what picks the API
+host, so a sandbox key under a live username is a 401 that reads like an outage.
+
+`STELLAR_FRIENDBOT_URL` is left unset deliberately: on Testnet the default is Stellar's own faucet, so new
+accounts are funded with nothing to configure.
+
 ## Documentation conventions
 
 Rules these docs and this repository's commit messages follow. They exist because a document that is
