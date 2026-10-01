@@ -928,12 +928,27 @@ and order (two rows in one millisecond are the only rows whose page order is the
 
 `render.yaml` at the repository root is a Render Blueprint: created once in a workspace (`New -> Blueprint`,
 pointed at this repository - the Blueprint Path is `render.yaml`, which is the default), it provisions the
-whole environment in one sync - a Postgres database, a Key Value instance, and the API built from the
-Dockerfile that is already here. A `main` push redeploys the API (`autoDeploy: true`); a change to the file
-is applied by re-syncing the Blueprint. Render builds and deploys on that push whether or not CI on
-that commit passed: the deploy's own gates are the image build and the migration the container runs as it
-starts, which is why the workflow is the check that is supposed to fail first rather than one Render
-consults.
+whole environment in one sync - a Postgres database, a Key Value instance, and the API, which Render builds
+and runs itself as a native Node service (`runtime: node`, `nodeVersion: 24`) rather than from the
+`Dockerfile`. A `main` push redeploys the API (`autoDeploy: true`); a change to the file is applied by
+re-syncing the Blueprint. Render builds and deploys on that push whether or not CI on that commit passed:
+the deploy's own gates are the build (`npm ci`, `prisma generate`, `nest build`) and the migration the
+instance runs as it starts, which is why the workflow is the check that is supposed to fail first rather
+than one Render consults.
+
+**The API is native, not an image, and the reason is where the migration lives.** The first revision of this
+file ran the API from the multi-stage `Dockerfile`, on the argument that the repository already built and ran
+that way. The argument wore out when the migration moved out of `preDeployCommand` and into the start
+command: the runtime stage then had to be told, one `COPY` at a time, which of the things `nest build`
+already knows about to carry beside a `--omit=dev` `node_modules` - `prisma/`, the migrations,
+`prisma7.config.ts`, and `dotenv`, a dev-only package that config imports - and a build that copies the wrong
+set does not fail at build time, it fails at *start*, behind `/bin/sh -c`, on an instance with no shell to
+look from. `runtime: node` keeps it a single build in one directory: `prisma` is a production dependency, so
+the same tree that compiles the app also migrates and boots it, and nothing is copied between stages. The
+`Dockerfile` is unchanged in what it does and is still what `docker-compose.yml` builds for local work; this
+changes only how Render builds and runs the API. What it trades away is the image as a reproducible
+artifact, which is why `nodeVersion` is pinned - the repository has no `engines` field, no `.nvmrc` and no
+`.node-version` for Render to read instead.
 
 ### What it costs, and what `free` takes away
 
@@ -958,8 +973,10 @@ Free is not a smaller version of the same thing, and four differences change how
   `maxShutdownDelaySeconds`, so the 30-second window this file used to set explicitly is now only Render's
   default - and a free instance may additionally be restarted at any time, or slept for 15 idle minutes. The
   API still asks for a clean shutdown (`app.enableShutdownHooks()` in `main.ts` closes the Prisma pool and the
-  queue producer), but a submission whose process is killed mid-flight is recovered by BullMQ's stalled-job
-  check rather than finished: the lock stops being renewed, the job returns to `waiting`, and `maxStalledCount`
+  queue producer - and the start command's `exec` is what makes the `SIGTERM` reach Node rather than a shell
+  that forked it), but a submission whose process is killed mid-flight is
+  recovered by BullMQ's stalled-job check rather than finished: the lock stops being renewed, the job returns
+  `waiting`, and `maxStalledCount`
   (1 by default) is how many times that may happen before it is failed instead. That recovery is the same
   mechanism the paid configuration relied on - what the field bought was the buffer that made it the rare case
   rather than the ordinary one, and this file no longer buys it.
@@ -1013,7 +1030,7 @@ staging: the frontend calls the real API and reads `/api/docs` while they do it.
 | `maxmemoryPolicy: noeviction` | BullMQ holds job state in keys, and Render's default (`allkeys-lru`) could evict a queued submission. Not a plan restriction - the setting is available on a free instance too (the policy table's third column asks "can memory fill up?", not "is this paid"), and the 25 MB is what makes it matter: with `noeviction` a full instance returns an error on a write, where an eviction drops a queued job silently. A rejected write is visible; an evicted job was not. |
 | `postgresMajorVersion: '16'` | The version `docker-compose.yml` runs, and therefore the one every migration and every e2e run in this repository was executed against. Left unset, Render would use its newest supported major. |
 | `healthCheckPath: /v1/health` | The liveness endpoint: no auth, no database call, no Redis call. It is the URL `HealthController`'s own docblock says a load balancer is pointed at. |
-| `dockerCommand` | `./node_modules/.bin/prisma migrate deploy && node dist/main.js` - the Dockerfile's `CMD` matched exactly, with the migration prefixed - runs through `/bin/sh -c`, so a failed migration means the app never starts, the instance never answers `healthCheckPath`, and the deploy fails with the previous version serving. It is a *start* command rather than a pre-deploy step because **Render's sync-time validator rejected `preDeployCommand` on a free web service** ("not supported for free tier services"), which falsified this row's earlier claim that the field survived the move to `free`: the published schema attaches no plan condition to `preDeployCommand`, and `/docs/free` does not list pre-deploy commands, and the field was still refused - plan gating is enforced when the Blueprint is synced and appears in neither document. Re-running it on every start (a free instance wakes by starting this command again) is safe, and that was measured rather than assumed: against a throwaway Postgres, the first run applied 7 migrations and exited 0, a second run and a third behind `sh -c` printed `No pending migrations to apply` and exited 0, and `_prisma_migrations` still held exactly 7 rows. That matches Prisma v7's own description - `migrate deploy` "Applies pending migrations" and "**Does not** reset the database" - and Prisma takes an advisory lock (10s timeout) so two instances cannot migrate at once. The Dockerfile copies `prisma/`, the migrations and `prisma7.config.ts` into the runtime stage for this one line (and `dotenv`, which that config imports); the CLI is addressed by its local path (`./node_modules/.bin/prisma`, not `npx --no-install prisma`) so no npm process sits between the migration's own output and the container log, which on a free instance (no shell) is the only diagnosis there is; no `--config` flag is needed because `prisma7.config.*` is the first candidate in the installed CLI's own config-file list. |
+| `startCommand` | `./node_modules/.bin/prisma migrate deploy && exec node dist/main.js` - `node dist/main.js` with the migration prefixed - runs through `/bin/sh -c`, so a failed migration means the app never starts, the instance never answers `healthCheckPath`, and the deploy fails with the previous version serving. It is a *start* command rather than a pre-deploy step because **Render's sync-time validator rejected `preDeployCommand` on a free web service** ("not supported for free tier services"), which falsified this row's earlier claim that the field survived the move to `free`: the published schema attaches no plan condition to `preDeployCommand`, and `/docs/free` does not list pre-deploy commands, and the field was still refused - plan gating is enforced when the Blueprint is synced and appears in neither document. Re-running it on every start (a free instance wakes by starting this command again) is safe, and that was measured rather than assumed: against a throwaway Postgres, the first run applied 7 migrations and exited 0, a second run and a third behind `sh -c` printed `No pending migrations to apply` and exited 0, and `_prisma_migrations` still held exactly 7 rows. That matches Prisma v7's own description - `migrate deploy` "Applies pending migrations" and "**Does not** reset the database" - and Prisma takes an advisory lock (10s timeout) so two instances cannot migrate at once. The schema, the migrations and `prisma7.config.ts` are in the repository for this one line (and `dotenv`, which that config imports, is installed with the rest by `npm ci --include=dev`); the CLI is addressed by its local path (`./node_modules/.bin/prisma`, not `npx --no-install prisma`) so no npm process sits between the migration's own output and the deploy log, which on a free instance (no shell) is the only diagnosis there is; no `--config` flag is needed because `prisma7.config.*` is the first candidate in the installed CLI's own config-file list. The `exec` in front of `node` is what puts the app where a `SIGTERM` lands: without it the signal reaches the `/bin/sh` that forked it, is not forwarded to the child, and `app.enableShutdownHooks()` never runs, which is the shutdown-side counterpart of the boot-side lesson that a start command should not leave a process between the platform and the app. The `Dockerfile`, which Render no longer uses but `docker-compose.yml` still builds, secures the same guarantee from `tini` as PID 1 instead of from `exec`, because that container's command is a shell chain of its own. |
 | No `maxShutdownDelaySeconds` | Removed on the same sync, for the same reason - a free web service refuses it ("not supported for free tier services"). The 30-second graceful-shutdown window still applies, but it is Render's default now rather than a value this file sets, and a free instance may be restarted at any time on top of that. An in-flight submission killed by a SIGKILL is still re-queued by BullMQ's stalled-job check (`maxStalledCount`, 1 by default) rather than lost; what is gone is the buffer that made that the rare case. Stated in the cost section above and in the known gaps below rather than dropped silently. |
 
 ### The values that are not in the file
@@ -1240,8 +1257,8 @@ blocks a step in `docs/build-sequence.md`.
   during the first incident.
 
 - **The Render blueprint has been checked against Render's schema and docs, and never synced to a
-  workspace.** `render.yaml` parses, and every key in it — `dockerCommand`, `maxmemoryPolicy:
-  noeviction`, `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
+  workspace.** `render.yaml` parses, and every key in it — `startCommand`, `nodeVersion`, `buildCommand`,
+  `maxmemoryPolicy: noeviction`, `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
   (`https://render.com/schema/render.yaml.json`). The three `plan: free` values are the `free` entry in
   that same file's `postgresPlan`, `keyValuePlan` and `serverPlan` enums, and the free-tier limits this
   file now opts into are Render's *documented* ones, read from `https://render.com/docs/free`,
@@ -1260,18 +1277,19 @@ blocks a step in `docs/build-sequence.md`.
   web service instance"), so "the schema attaches no plan condition to this field" was never evidence that a
   field survives `free` — and this bullet previously drew that conclusion from it. `/docs/free` does not list
   pre-deploy commands either: the refusal is enforced when the Blueprint is synced and appears in neither
-  document, so the sync is the only check that counts. The migration now runs as `dockerCommand` instead, and
+  document, so the sync is the only check that counts. The migration now runs as `startCommand` instead, and
   its idempotency is the one part of this that has been *measured* rather than read: against a throwaway
   local database on 2026-10-01 (Postgres 18.3, where the blueprint pins 16), the first run applied 7
   migrations and exited 0, a second run and a third behind `sh -c` printed `No pending migrations to apply`
   and exited 0, and `_prisma_migrations` still held exactly 7 rows. What remains Render's documented answer
   rather than this repository's observation is the failure path — that a failing `prisma migrate deploy` in
   the start command fails the deploy and leaves the previous version serving — and the same is true of the
-  startup-side uncertainty a sync will settle: a free web service is documented to accept `dockerCommand`
+  startup-side uncertainty a sync will settle: a free web service is documented to accept `startCommand`
   because every service has a start command, and that has not been exercised either. What has also been
-  observed is the image: the Dockerfile's runtime stage carries `prisma/`, the migrations, `prisma7.config.ts`
-  and `dotenv`, so `./node_modules/.bin/prisma migrate deploy` has a schema and a datasource to read instead of
-  dying on an unresolved import — and the installed CLI resolves that config by name, because
+  observed is the tree a native build leaves behind: `prisma/`, the migrations and `prisma7.config.ts` sit in
+  the repository beside the app, and `npm ci --include=dev` installs `dotenv`, so `./node_modules/.bin/prisma
+  migrate deploy` has a schema and a datasource to read instead of dying on an unresolved import — and the
+  installed CLI resolves that config by name, because
   `prisma7.config.*` is the first entry in its own candidate list, ahead of `prisma.config.*`. The environment
   the e2e suites run against is still `docker-compose.yml`'s Postgres and Redis on their own ports, and no API
   request in this repository has ever been served by the staging service. An earlier revision of this file
@@ -1279,12 +1297,14 @@ blocks a step in `docs/build-sequence.md`.
   is what going back costs — and $27.50/month would also buy back both fields above.
 
 - **A Render web service listens on `PORT`, and an empty log is Nest exiting before it wrote the reason down.**
-  Two things a staging deploy made concrete. `EXPOSE 3000` in the Dockerfile is image metadata and nothing
-  else: Render ignores it when choosing which port to scan, injects `PORT` (**10000** by default) into the
-  container, and requires the process to bind `0.0.0.0`. `main.ts` reads that `PORT`, so the port the app binds
-  and the port Render scans agree by construction — and the `render.yaml` comment that claimed Render derived
-  the port *from* `EXPOSE` was simply wrong, and has been corrected rather than left as a plausible-looking
-  falsehood. The silence is Nest's own default: `NestFactory.create` runs with `abortOnError: true`, which logs
+  Two things a staging deploy made concrete. Render injects `PORT` (**10000** by default) into the service and
+  requires the process to bind `0.0.0.0`, so nothing in the repository may decide that port - and an `EXPOSE
+  3000` in an image is image metadata and nothing else, which Render ignored when choosing which port to scan.
+  That distinction is now moot for the API, which runs natively with no image to carry an `EXPOSE`, but the
+  `render.yaml` comment that claimed Render derived the port *from* `EXPOSE` was simply wrong and has been
+  corrected rather than left as a plausible-looking falsehood. `main.ts` reads the injected `PORT`, so the port
+  the app binds and the port Render scans agree by construction. The silence is Nest's own default:
+  `NestFactory.create` runs with `abortOnError: true`, which logs
   an initialization error from inside `ExceptionsZone` and then calls `process.exit(1)` — and that log is
   written to `process.stdout`, which is a pipe under Render and therefore written asynchronously, so the exit
   can drop the one line that names the cause. `main.ts` now passes `abortOnError: false`, which makes Nest

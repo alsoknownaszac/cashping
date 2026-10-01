@@ -37,11 +37,11 @@
 
 databases:
   # The API's Postgres, on the private network only. Every DATABASE_URL this
-  # workspace hands out points at that private address, so the container and
+  # workspace hands out points at that private address, so the API service and
   # nothing else can reach it - `ipAllowList: []` below is what makes "nothing
   # else" a fact rather than a hope. The migration that used to run as a
-  # separate pre-deploy step now runs inside that same container (see
-  # `dockerCommand` below), so "the container" covers both.
+  # separate pre-deploy step now runs inside that same service (see
+  # `startCommand` below), so "the API" covers both.
   #
   # `postgresMajorVersion: '16'` states what docker-compose.yml runs, which is
   # what every migration and every e2e run in this repository was executed
@@ -109,17 +109,28 @@ services:
     maxmemoryPolicy: noeviction
     ipAllowList: []
 
-  # The API. Docker, because this repository already builds and runs that way
-  # (the multi-stage Dockerfile, `docker-compose.yml`); a native Node runtime
-  # would be a second build to keep in step with the first. The build context is
-  # this repository's root and `Dockerfile` is the default path there, which is
-  # where both files sit - no directory has to be configured for either.
+  # The API. Native Node, not Docker, and this is where the trade is argued
+  # because it is where it is made. The image's runtime stage had to be told, one
+  # `COPY` at a time, which of the things `nest build` already knows about must
+  # travel into a `--omit=dev` layer - `prisma/`, the migrations,
+  # `prisma7.config.ts`, and `dotenv`, a dev-only package that config imports -
+  # and a build that copies the wrong set fails at *start*, behind `/bin/sh -c`,
+  # on an instance with no shell to look from. A native runtime keeps it a single
+  # build in one directory: `prisma` is a production dependency, so the same tree
+  # that compiles the app also migrates and boots it, and nothing is copied
+  # between stages. `docker-compose.yml` still builds and runs the API locally;
+  # this changes only how Render builds and runs it.
   - type: web
     name: cashping-staging
-    runtime: docker
+    runtime: node
     branch: main
-    dockerfilePath: ./Dockerfile
     region: frankfurt
+    # Pinned because nothing else in the repository answers "which Node?": there
+    # is no `engines` field, no `.nvmrc` and no `.node-version`. 24 is the line
+    # the runtime image used (`node:24-alpine`) and the one development and every
+    # e2e run here executed against, so leaving Render's default in place would
+    # boot the API on a version no local run has exercised.
+    nodeVersion: 24
     # `plan: free`: 0.1 CPU and 512 MB, and - the part that changes how the
     # environment behaves - a Free web service is spun down after 15 minutes with
     # no inbound traffic and takes about a minute to wake again. While it is
@@ -127,7 +138,7 @@ services:
     # inside this process, so queued work waits for whatever request wakes it.
     # Free web services also get no shell (SSH or Dashboard) and no one-off jobs,
     # so an incident is diagnosed from the log and the API rather than from a
-    # shell in the container - worth knowing before the first one. A free
+    # shell on the instance - worth knowing before the first one. A free
     # instance also refuses `maxShutdownDelaySeconds` and `preDeployCommand`
     # (both noted below), which is why the 30-second graceful-shutdown window is
     # Render's default here rather than a value this file sets. `1c-2g` (paid)
@@ -147,15 +158,20 @@ services:
     # no auth, no database call, no Redis call. Its own docblock records that
     # this is the URL a health check is aimed at - this is that health check.
     healthCheckPath: /v1/health
-    # The container's start command, and it is `dockerCommand` rather than
-    # `startCommand` because this service is `runtime: docker`: the schema
-    # describes this field as "the command to run when starting the
-    # Docker-based service. If omitted, uses the CMD defined in the
-    # Dockerfile." (`startCommand` is the native-runtime equivalent.)
-    #
-    # It overrides that CMD - `node dist/main.js`, matched exactly - and
-    # prefixes one step to it: the migration, which used to be
-    # `preDeployCommand`. Render refused that field on a free web service
+    # The build: the dependencies, the generated Prisma client, then the compile.
+    # `--include=dev` is not optional. `NODE_ENV=production` (below) is in the
+    # build environment too, and npm omits dev dependencies when it is set, which
+    # would drop `@nestjs/cli`, `typescript` and `dotenv` before `nest build` or
+    # the start command ever ran. `prisma generate` has to precede the compile
+    # because the generated client lives under `src/` and is gitignored: it does
+    # not exist on a fresh clone, and `nest build` cannot compile the code that
+    # imports it. The CLI is addressed by its local path so that no npm process
+    # sits in front of it, the same reason the start command addresses it so.
+    buildCommand: npm ci --include=dev && ./node_modules/.bin/prisma generate && npm run build
+    # The start command. The service is `runtime: node`, so this is `startCommand`
+    # and not the container's `dockerCommand` it used to be - the string is the
+    # same `node dist/main.js` with one step prefixed to it: the migration, which
+    # used to be `preDeployCommand`. Render refused that field on a free web service
     # ("not supported for free tier services"), so the migration runs here
     # instead, in the instance that is starting. Render runs this string
     # through `/bin/sh -c`, so `&&` is a shell chain: if `migrate deploy` exits
@@ -164,16 +180,27 @@ services:
     # serving - the outcome the pre-deploy step gave, reached through the
     # health check instead of through a step that gates traffic.
     #
+    # The `exec` in front of `node` is what keeps the shell from outliving its
+    # use. A `/bin/sh` that *forked* the app would be the process Render signals,
+    # and it does not forward SIGTERM to that child - so `app.enableShutdownHooks()`
+    # in `main.ts`, which closes the Prisma pool and the queue producer, would
+    # never run and the instance would be SIGKILLed with its connections still
+    # open. `exec` replaces the shell with `node`, so the signal the platform
+    # sends lands on the app rather than on a shell that used to wrap it. The
+    # `Dockerfile` reaches the same place by a different route - an `ENTRYPOINT`
+    # of `tini` as PID 1 - which is what covers the `docker-compose.yml` service,
+    # where this file's start command is not the one that runs.
+    #
     # `DATABASE_URL` is this service's internal one, so the migration reaches
     # the database over the private network. The CLI is addressed by its local
     # path, `./node_modules/.bin/prisma`, rather than `npx --no-install prisma`:
     # both resolve to the version pinned in the lockfile (`prisma` is a
-    # production dependency, so the binary is in the runtime image), but `npx`
+    # production dependency, so the binary is installed at build time), but `npx`
     # puts a whole npm process in front of the migration, and a free instance
-    # offers no shell - the container log is the only diagnosis there is, so
+    # offers no shell - the deploy log is the only diagnosis there is, so
     # nothing is put between the migration's output and it. The schema, the
-    # migrations and the Prisma 7 config are copied into the runtime image for
-    # exactly this line - see the Dockerfile. No `--config` flag is needed:
+    # migrations and the Prisma 7 config are in the repository for exactly this
+    # line, beside the app they configure. No `--config` flag is needed:
     # `prisma7.config.*` is the *first* candidate in the installed CLI's own
     # config-file list, ahead of `prisma.config.*`.
     #
@@ -191,7 +218,7 @@ services:
     #
     # What it costs: the first request after a sleep now waits for the
     # migration check on top of the ~1-minute spin-up.
-    dockerCommand: ./node_modules/.bin/prisma migrate deploy && node dist/main.js
+    startCommand: ./node_modules/.bin/prisma migrate deploy && exec node dist/main.js
     # `maxShutdownDelaySeconds: 30` was here and is gone for the same reason:
     # a free web service refuses it ("not supported for free tier
     # services"). The 30-second window still applies - it is Render's default -
@@ -213,16 +240,14 @@ services:
 
       # `PORT` is deliberately not set, because Render owns it: every Render web
       # service must bind `0.0.0.0` and Render injects `PORT` into it - **10000**
-      # by default, changed only by setting this variable yourself. The
-      # Dockerfile's `EXPOSE 3000` does **not** feed that value: `EXPOSE` is only
-      # image metadata and Render ignores it when choosing the port to scan, so
-      # it says what the image may listen on, not what the deploy will. What
-      # actually listens is `main.ts` on the validated `PORT` (the `?? 3000` in
-      # `configuration.ts` is the laptop default and never applies here), so the
-      # port the app binds and the port Render scans agree because both are
-      # `PORT`. Bind 3000 on the belief that `EXPOSE` set the port and the deploy
-      # fails exactly one way: "Port scan timeout reached, no open HTTP ports
-      # detected".
+      # by default, changed only by setting this variable yourself. A native
+      # runtime has no image, so there is no `EXPOSE 3000` for anyone to mistake
+      # for this value; what listens is `main.ts` on the validated `PORT` (the
+      # `?? 3000` in `configuration.ts` is the laptop default and never applies
+      # here), so the port the app binds and the port Render scans agree because
+      # both are `PORT`. Bind 3000 instead - which the retired Dockerfile's
+      # `EXPOSE` once invited - and the deploy fails exactly one way: "Port scan
+      # timeout reached, no open HTTP ports detected".
 
       # --- Datastores --------------------------------------------------------
       # Internal connection strings: Render injects each datastore's
