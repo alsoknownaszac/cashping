@@ -6,6 +6,10 @@ import { type SessionUser } from '../../identity/token/token.service.js';
 import { type PrismaService } from '../../prisma/prisma.service.js';
 import { type BalanceResponseDto } from '../../wallet/dto/balance-response.dto.js';
 import { type BalancesService } from '../../wallet/balances/balances.service.js';
+import {
+  PAYMENT_HISTORY_DEFAULT_LIMIT,
+  PAYMENT_HISTORY_MAX_LIMIT,
+} from '../history/payment-history-query.js';
 import { type PaymentsQueueService } from '../jobs/payments-queue.service.js';
 import { type RecipientsService } from './recipients.service.js';
 import { PaymentsService } from './payments.service.js';
@@ -439,5 +443,325 @@ describe('the unique index underneath the idempotency claim', () => {
     const harnessed = harness({ insertError: other });
 
     await expect(create(harnessed)).rejects.toBe(other);
+  });
+});
+
+/**
+ * Step 30's two reads, with the database substituted: which rows are asked for, what a 404 means,
+ * and how a row becomes a response.
+ *
+ * The claims this step is graded on live in `test/payments-history.e2e-spec.ts` - thirty real rows,
+ * real Postgres, every filter and both page boundaries. What is pinned here is the part an e2e is a
+ * clumsy witness for: the *shape* of the query (the caller's id is in it, and the read asks for one
+ * row more than the page holds), that a filter which cannot be read never reaches the database, and
+ * that the two fields a list will not show are not even read.
+ */
+
+/** A `transactions` row, as the two reads select it. */
+interface HistoryRow {
+  id: string;
+  senderId: string;
+  recipientId: string;
+  status: TransactionStatus;
+  /** A decimal string: what `Amount.fromDatabase` accepts, and what the driver's `Decimal` reduces to. */
+  amount: string;
+  createdAt: Date;
+}
+
+/** The same row plus the two columns only the detail read selects. */
+interface DetailedRow extends HistoryRow {
+  failureReason: string | null;
+  stellarTxHash: string | null;
+}
+
+const PAYMENT_ID = '6d1f3c9e-4a11-4f6b-9d1e-2b3c4d5e6f70';
+const TX_HASH = 'e9da1c48bdfaeacd13eb05d1fff82eee4d61d77f0faa467c9d539955bf36ec0d';
+
+function historyRow(overrides: Partial<HistoryRow> = {}): HistoryRow {
+  return {
+    id: PAYMENT_ID,
+    senderId: SENDER.id,
+    recipientId: RECIPIENT_ID,
+    status: TransactionStatus.SUCCESSFUL,
+    amount: '123456789012.1234567',
+    createdAt: CREATED_AT,
+    ...overrides,
+  };
+}
+
+function detailedRow(overrides: Partial<DetailedRow> = {}): DetailedRow {
+  return { ...historyRow(), failureReason: null, stellarTxHash: null, ...overrides };
+}
+
+/** The columns the list reads, in one place so the "not even read" assertion is one line. */
+const LIST_SELECT = {
+  id: true,
+  senderId: true,
+  recipientId: true,
+  status: true,
+  amount: true,
+  createdAt: true,
+} as const;
+
+/** What the detail read adds. */
+const DETAIL_SELECT = { ...LIST_SELECT, failureReason: true, stellarTxHash: true } as const;
+
+interface ReadHarnessOptions {
+  /** What `findFirst` answers - a detail row, or `null` for "not this caller's". */
+  row?: DetailedRow | null;
+  /** What `findMany` answers, in the order the database would have returned it. */
+  rows?: readonly HistoryRow[];
+}
+
+/**
+ * What a read was asked for, declared so a test can read the arguments back typed.
+ *
+ * Deliberately loose (`where?: unknown`): the assertions here are about the *shape* a caller chose
+ * (`take` one past the page, `select` without the two list-omitted columns), and a typed `where`
+ * would make the spec restate Prisma's own types to say nothing.
+ */
+interface ReadArgs {
+  where?: unknown;
+  orderBy?: unknown;
+  take?: number;
+  select?: Record<string, boolean>;
+}
+
+/**
+ * The two reads, with everything but Prisma real, and the wallet, the recipient check and the queue
+ * as spies that nothing should reach: a read of a row this API already wrote must not spend an
+ * allowance, ask Horizon anything or enqueue a job.
+ */
+function readHarness(options: ReadHarnessOptions = {}) {
+  const findOneArgs: ReadArgs[] = [];
+  const listArgs: ReadArgs[] = [];
+
+  const findFirst = vi.fn(async (args: ReadArgs) => {
+    findOneArgs.push(args);
+
+    return options.row ?? null;
+  });
+
+  const findMany = vi.fn(async (args: ReadArgs) => {
+    listArgs.push(args);
+
+    return options.rows ?? [];
+  });
+
+  const spies = {
+    balanceFor: vi.fn(),
+    assertPayableRecipient: vi.fn(),
+    enqueueSubmission: vi.fn(),
+  };
+
+  return {
+    findFirst,
+    findMany,
+    findOneArgs,
+    listArgs,
+    spies,
+    service: new PaymentsService(
+      { transaction: { findFirst, findMany } } as unknown as PrismaService,
+      { balanceFor: spies.balanceFor } as unknown as BalancesService,
+      { assertPayableRecipient: spies.assertPayableRecipient } as unknown as RecipientsService,
+      { enqueueSubmission: spies.enqueueSubmission } as unknown as PaymentsQueueService,
+    ),
+  };
+}
+
+describe('one payment, by id', () => {
+  it('asks for the id *and* the caller, in one query', async () => {
+    const harnessed = readHarness({ row: detailedRow() });
+
+    await harnessed.service.findOne(SENDER.id, PAYMENT_ID);
+
+    // The caller in the predicate is the whole of the access control: a row two other people are
+    // party to matches neither branch, so "not mine" and "does not exist" are one answer. Asserting
+    // the arguments rather than only the outcome is what keeps a later refactor from splitting this
+    // into "fetch, then compare", where the comparison can be forgotten.
+    expect(harnessed.findFirst).toHaveBeenCalledWith({
+      where: { id: PAYMENT_ID, OR: [{ senderId: SENDER.id }, { recipientId: SENDER.id }] },
+      select: DETAIL_SELECT,
+    });
+  });
+
+  it('answers 404 for a payment that is not the caller\'s, exactly as for one that does not exist', async () => {
+    const harnessed = readHarness({ row: null });
+
+    const failure = await failureOf(harnessed.service.findOne(SENDER.id, PAYMENT_ID));
+
+    expect(failure.status).toBe(404);
+    expect(failure.message).toContain('No payment with that id involves this account');
+  });
+
+  it('reads the amount back from the row, so the response cannot disagree with the column', async () => {
+    const harnessed = readHarness({ row: detailedRow({ amount: '0.0000001' }) });
+
+    expect((await harnessed.service.findOne(SENDER.id, PAYMENT_ID)).amount).toBe('0.0000001');
+  });
+
+  it('says `sent` to the sender and `received` to the recipient, from the same row', async () => {
+    const row = detailedRow();
+
+    expect((await readHarness({ row }).service.findOne(SENDER.id, PAYMENT_ID)).direction).toBe(
+      'sent',
+    );
+    expect(
+      (await readHarness({ row }).service.findOne(RECIPIENT_ID, PAYMENT_ID)).direction,
+    ).toBe('received');
+  });
+
+  it('keeps a missing failure reason as null, and hands a real one back unchanged', async () => {
+    const clean = readHarness({ row: detailedRow() });
+    const failed = readHarness({
+      row: detailedRow({
+        status: TransactionStatus.FAILED,
+        failureReason: 'landed-unsuccessful:tx_failed',
+        stellarTxHash: TX_HASH,
+      }),
+    });
+
+    expect((await clean.service.findOne(SENDER.id, PAYMENT_ID)).failureReason).toBeNull();
+
+    const response = await failed.service.findOne(SENDER.id, PAYMENT_ID);
+
+    // Verbatim: this layer does not turn a machine code into a sentence, and the hash is present on
+    // a FAILED row because a transaction a ledger closed is still a transaction.
+    expect(response.failureReason).toBe('landed-unsuccessful:tx_failed');
+    expect(response.stellarTxHash).toBe(TX_HASH);
+  });
+
+  it('reaches no wallet, no allowance and no queue', async () => {
+    const harnessed = readHarness({ row: detailedRow() });
+
+    await harnessed.service.findOne(SENDER.id, PAYMENT_ID);
+
+    expect(harnessed.spies.balanceFor).not.toHaveBeenCalled();
+    expect(harnessed.spies.assertPayableRecipient).not.toHaveBeenCalled();
+    expect(harnessed.spies.enqueueSubmission).not.toHaveBeenCalled();
+  });
+});
+
+describe('a page of history', () => {
+  it('asks for one row more than the page holds, newest first', async () => {
+    const harnessed = readHarness();
+
+    const page = await harnessed.service.history(SENDER.id, {});
+
+    expect(harnessed.findMany).toHaveBeenCalledWith({
+      where: { OR: [{ senderId: SENDER.id }, { recipientId: SENDER.id }] },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: PAYMENT_HISTORY_DEFAULT_LIMIT + 1,
+      select: LIST_SELECT,
+    });
+    expect(page).toEqual({ items: [], hasMore: false });
+  });
+
+  it('does not even read the two fields a page will not show', async () => {
+    const harnessed = readHarness();
+
+    await harnessed.service.history(SENDER.id, {});
+
+    const select = harnessed.listArgs[0]?.select ?? {};
+
+    // The omission is the disclosure decision `PaymentListItemDto` records, enforced where it can
+    // be: a column that is never selected cannot reach a page through a later mapper change.
+    expect(select).not.toHaveProperty('failureReason');
+    expect(select).not.toHaveProperty('stellarTxHash');
+    expect(select).toHaveProperty('senderId');
+  });
+
+  it('says there is more when the extra row came back, and drops it from the page', async () => {
+    const rows = ['a', 'b', 'c'].map((id) => historyRow({ id }));
+    const harnessed = readHarness({ rows });
+
+    const page = await harnessed.service.history(SENDER.id, { limit: '2' });
+
+    expect(page.items.map((item) => item.id)).toEqual(['a', 'b']);
+    expect(page.hasMore).toBe(true);
+  });
+
+  it('says there is no more when the read ended exactly at the limit', async () => {
+    const rows = ['a', 'b', 'c'].map((id) => historyRow({ id }));
+    const harnessed = readHarness({ rows });
+
+    const page = await harnessed.service.history(SENDER.id, { limit: '3' });
+
+    expect(page.items.map((item) => item.id)).toEqual(['a', 'b', 'c']);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it('maps each row to the caller\'s own side of it', async () => {
+    const harnessed = readHarness({
+      rows: [
+        historyRow({ id: 'sent', senderId: SENDER.id, recipientId: RECIPIENT_ID }),
+        historyRow({ id: 'received', senderId: RECIPIENT_ID, recipientId: SENDER.id }),
+      ],
+    });
+
+    const page = await harnessed.service.history(SENDER.id, {});
+
+    expect(page.items).toEqual([
+      {
+        id: 'sent',
+        status: TransactionStatus.SUCCESSFUL,
+        amount: '123456789012.1234567',
+        direction: 'sent',
+        recipientId: RECIPIENT_ID,
+        createdAt: CREATED_AT.toISOString(),
+      },
+      {
+        id: 'received',
+        status: TransactionStatus.SUCCESSFUL,
+        amount: '123456789012.1234567',
+        direction: 'received',
+        recipientId: SENDER.id,
+        createdAt: CREATED_AT.toISOString(),
+      },
+    ]);
+  });
+
+  it('refuses a filter it cannot read, before the database is touched', async () => {
+    const harnessed = readHarness();
+
+    const failure = await failureOf(harnessed.service.history(SENDER.id, { direction: 'sideways' }));
+
+    expect(failure.status).toBe(400);
+    expect(failure.message).toContain('sent, received, both');
+    expect(harnessed.findMany).not.toHaveBeenCalled();
+  });
+
+  it('passes every filter through as one clause each, and never widens the scope', async () => {
+    const harnessed = readHarness();
+
+    await harnessed.service.history(SENDER.id, {
+      direction: 'received',
+      status: 'FAILED',
+      from: '2026-09-01T00:00:00.000Z',
+      to: '2026-09-30T23:59:59.999Z',
+      limit: '5',
+    });
+
+    expect(harnessed.findMany).toHaveBeenCalledWith({
+      where: {
+        recipientId: SENDER.id,
+        status: 'FAILED',
+        createdAt: {
+          gte: new Date('2026-09-01T00:00:00.000Z'),
+          lte: new Date('2026-09-30T23:59:59.999Z'),
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 6,
+      select: LIST_SELECT,
+    });
+  });
+
+  it('clamps a page size above the cap instead of refusing it', async () => {
+    const harnessed = readHarness();
+
+    await harnessed.service.history(SENDER.id, { limit: '1000' });
+
+    expect(harnessed.listArgs[0]?.take).toBe(PAYMENT_HISTORY_MAX_LIMIT + 1);
   });
 });

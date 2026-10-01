@@ -782,6 +782,148 @@ records the run
 that was made and what it showed: the hashes, the ledgers, and the balances read back from Horizon by
 something other than this codebase.
 
+## Payment history (Step 30)
+
+`GET /v1/payments` answers a filtered page of the caller's own history; `GET /v1/payments/:id` answers
+one payment the caller is a party to. Both are `JwtAuthGuard`ed, both delegate to `PaymentsService`, and
+both read the *meaning* of a request from one module, `src/payments/history/payment-history-query.ts` -
+the same split Step 21's `classifyRecipientQuery` makes.
+
+| File | What it is |
+| --- | --- |
+| `src/payments/history/payment-history-query.ts` | The vocabulary and the `WHERE` clause: `parsePaymentHistoryQuery`, `membershipWhere`, `buildPaymentHistoryWhere`, `PAYMENT_HISTORY_ORDER`, `directionFor`, `takePage`, and the constants the two DTOs quote. |
+| `src/payments/dto/list-payments.dto.ts` | The query as Swagger documents it. Every member is a `string` here on purpose: the rules live in the module, including the one that *clamps* rather than refuses. |
+| `src/payments/dto/payment-list-response.dto.ts` | One page: `items` (six fields per row) and `hasMore`. |
+| `src/payments/dto/payment-response.dto.ts` | One payment: the same six fields plus `failureReason` and `stellarTxHash`. |
+| `src/payments/services/payments.service.ts` | `history()` and `findOne()`: the two reads, the two status codes, and no filter logic of their own. |
+| `src/payments/controllers/payments.controller.ts` | The two routes, and `@Get()` declared before `@Get(':id')`. |
+
+### Membership is the access control, and it is not a parameter
+
+Both reads call the same predicate, `membershipWhere(userId, direction)`, and the caller's id is the
+*first* argument rather than a value a client can send. A payment is visible to the two accounts on the
+row - the sender and the recipient - which is what makes one payment appear once on each side of a
+transaction, and it is what `GET /v1/payments/:id` uses with `direction: 'both'`.
+
+The consequence for the detail route is the interesting part: **a payment that belongs to two other
+people answers exactly what a made-up id answers.** There is no second check and no `403`, because there
+is nothing to check: a stranger's id reaching `membershipWhere` matches no row, the service sees `null`,
+and a `null` row is a 404 either way. This endpoint is therefore not an oracle for which payment ids
+exist, and the two answers differ only in `path` and `timestamp` - which the e2e asserts by comparing the
+five fields that matter (`message`, `error`, `statusCode`) individually and the key *set* of the whole
+body, rather than by comparing responses that were never going to be byte-identical.
+
+An id that is not a UUID is a **400** before any row is looked for (`new ParseUUIDPipe()` on the
+parameter), because "fix the request" and "stop looking" are different instructions - the same choice
+`RecipientsController.confirm` records for account ids.
+
+| Situation | `GET /v1/payments` | `GET /v1/payments/:id` |
+| --- | --- | --- |
+| Matched | `200`, a page of `items` plus `hasMore` | `200`, the payment |
+| Nothing matched | `200`, `items: []` - an empty page, not a 404 | `404` - one payment was asked for by name, and `GET`ing a list is how a client asks "do I have any" |
+| A filter could not be read | `400`, naming the parameter and the values that work | - |
+| `id` is not a UUID | - | `400`, before any row is read |
+| No or invalid access token | `401` | `401` |
+| Account suspended | `403` | `403` |
+
+The asymmetry on the second row is the route, not the scope: a list that matched nothing is a history
+with nothing in it, and an id that matched nothing at *this* scope is a payment the caller may not see.
+
+### What the filters accept
+
+| Parameter | Values | Default |
+| --- | --- | --- |
+| `direction` | `sent`, `received`, `both` | `both` |
+| `status` | `PENDING`, `PROCESSING`, `SUCCESSFUL`, `FAILED` | no filter |
+| `from` / `to` | ISO-8601 instants, both bounds **inclusive** on `createdAt` | no bound |
+| `limit` | a whole number of payments, clamped to `[1, 50]` | `20` |
+
+Filters are spread *on top of* membership, never beside it, so no combination can widen what the caller
+is allowed to see - a filter can only ever narrow it.
+
+`?direction=` and `?status=` sent **empty** mean "not provided": "no filter" is a real request, and an
+always-appended key with nothing in it is how a client spells it. `?from=`, `?to=` and `?limit=` are
+**refused** when empty, because each names a specific value and the empty string is not one. That
+asymmetry is deliberate and is asserted rather than left to be inferred from the code.
+
+A date-only `from`/`to` is midnight UTC of that day and nothing else, so `to=2026-09-30` includes
+nothing that happened during the 30th. A client that wants the whole day passes
+`to=2026-09-30T23:59:59.999Z`, because silently widening a bound to the end of its day would be a hidden
+`+23:59:59.999` inside a filter a person is reading numbers out of. `2026-02-31` is refused - it is not
+an instant, and `new Date()` would have quietly rolled it into March.
+
+### A cap, where Step 21 refused
+
+Asking for `limit=1000` is answered rather than refused: it is the cap - fifty rows, or the caller's
+whole history if it is shorter - with `hasMore` saying whether there is another page. That is the one
+place this endpoint deliberately differs from the directory search, and the difference is who is paying
+for the query: Step 21's `limit` prices *sweeping other people's handles*, so silently returning twenty
+to someone who asked for a thousand would hide a refusal from a sweep. Here the caller is reading their
+own money: there is nothing to protect, and a page is a page. A whole number out of range is clamped, so
+`limit=0` becomes one row - the smallest page that is still a page - while a value that is not a whole
+number at all (`-1`, `1.5`, `twenty`, empty) is a 400 naming the parameter, because a page size that is
+not a number is a typo and answering a typo with a default hides it.
+
+The bound lives in the module (`PAYMENT_HISTORY_MAX_LIMIT`, `PAYMENT_HISTORY_DEFAULT_LIMIT`) and *not*
+as `@Max()` on the DTO, so there is one statement of it rather than two that are free to drift: a pipe
+that refused a `limit` the code is written to clamp would be a second, disagreeing answer.
+
+### `hasMore`, and the order a page needs
+
+`hasMore` comes from reading `limit + 1` rows and discarding the extra one, not from a second `count()`.
+A count is a different query at a different moment, so it can disagree with the page the client is
+actually holding; one extra row cannot. `items.length === limit && hasMore` is therefore exactly "there
+are more, ask for a bigger page", and the e2e asserts both halves of that seam at the default page size
+against thirty real rows.
+
+The order is `createdAt` descending **with the id as a tiebreak** (`PAYMENT_HISTORY_ORDER`), and the
+tiebreak is not decoration: two rows written in the same millisecond order arbitrarily without it, and a
+page boundary drawn on an unstable order can show a client the same payment twice while hiding another
+one entirely. Thirty rows an hour apart cannot tell "newest first" from "newest first, ties broken", so
+the e2e carries a pair written at the same instant - the two control payments between the other two
+accounts. Read from the stranger's side that page is two rows with one `createdAt` and no chronology to
+sort them by, and the assertions are that the order is `id` descending, that each row is on its own
+side (`sent`, `received`), and that a second request returns the same order.
+
+### Six fields in a list, eight for one payment
+
+`PaymentListItemDto` carries `id`, `status`, `amount`, `direction`, `recipientId`, `createdAt` - the
+fields a list sorts and renders. `failureReason` and `stellarTxHash` are on `PaymentResponseDto` only,
+and that is a disclosure decision as much as a size one: `failureReason` is a raw machine code
+(`landed-unsuccessful:tx_failed`), never Horizon's prose, and the fewer rows that carry one the fewer
+places it can be rendered as a sentence somebody wrote for a person. The e2e asserts the absence with
+`toHaveProperty`/`Object.keys` rather than by trusting the mapper.
+
+`direction` is derived per caller (`directionFor`) from the row, not from the query: the same payment is
+`sent` to its sender and `received` to its recipient, both reach the detail route with the same id, and
+the id is the only thing the client knows.
+
+### Running the proofs
+
+```bash
+npm test                                             # 841 tests (47 files) as of Step 30
+npm run test:e2e test/payments-history.e2e-spec.ts   # 25 tests: real Postgres, real Redis
+npm run lint                                         # oxlint, then lint:money, then lint:status
+```
+
+The unit half is `payment-history-query.spec.ts` (71 tests) and it drives the *parser* exhaustively -
+every value a parameter accepts, every empty string, both ends of the clamp, a reversed range, `2026-02-31`
+- because a filter's interesting half is the reading of what a client sent, and that half needs no
+database. `payments.service.spec.ts` then pins the two reads against a fake Prisma client: the exact
+`where`, the `limit + 1` read, and that a missing row is a 404 while a filter the module refused is a
+400.
+
+The e2e is the audit item - "against real data, not just a small fixture that happens to pass" - and it
+is built to make a small fixture impossible: **thirty rows, one per hour from 2026-06-01T00:00Z**, written
+straight into `transactions` through the Step 29 state machine (so each one is a real `PROCESSING` or
+`SUCCESSFUL` or `FAILED` row with a real envelope, not a status written by hand), plus a **control pair**
+at `2026-06-01T10:00Z` belonging to two other accounts - one each way, both at the same instant as the
+caller's tenth row. Thirty is more than one page, which is what makes the seam testable: the twentieth
+row, the page that must not claim to be the whole answer, and the `from`/`to` bound placed exactly on a
+row's `createdAt`. The control pair is both assertions at once: membership (it is invisible in every page
+and filter, its detail request 404s for everyone else, and each of its two parties reads its own side)
+and order (two rows in one millisecond are the only rows whose page order is the tiebreak itself).
+
 ## Documentation conventions
 
 Rules these docs and this repository's commit messages follow. They exist because a document that is
@@ -795,8 +937,9 @@ right when it is written and quietly wrong later is worse than one that never cl
   place: the Step 23 audit line in `docs/build-sequence.md` carries both `121 files, 0 violations as
   of Step 23` and `131 files, 0 violations as of Step 25`, because the older number is evidence about
   a smaller tree, not a mistake to be corrected. Re-measured again at Step 27: **148 files scanned, 0
-  violations as of Step 27**, where the status rule prints a finer line of its own - `158 files scanned, 3
-  status writes in the sanctioned writer, 0 violations` - because for that rule "nothing was found" and "nothing was read"
+  violations as of Step 27**; and again at Step 30: **164 files scanned, 0 violations as of Step 30**,
+  where the status rule prints a finer line of its own - `164 files scanned, 3 status writes in the
+  sanctioned writer, 0 violations` - because for that rule "nothing was found" and "nothing was read"
   have to be different sentences.
 - **A heading that names a step does not label the counts inside it.** `## Money precision and the
   money rule (Step 23)` says when the *feature* landed; it says nothing about when the *number* under
@@ -953,9 +1096,20 @@ blocks a step in `docs/build-sequence.md`.
 - **A lost claim degrades a retry from "here is your payment" to a 409.** If Redis loses the key
   (flush, eviction, expiry, a deploy that never wrote it) and the client retries, the database
   refuses the second insert and `PaymentsService` answers 409 with "this Idempotency-Key already
-  created a payment" - correct, but not the *original body*. The client can recover the payment by
-  listing its history, which does not exist yet: `GET /v1/payments` is Step 30. Until then that
-  message is the whole recovery path, which is why it names the key.
+  created a payment" - correct, but not the *original body*. Since Step 30 the client can recover the
+  payment itself: it will be the newest row that account is a party to in `GET /v1/payments`. What
+  does *not* exist is a lookup by key - no route takes an `Idempotency-Key` as a filter - so recovery
+  means recognising your own payment by its amount and time, which is why the 409 still names the key.
+- **History pages by time window, not by cursor.** `GET /v1/payments` takes `limit` and no `offset` or
+  cursor, so paging deeper than one page means narrowing `to` to the `createdAt` of the last row seen
+  and de-duplicating the boundary row yourself: that row is the newest of the next page and the oldest
+  of the previous one. `hasMore` says a page was cut short; it does not say what to ask for next. The
+  order is total (`createdAt` desc, then id), which is what makes the boundary safe for rows written in
+  the same millisecond - but the id tiebreak is not exposed as a value a client could pass back, so a
+  single millisecond holding more than `limit` rows cannot be crossed by a window alone. There is also
+  no `total`: a client cannot render "3 of 47", and that is deliberate rather than missing, because a
+  count is a second query that can disagree with the page in hand. A cursor is the fix if a client ever
+  needs one; the request a wallet client actually makes ("my newest twenty") is answered exactly.
 - **Nothing caps a single payment's size.** `numeric(20, 7)` bounds it at 13 integer digits, and
   `Amount.fromString` refuses anything wider with a 400 (a wider value reaches Postgres as
   `numeric field overflow`, i.e. a 500 for a bad request), but there is no *product* limit - no

@@ -12,7 +12,21 @@ import { type SessionUser } from '../../identity/token/token.service.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { BalancesService } from '../../wallet/balances/balances.service.js';
 import { type CreatePaymentDto } from '../dto/create-payment.dto.js';
+import { type ListPaymentsQueryDto } from '../dto/list-payments.dto.js';
 import { PaymentCreatedResponseDto } from '../dto/payment-created-response.dto.js';
+import { PaymentListItemDto, PaymentListResponseDto } from '../dto/payment-list-response.dto.js';
+import { PaymentResponseDto } from '../dto/payment-response.dto.js';
+import {
+  InvalidHistoryQueryError,
+  PAYMENT_HISTORY_ORDER,
+  buildPaymentHistoryWhere,
+  directionFor,
+  invalidHistoryQueryMessage,
+  membershipWhere,
+  parsePaymentHistoryQuery,
+  takePage,
+  type PaymentHistoryQuery,
+} from '../history/payment-history-query.js';
 import { PaymentsQueueService } from '../jobs/payments-queue.service.js';
 import { RecipientsService } from './recipients.service.js';
 
@@ -49,7 +63,63 @@ interface CreatedTransaction {
 }
 
 /**
- * Payment creation (Step 25): `POST /v1/payments`, up to the moment the row exists.
+ * What a history page reads.
+ *
+ * Named here for the same reason `RecipientsService` names its `SEARCH_COLUMNS`: what a list
+ * discloses is a list in one place rather than a habit spread over two queries, and the *absence*
+ * of `failureReason` and `stellarTxHash` is then something a reviewer can see rather than assume.
+ *
+ * `senderId` is read and never rendered. It is what `directionFor` needs to answer "sent or
+ * received" for the caller, and on a row the caller sent it is the caller's own id - so it is not
+ * a disclosure, it is the field the answer is derived from.
+ */
+const HISTORY_COLUMNS = {
+  id: true,
+  senderId: true,
+  recipientId: true,
+  status: true,
+  amount: true,
+  createdAt: true,
+} as const;
+
+/** What the detail read adds: the two fields worth reading one payment for. See `PaymentResponseDto`. */
+const DETAIL_COLUMNS = {
+  ...HISTORY_COLUMNS,
+  failureReason: true,
+  stellarTxHash: true,
+} as const;
+
+/**
+ * One history row, as much of it as a response needs.
+ *
+ * `amount` is typed structurally (`toString`) rather than as Prisma's `Decimal`, the same way
+ * `CreatedTransaction` types it: this file reads the column back, and how the driver spells a
+ * `numeric` is `common/money`'s business, not this module's.
+ */
+interface HistoryTransaction {
+  readonly id: string;
+  readonly senderId: string;
+  readonly recipientId: string;
+  readonly status: TransactionStatus;
+  readonly amount: { toString(): string };
+  readonly createdAt: Date;
+}
+
+/** A history row plus the two fields only `GET /v1/payments/:id` reads. */
+interface DetailedTransaction extends HistoryTransaction {
+  readonly failureReason: string | null;
+  readonly stellarTxHash: string | null;
+}
+
+/**
+ * Payments over HTTP: creation (Step 25) and history (Step 30).
+ *
+ * `POST /v1/payments` runs up to the moment the row exists - written, reserved against the sender,
+ * queued for submission. The two reads answer about rows that already do: one payment to the
+ * caller who is a party to it, and a filtered page of the caller's own history. They share this
+ * file because they share the row and its vocabulary, and they share nothing else - a read touches
+ * no wallet, no queue and no network, and both of them delegate what a caller may *see* to
+ * `history/payment-history-query.ts` rather than deciding it here.
  *
  * ## What this step is responsible for, and what it is not
  *
@@ -214,6 +284,77 @@ export class PaymentsService {
       amount: Amount.fromDatabase(created.amount).toString(),
       recipientId: recipient.id,
       createdAt: created.createdAt.toISOString(),
+    };
+  }
+
+  /**
+   * `GET /v1/payments/:id` (Step 30): one payment, if the caller is a party to it.
+   *
+   * A single `findFirst` whose predicate *is* the access control, rather than a `findUnique`
+   * followed by a comparison. That is the decision, not a style: the caller's id is part of the
+   * query, so "this id belongs to two other people" and "no row has this id" are one row-less
+   * answer and one 404 - which keeps this endpoint from becoming an oracle for which payment ids
+   * exist (the same rule `RecipientsController`'s 404 records for account ids). Split into
+   * "fetch, then check" it would be the same answer written twice, with a window in between for
+   * the second half to be forgotten.
+   *
+   * Nothing else happens here. No wallet is read, no allowance is spent, Horizon is not asked: this
+   * answers about a row this API itself wrote, so it cannot cost money or reach the network.
+   */
+  async findOne(userId: string, id: string): Promise<PaymentResponseDto> {
+    const row: DetailedTransaction | null = await this.prisma.transaction.findFirst({
+      where: { id, ...membershipWhere(userId, 'both') },
+      select: DETAIL_COLUMNS,
+    });
+
+    if (row === null) {
+      throw new NotFoundException(
+        'No payment with that id involves this account. Check the id, or list your payments.',
+      );
+    }
+
+    return {
+      id: row.id,
+      status: row.status,
+      // Re-read from the row, as `create` does: the response then cannot disagree with the column.
+      amount: Amount.fromDatabase(row.amount).toString(),
+      direction: directionFor(row, userId),
+      recipientId: row.recipientId,
+      createdAt: row.createdAt.toISOString(),
+      // `null` stays `null` rather than being dropped, so a client can switch on presence.
+      failureReason: row.failureReason,
+      stellarTxHash: row.stellarTxHash,
+    };
+  }
+
+  /**
+   * `GET /v1/payments` (Step 30): one filtered page of the caller's history, newest first.
+   *
+   * The query is parsed before the database is touched, so a bad `direction`, an unreadable date or
+   * an inverted range costs nothing and names the parameter it was about. What is left is one
+   * indexed read of `limit + 1` rows and a `slice`, which is where `hasMore` comes from: the page
+   * and its "is there more" question are the same read, so they cannot disagree - where a second
+   * `count()` is a different query at a different moment.
+   *
+   * The scope is membership (`buildPaymentHistoryWhere`), so a filter can only narrow what the
+   * caller may see and can never widen it - there is no parameter that names whose payments to
+   * read, because the answer is always "the caller's".
+   */
+  async history(userId: string, dto: ListPaymentsQueryDto): Promise<PaymentListResponseDto> {
+    const query = readHistoryQuery(dto);
+
+    const rows: HistoryTransaction[] = await this.prisma.transaction.findMany({
+      where: buildPaymentHistoryWhere(userId, query),
+      orderBy: PAYMENT_HISTORY_ORDER,
+      take: query.limit + 1,
+      select: HISTORY_COLUMNS,
+    });
+
+    const page = takePage(rows, query.limit);
+
+    return {
+      items: page.items.map((row) => toListItem(row, userId)),
+      hasMore: page.hasMore,
     };
   }
 
@@ -385,4 +526,43 @@ function asKeyReuse(error: unknown, idempotencyKey: string): Error {
   }
 
   return error as Error;
+}
+
+/**
+ * The history query as the module reads it, with its refusal turned into the 400 it is at the edge.
+ *
+ * The same two lines `RecipientsService.classify` writes for `UnsearchableQueryError`, for the same
+ * reason: the module states the fact about the input, and only the service knows that over HTTP the
+ * fact is a 400 carrying a sentence naming the parameter. Nothing else can come out of the parse,
+ * which is why there is no second `instanceof` here.
+ */
+function readHistoryQuery(dto: ListPaymentsQueryDto): PaymentHistoryQuery {
+  try {
+    return parsePaymentHistoryQuery(dto);
+  } catch (error) {
+    if (error instanceof InvalidHistoryQueryError) {
+      throw new BadRequestException(invalidHistoryQueryMessage(error.problem));
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * A row, as one page of history spells it.
+ *
+ * The amount goes through `Amount.fromDatabase(...).toString()` rather than `row.amount.toString()`
+ * directly, which is the same round trip `create`'s response makes: `numeric(20, 7)` comes back as
+ * the driver's `Decimal`, and how that becomes text on the wire is `common/money`'s decision - the
+ * one place a 7-decimal amount is guaranteed not to have been through a JS `number`.
+ */
+function toListItem(row: HistoryTransaction, userId: string): PaymentListItemDto {
+  return {
+    id: row.id,
+    status: row.status,
+    amount: Amount.fromDatabase(row.amount).toString(),
+    direction: directionFor(row, userId),
+    recipientId: row.recipientId,
+    createdAt: row.createdAt.toISOString(),
+  };
 }

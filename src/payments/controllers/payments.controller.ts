@@ -1,10 +1,14 @@
 import {
   Body,
   Controller,
+  Get,
   Headers,
   HttpCode,
   HttpStatus,
+  Param,
+  ParseUUIDPipe,
   Post,
+  Query,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
@@ -12,7 +16,9 @@ import {
   ApiAcceptedResponse,
   ApiBearerAuth,
   ApiHeader,
+  ApiOkResponse,
   ApiOperation,
+  ApiParam,
   ApiTags,
 } from '@nestjs/swagger';
 import { ApiErrorResponses } from '../../common/http/swagger.js';
@@ -25,11 +31,30 @@ import { CurrentUser } from '../../identity/jwt/current-user.decorator.js';
 import { JwtAuthGuard } from '../../identity/jwt/jwt-auth.guard.js';
 import { type SessionUser } from '../../identity/token/token.service.js';
 import { CreatePaymentDto } from '../dto/create-payment.dto.js';
+import { ListPaymentsQueryDto } from '../dto/list-payments.dto.js';
 import { PaymentCreatedResponseDto } from '../dto/payment-created-response.dto.js';
+import { PaymentListResponseDto } from '../dto/payment-list-response.dto.js';
+import { PaymentResponseDto } from '../dto/payment-response.dto.js';
 import { PaymentsService } from '../services/payments.service.js';
 
 /**
- * `POST /v1/payments` (Step 25): create a payment. *Not* send one.
+ * Payments over HTTP: `POST /v1/payments` (Step 25) and the two reads (Step 30).
+ *
+ * `POST /v1/payments` *creates* a payment. *Not* sends one.
+ *
+ * ## The two reads, and the reason `@Get()` is declared before `@Get(':id')`
+ *
+ * `GET /v1/payments/:id` answers about one payment the caller is a party to, and `GET /v1/payments`
+ * answers with a filtered page of the caller's own history. Both are guarded, and both delegate
+ * everything to `PaymentsService`, which owns the scope (membership - the caller's id is part of
+ * the query, never a parameter) and the status codes (400 for a filter that cannot be read, 404 for
+ * a payment the caller is not a party to).
+ *
+ * The order below is the same trap `RecipientsController` records: Nest registers routes in
+ * declaration order. `/payments/:id` does not shadow `/payments` today - the paths differ by a
+ * segment - but the habit is the point. The day a literal sub-path is added (`/payments/summary`),
+ * the route that reads like a filter declares first or it arrives as an `:id`, is refused by the
+ * UUID pipe with a 400, and looks like a validation bug rather than a routing one.
  *
  * The route exists in this shape - accepted, idempotent, `PENDING` - because that is what the
  * rest of the system can honestly do today. The row is written and the amount is reserved
@@ -139,5 +164,106 @@ export class PaymentsController {
     @Headers(IDEMPOTENCY_KEY_HEADER) idempotencyKey: string,
   ): Promise<PaymentCreatedResponseDto> {
     return this.payments.create(user, body, idempotencyKey);
+  }
+
+  /**
+   * `GET /v1/payments` (Step 30): the caller's own history, newest first.
+   *
+   * Declared before `:id` on purpose - see the class docblock. One delegation, like every other
+   * handler here: `PaymentsService.history` reads the query, owns the scope, and answers.
+   */
+  @Get()
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'List your payments, newest first',
+    description: [
+      'Every payment this account is a party to - sent or received, one row each - newest first, with filters for the interesting questions a support conversation asks: "what did I send last week", "what is still processing", "what failed".',
+      '',
+      'The scope is not a parameter. There is no way to ask this endpoint for somebody else\'s history: the caller is part of the query, and `direction` chooses only which side of *their own* payments to read.',
+      '',
+      '`hasMore` says whether the filters matched more than this page holds, and it is computed from the same read that produced `items` rather than from a second count - so the page and its answer cannot disagree.',
+      '',
+      'The two fields that only make sense while looking at one payment, `failureReason` and `stellarTxHash`, are on `GET /v1/payments/:id` and deliberately absent here.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: PaymentListResponseDto,
+    description:
+      'The caller\'s payments that matched, newest first. An empty `items` is an ordinary answer: "nothing matched", not a 404.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description:
+        'A filter could not be read: `direction` is not `sent`/`received`/`both`, `status` is not one of the four statuses, `from` or `to` is not an ISO-8601 instant, `limit` is not a whole number, or `from` is later than `to`. The message names the parameter and the values that work.',
+    },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+  ])
+  list(
+    @CurrentUser() user: SessionUser,
+    @Query() query: ListPaymentsQueryDto,
+  ): Promise<PaymentListResponseDto> {
+    return this.payments.history(user.id, query);
+  }
+
+  /**
+   * `GET /v1/payments/:id` (Step 30): one payment, if the caller is a party to it.
+   *
+   * The id is the value `POST /v1/payments` answered with - the thing a client polls after being
+   * told `202`, and the thing a support conversation is keyed on.
+   */
+  @Get(':id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'One of your payments, by id',
+    description: [
+      'The row as it stands now: `PENDING` while nothing has been submitted, `PROCESSING` while a signed transaction is with the network, then `SUCCESSFUL` or `FAILED` when a ledger has closed it. `SUCCESSFUL` and `FAILED` are final.',
+      '',
+      'Both parties to a payment can read it with the same id - the sender sees `direction: sent`, the recipient sees `received` - and nobody else can: a payment the caller is not a party to answers exactly what a made-up id answers (404), so this route cannot be used to discover which payment ids exist.',
+      '',
+      '`failureReason` is the raw machine code the submission path recorded, never Horizon\'s prose, and it is only meaningful while `status` is `FAILED`. `stellarTxHash` is the hash to paste into an explorer, and it can be present on a `FAILED` row: a transaction a ledger closed unsuccessfully is still a transaction.',
+    ].join('\n'),
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'The transaction id - the value `POST /v1/payments` returned.',
+    example: '6d1f3c9e-4a11-4f6b-9d1e-2b3c4d5e6f70',
+  })
+  @ApiOkResponse({
+    type: PaymentResponseDto,
+    description: 'The payment, as the caller sees it.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description: '`id` is not a UUID, so it cannot be a transaction id.',
+    },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 404,
+      description:
+        'No payment with that id involves this account: it does not exist, or it belongs to two other people. The two are one answer, deliberately.',
+    },
+  ])
+  findOne(
+    @CurrentUser() user: SessionUser,
+    // The pipe is what turns "not a UUID" into a 400 rather than into a 404 from the database: an
+    // id that cannot be an id is a malformed request, and the two mean different things to a client
+    // (fix the request, versus stop looking). The same choice `RecipientsController.confirm` makes.
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ): Promise<PaymentResponseDto> {
+    return this.payments.findOne(user.id, id);
   }
 }
