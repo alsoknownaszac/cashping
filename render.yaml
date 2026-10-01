@@ -206,10 +206,18 @@ services:
       - key: NODE_ENV
         value: production
 
-      # `PORT` is deliberately not set. Render decides it (the port from the
-      # Dockerfile's single EXPOSE) and passes it in, and `main.ts` listens on
-      # the validated `PORT` - so the two agree by construction rather than by a
-      # hardcoded 3000 that would become a health-check timeout.
+      # `PORT` is deliberately not set, because Render owns it: every Render web
+      # service must bind `0.0.0.0` and Render injects `PORT` into it - **10000**
+      # by default, changed only by setting this variable yourself. The
+      # Dockerfile's `EXPOSE 3000` does **not** feed that value: `EXPOSE` is only
+      # image metadata and Render ignores it when choosing the port to scan, so
+      # it says what the image may listen on, not what the deploy will. What
+      # actually listens is `main.ts` on the validated `PORT` (the `?? 3000` in
+      # `configuration.ts` is the laptop default and never applies here), so the
+      # port the app binds and the port Render scans agree because both are
+      # `PORT`. Bind 3000 on the belief that `EXPOSE` set the port and the deploy
+      # fails exactly one way: "Port scan timeout reached, no open HTTP ports
+      # detected".
 
       # --- Datastores --------------------------------------------------------
       # Internal connection strings: Render injects each datastore's

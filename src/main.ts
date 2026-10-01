@@ -1,3 +1,4 @@
+import { writeSync } from 'node:fs';
 import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import * as Sentry from '@sentry/nestjs';
@@ -142,7 +143,17 @@ async function bootstrap(): Promise<void> {
 
   initializeSentry(config);
 
-  const app = await NestFactory.create(AppModule);
+  // `abortOnError: false` is what makes a boot failure *readable*. Left at its
+  // default, Nest logs an initialization error and then, from inside
+  // `ExceptionsZone`, calls `process.exit(1)` - and that log goes to
+  // `process.stdout`, which is a pipe under Render and therefore written
+  // asynchronously, so the exit can drop the one line that names the cause.
+  // `false` makes Nest rethrow instead of exiting: the rejection lands in the
+  // `try/catch` at the foot of this file, which writes synchronously to stderr
+  // before it exits. A module that cannot be constructed - an unreachable
+  // dependency, a KMS key that is not in the configured region - now reports
+  // itself, rather than leaving an empty log and a port scan timing out.
+  const app = await NestFactory.create(AppModule, { abortOnError: false });
   // Lets onModuleDestroy close the Prisma pool on SIGTERM/SIGINT, instead of the
   // process being cut off with connections still open.
   app.enableShutdownHooks();
@@ -175,4 +186,50 @@ async function bootstrap(): Promise<void> {
   }
 }
 
-await bootstrap();
+/**
+ * Writes a line to stderr synchronously.
+ *
+ * Node writes to `process.stdout`/`process.stderr` asynchronously when they are
+ * pipes - which is what they are under Render - and `process.exit()` does not
+ * wait for such a write to land. A boot that dies before Nest prints its first
+ * line therefore leaves an empty log, which is a failed deploy with no cause in
+ * it. `writeSync` is synchronous, so the message is in the pipe before the
+ * process goes away: a failure is readable even when it is the last thing to
+ * run.
+ */
+function reportFatal(message: string): void {
+  try {
+    writeSync(2, `${message}\n`);
+  } catch {
+    // stderr is gone (a closed pipe) - there is nothing left to report to.
+  }
+}
+
+/** Renders an unknown thrown value into the single line a fatal log can carry. */
+function describeError(error: unknown): string {
+  return error instanceof Error
+    ? (error.stack ?? `${error.name}: ${error.message}`)
+    : String(error);
+}
+
+// A throw that escapes a callback, or a rejection nothing awaited, ends the
+// process the same silent way the bare `await bootstrap()` used to: the deploy
+// shows only "exited early" or a port scan timing out, and names no cause. Both
+// handlers report and then exit non-zero, so a start-command failure is never an
+// empty log again.
+process.on('uncaughtException', (error) => {
+  reportFatal(`Uncaught exception during startup - ${describeError(error)}`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  reportFatal(`Unhandled rejection during startup - ${describeError(reason)}`);
+  process.exit(1);
+});
+
+try {
+  await bootstrap();
+} catch (error) {
+  reportFatal(`Bootstrap failed - ${describeError(error)}`);
+  process.exit(1);
+}

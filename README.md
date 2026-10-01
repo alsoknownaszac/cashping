@@ -1278,6 +1278,23 @@ blocks a step in `docs/build-sequence.md`.
   named Render's smallest paid plans instead; Render's Create page priced *that* file at $27.50/month, which
   is what going back costs — and $27.50/month would also buy back both fields above.
 
+- **A Render web service listens on `PORT`, and an empty log is Nest exiting before it wrote the reason down.**
+  Two things a staging deploy made concrete. `EXPOSE 3000` in the Dockerfile is image metadata and nothing
+  else: Render ignores it when choosing which port to scan, injects `PORT` (**10000** by default) into the
+  container, and requires the process to bind `0.0.0.0`. `main.ts` reads that `PORT`, so the port the app binds
+  and the port Render scans agree by construction — and the `render.yaml` comment that claimed Render derived
+  the port *from* `EXPOSE` was simply wrong, and has been corrected rather than left as a plausible-looking
+  falsehood. The silence is Nest's own default: `NestFactory.create` runs with `abortOnError: true`, which logs
+  an initialization error from inside `ExceptionsZone` and then calls `process.exit(1)` — and that log is
+  written to `process.stdout`, which is a pipe under Render and therefore written asynchronously, so the exit
+  can drop the one line that names the cause. `main.ts` now passes `abortOnError: false`, which makes Nest
+  *rethrow*, and a top-level `try/catch` writes the stack to stderr with `writeSync` before exiting non-zero;
+  `uncaughtException` and `unhandledRejection` handlers report the same way. A module that cannot be
+  constructed — an unreachable dependency, a KMS key that is not in the configured region — now reports itself
+  instead of leaving the deploy to fail as "no open HTTP ports detected". No unit test covers this: `main.ts`
+  is a side-effecting entry point the e2e suites deliberately do not import, so it was checked by booting
+  `dist/main.js` with an empty environment and reading the `Bootstrap failed - ...` line it writes to stderr.
+
 - **On the free tier, staging can lose a queued payment, and its database is on a clock.** Both are the
   price of free and neither is hypothetical. A free Key Value instance is not persisted and Render may
   restart it at any time, and when it restarts the payment queue goes with it:
