@@ -125,12 +125,21 @@ services:
     runtime: node
     branch: main
     region: frankfurt
-    # Pinned because nothing else in the repository answers "which Node?": there
-    # is no `engines` field, no `.nvmrc` and no `.node-version`. 24 is the line
-    # the runtime image used (`node:24-alpine`) and the one development and every
-    # e2e run here executed against, so leaving Render's default in place would
-    # boot the API on a version no local run has exercised.
-    nodeVersion: 24
+    # Which Node builds and runs this service is `NODE_VERSION`, an entry in
+    # `envVars` below - not a field here, because the Blueprint schema has no
+    # such field: `serverService` in `https://render.com/schema/render.yaml.json`
+    # sets `additionalProperties: false` and defines no `nodeVersion`, so the key
+    # would be a validation error rather than a pin. Render's own list of the
+    # ways to choose a version is the `NODE_VERSION` variable, `.node-version`,
+    # `.nvmrc` and `engines` - and the variable is first of the four, so it wins
+    # over any of those files added to the repository later. It is set at all
+    # because nothing else in the repository answers "which Node?": there is no
+    # `engines` field, no `.nvmrc` and no `.node-version`. 24 is the line the
+    # runtime image used (`node:24-alpine`) and the one development and every e2e
+    # run here executed against, so inheriting Render's default - which Render
+    # decides, and which moves - would boot the API on a version no local run has
+    # exercised.
+
     # `plan: free`: 0.1 CPU and 512 MB, and - the part that changes how the
     # environment behaves - a Free web service is spun down after 15 minutes with
     # no inbound traffic and takes about a minute to wake again. While it is
@@ -238,6 +247,16 @@ services:
       - key: NODE_ENV
         value: production
 
+      # The Node line, and the only way this file can state it (see the note
+      # above `plan:`). An ordinary environment variable rather than a special
+      # field: Render reads `NODE_VERSION` ahead of `.node-version`, `.nvmrc` and
+      # `engines`, so the version here is the version even if one of those files
+      # is added to the repository later. `24` is a bounded major range, and
+      # tracks the latest 24.x - which is what `node:24-alpine`, the image every
+      # local and every e2e run used, tracks too.
+      - key: NODE_VERSION
+        value: '24'
+
       # `PORT` is deliberately not set, because Render owns it: every Render web
       # service must bind `0.0.0.0` and Render injects `PORT` into it - **10000**
       # by default, changed only by setting this variable yourself. A native
@@ -245,9 +264,10 @@ services:
       # for this value; what listens is `main.ts` on the validated `PORT` (the
       # `?? 3000` in `configuration.ts` is the laptop default and never applies
       # here), so the port the app binds and the port Render scans agree because
-      # both are `PORT`. Bind 3000 instead - which the retired Dockerfile's
-      # `EXPOSE` once invited - and the deploy fails exactly one way: "Port scan
-      # timeout reached, no open HTTP ports detected".
+      # both are `PORT`. Bind 3000 instead - the mistake the `Dockerfile`'s
+      # `EXPOSE 3000` still invites on the docker-compose route, which is the
+      # only route that image travels any more - and the deploy fails exactly one
+      # way: "Port scan timeout reached, no open HTTP ports detected".
 
       # --- Datastores --------------------------------------------------------
       # Internal connection strings: Render injects each datastore's

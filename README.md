@@ -929,7 +929,8 @@ and order (two rows in one millisecond are the only rows whose page order is the
 `render.yaml` at the repository root is a Render Blueprint: created once in a workspace (`New -> Blueprint`,
 pointed at this repository - the Blueprint Path is `render.yaml`, which is the default), it provisions the
 whole environment in one sync - a Postgres database, a Key Value instance, and the API, which Render builds
-and runs itself as a native Node service (`runtime: node`, `nodeVersion: 24`) rather than from the
+and runs itself as a native Node service (`runtime: node`, with `NODE_VERSION=24` among its `envVars`)
+rather than from the
 `Dockerfile`. A `main` push redeploys the API (`autoDeploy: true`); a change to the file is applied by
 re-syncing the Blueprint. Render builds and deploys on that push whether or not CI on that commit passed:
 the deploy's own gates are the build (`npm ci`, `prisma generate`, `nest build`) and the migration the
@@ -947,8 +948,12 @@ look from. `runtime: node` keeps it a single build in one directory: `prisma` is
 the same tree that compiles the app also migrates and boots it, and nothing is copied between stages. The
 `Dockerfile` is unchanged in what it does and is still what `docker-compose.yml` builds for local work; this
 changes only how Render builds and runs the API. What it trades away is the image as a reproducible
-artifact, which is why `nodeVersion` is pinned - the repository has no `engines` field, no `.nvmrc` and no
-`.node-version` for Render to read instead.
+artifact, which is why a Node version is pinned - as `NODE_VERSION`, an environment variable, and not as a
+`nodeVersion` field, because the Blueprint schema defines no such field (`serverService` is
+`additionalProperties: false`, so the key would be a validation error rather than a pin): Render's four ways
+to choose a version are that variable, `.node-version`, `.nvmrc` and `engines`, the variable is the first of
+them, and the repository has no `engines` field, no `.nvmrc` and no `.node-version` for Render to read
+instead.
 
 ### What it costs, and what `free` takes away
 
@@ -1024,6 +1029,7 @@ staging: the frontend calls the real API and reads `/api/docs` while they do it.
 
 | Decision | Why |
 | --- | --- |
+| `NODE_VERSION: '24'` | An environment variable rather than a `nodeVersion` field, because the Blueprint schema has no such field and `serverService` is `additionalProperties: false`. Render reads `NODE_VERSION` ahead of `.node-version`, `.nvmrc` and `engines`, so this line holds even if one of those files is added later; `24` is a bounded major range that tracks the latest 24.x, which is what `node:24-alpine` - the image every local and every e2e run used - tracks too. |
 | `numInstances: 1` | The BullMQ worker and the confirmation sweep run *inside the API process* (Step 26). A second replica would be a second consumer of one queue and a second registrant of one schedule, for throughput this stage does not need - and it is the only value the free plan allows, since scaling beyond a single instance is one of the features free web services lack. |
 | `plan: free` on all three | **$0**, and the trade argued above: an API that sleeps after 15 minutes idle, a Postgres database that expires 30 days after creation, and a Key Value instance that loses every key on any restart Render chooses to perform. `free` is the entry in all three of the schema's plan enums, so the value is checked rather than remembered. |
 | No paid-only fields | `diskSizeGB`, `connectionPool`, `readReplicas`, `highAvailability`, `maintenanceMode`, `scaling` and `disk` are absent because the free tier does not offer what they configure: storage fixed at 1 GB, no managed connection pooling, no read replicas or high availability, no maintenance mode (the schema itself limits that to paid web services), no scaling past one instance, no persistent disks. Each of them *is* a field in the schema, which is what makes its absence read as a decision. |
@@ -1257,9 +1263,13 @@ blocks a step in `docs/build-sequence.md`.
   during the first incident.
 
 - **The Render blueprint has been checked against Render's schema and docs, and never synced to a
-  workspace.** `render.yaml` parses, and every key in it — `startCommand`, `nodeVersion`, `buildCommand`,
-  `maxmemoryPolicy: noeviction`, `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
-  (`https://render.com/schema/render.yaml.json`). The three `plan: free` values are the `free` entry in
+  workspace.** `render.yaml` parses, and every key in it — `startCommand`, `buildCommand`, `maxmemoryPolicy:
+  noeviction`, `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
+  (`https://render.com/schema/render.yaml.json`), with one exception this bullet used to claim as a pass:
+  `nodeVersion` appears in no definition in that file, and `serverService` is `additionalProperties: false`,
+  so the Node pin is `NODE_VERSION` in `envVars` instead — the first of Render's four documented ways to
+  choose a version. The claim was checked key by key rather than by eye the second time; a `nodeVersion` key
+  is the kind of thing that reads as valid and is not. The three `plan: free` values are the `free` entry in
   that same file's `postgresPlan`, `keyValuePlan` and `serverPlan` enums, and the free-tier limits this
   file now opts into are Render's *documented* ones, read from `https://render.com/docs/free`,
   `/docs/compute-plans` and `/docs/key-value` rather than inferred: a 15-minute spin-down and a ~1-minute
