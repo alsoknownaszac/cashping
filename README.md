@@ -934,6 +934,59 @@ is applied by re-syncing the Blueprint. Render builds and deploys on that push w
 that commit passed: the deploy's own gates are the image build and the pre-deploy migration, which is
 why the workflow is the check that is supposed to fail first rather than one Render consults.
 
+### What it costs, and what `free` takes away
+
+All three resources are on Render's `free` plan, and that string is Render's rather than a price list
+remembered: the published Blueprint schema (`https://render.com/schema/render.yaml.json`) lists `free` in
+all three of its plan enums - `postgresPlan`, `keyValuePlan` and `serverPlan` - so it is the same slug on a
+database, a Key Value instance and a web service. The bill for the three of them is **$0**.
+
+Free is not a smaller version of the same thing, and three differences change how this environment behaves:
+
+- **The API sleeps.** A Free web service is spun down after 15 minutes with no inbound traffic (HTTP
+  requests and WebSocket messages are what count) and takes about a minute to wake on the next request.
+  Nothing runs while it is asleep: the BullMQ worker and the confirmation sweep live inside that process
+  (see the table below), so a queued submission and a `PROCESSING` payment both wait for the request that
+  wakes it. A smoke test should warm `/v1/health` first, or its first assertion is a timeout.
+- **The database expires.** A Free Postgres database expires **30 days after creation**, then has a 14-day
+  grace period before Render deletes it and its data - and Render emails before each deadline, which is the
+  only warning there is. It is also fixed at 1 GB of storage (0.1 CPU, 256 MB, up to 100 connections), gets
+  **no backups** and no managed connection pooling, and may be restarted or taken down for maintenance at
+  any time.
+- **Key Value keeps nothing.** A Free Key Value instance is **25 MB** with a 50-connection limit, and Render
+  does not persist it: its free tier forces `persistenceMode` off, and Render reserves the right to restart
+  the instance at any time, which deletes every key in it.
+
+The last of those is an operational change rather than a performance one, so it is itemised rather than
+summarised. Redis here is not a cache: it holds four things a paid instance would keep across a restart.
+
+- **The payment queue.** `PaymentsService.create` writes the `PENDING` row *and* adds the BullMQ submission
+  job inside one database transaction, and `enqueueSubmission` has exactly one caller - that transaction.
+  (The queue's own docblock argues that "the durable record of a payment is the row, not a Redis entry";
+  that is about surviving BullMQ's retention policy, not about a queue that no longer exists.) So if Redis
+  is wiped while a job is queued and not yet picked up, the job is gone and **nothing re-drives it**: the
+  row stays `PENDING` with its amount reserved against the sender, and the client polls a payment nothing
+  will submit.
+- **The confirmation sweep's schedule.** The repeatable tick is a key in Redis, upserted once at boot by
+  `PaymentsQueueService.onApplicationBootstrap`. A wipe removes it and nothing re-registers it while the
+  process keeps running, so payments already `PROCESSING` (hash recorded, waiting on a ledger) stop being
+  polled until the API restarts - which on the free tier happens at the next deploy, or the next time the
+  service is woken from sleep.
+- **The rate-limit counters** (OTP issuance, recipient lookup) are Redis-only, so a wipe refills both
+  allowances early. There is no durable layer behind them: the counter is the whole mechanism.
+- **The idempotency claims.** A wipe loses the stored response, so a retry with the same `Idempotency-Key`
+  gets the database's refusal (`@@unique([senderId, idempotencyKey])`: "this Idempotency-Key already created
+  a payment, fetch that payment instead") instead of the replayed body it would otherwise have received. The
+  row count - the guarantee - survives; the replay is what does not, and the two layers failing differently
+  is worth knowing before somebody reads the second failure as a duplicate payment.
+
+What it costs to stop being free is unchanged, and already measured: the same file with the plans it used to
+name - Postgres `0.1c-256mb`, Key Value `256mb`, API `0.5c-512mb` - was priced by Render's own Create page
+at **$27.50 per month** ($10.50 + $10 + $7, prorated by the second and billed at the start of the month).
+That is the number to re-read if the flat plans change; the upgrade is those three values and nothing else,
+and it removes every item above. `numInstances: 1` is the one decision the free tier agrees with, since
+scaling beyond a single instance is a feature free web services do not have.
+
 **It is staging, and three things in the file say so.** `STELLAR_NETWORK=TESTNET`, with the Horizon URL and
 the USDC issuer that exist on that network, so nothing in this environment can move real money.
 `NODE_ENV=production`, so the custody guards (Step 18) are *exercised* rather than bypassed - which is why
@@ -944,12 +997,13 @@ staging: the frontend calls the real API and reads `/api/docs` while they do it.
 
 | Decision | Why |
 | --- | --- |
-| `numInstances: 1` | The BullMQ worker and the confirmation sweep run *inside the API process* (Step 26). A second replica would be a second consumer of one queue and a second registrant of one schedule, for throughput this stage does not need. |
-| Paid datastore plans | A Free Postgres instance expires 30 days after creation, and a Free Key Value instance keeps nothing on disk - a staging database that disappears mid-demo, and jobs plus idempotency records lost on any restart. |
-| `maxmemoryPolicy: noeviction` | BullMQ holds job state in keys, and Render's default (`allkeys-lru`) could evict a queued submission. Step 26 makes the work list the `transactions` table, so an eviction costs a delay rather than a payment nothing will look at again - a preference, not a load-bearing setting. |
+| `numInstances: 1` | The BullMQ worker and the confirmation sweep run *inside the API process* (Step 26). A second replica would be a second consumer of one queue and a second registrant of one schedule, for throughput this stage does not need - and it is the only value the free plan allows, since scaling beyond a single instance is one of the features free web services lack. |
+| `plan: free` on all three | **$0**, and the trade argued above: an API that sleeps after 15 minutes idle, a Postgres database that expires 30 days after creation, and a Key Value instance that loses every key on any restart Render chooses to perform. `free` is the entry in all three of the schema's plan enums, so the value is checked rather than remembered. |
+| No paid-only fields | `diskSizeGB`, `connectionPool`, `readReplicas`, `highAvailability`, `maintenanceMode`, `scaling` and `disk` are absent because the free tier does not offer what they configure: storage fixed at 1 GB, no managed connection pooling, no read replicas or high availability, no maintenance mode (the schema itself limits that to paid web services), no scaling past one instance, no persistent disks. Each of them *is* a field in the schema, which is what makes its absence read as a decision. |
+| `maxmemoryPolicy: noeviction` | BullMQ holds job state in keys, and Render's default (`allkeys-lru`) could evict a queued submission. Not a plan restriction - the setting is available on a free instance too (the policy table's third column asks "can memory fill up?", not "is this paid"), and the 25 MB is what makes it matter: with `noeviction` a full instance returns an error on a write, where an eviction drops a queued job silently. A rejected write is visible; an evicted job was not. |
 | `postgresMajorVersion: '16'` | The version `docker-compose.yml` runs, and therefore the one every migration and every e2e run in this repository was executed against. Left unset, Render would use its newest supported major. |
 | `healthCheckPath: /v1/health` | The liveness endpoint: no auth, no database call, no Redis call. It is the URL `HealthController`'s own docblock says a load balancer is pointed at. |
-| `preDeployCommand` | `npx --no-install prisma migrate deploy` runs in the newly built image, with this service's environment, *before* it takes traffic - so a failed migration fails the deploy and the previous version keeps serving. The Dockerfile copies `prisma/`, the migrations and `prisma7.config.ts` into the runtime stage for this one line (and `dotenv`, which that config imports). |
+| `preDeployCommand` | `npx --no-install prisma migrate deploy` runs in the newly built image, with this service's environment, *before* it takes traffic - so a failed migration fails the deploy and the previous version keeps serving. The Dockerfile copies `prisma/`, the migrations and `prisma7.config.ts` into the runtime stage for this one line (and `dotenv`, which that config imports). Render's free-tier documentation does not list pre-deploy commands among the features free web services lack (it counts them as pipeline minutes, which a free workspace gets an included amount of), and the schema attaches no plan condition to the field - so the migration step survives the move to `free`, and a failed `migrate deploy` still fails the deploy. |
 
 ### The values that are not in the file
 
@@ -1174,20 +1228,44 @@ blocks a step in `docs/build-sequence.md`.
   category from a probe that failed. Recorded so that it stays a decision instead of a surprise
   during the first incident.
 
-- **The Render blueprint has been checked against Render's schema, never against a workspace.**
-  `render.yaml` parses, and every key in it — `preDeployCommand`, `maxmemoryPolicy: noeviction`,
-  `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
-  (`https://render.com/schema/render.yaml.json`), which is a statement about the file and not
-  about a deployment: no sync has been run, so the plan slugs (`0.1c-256mb` for Postgres, and
-  `0.5c-512mb` and `256mb` for the API and the Key Value instance), the `frankfurt` region and
-  the behaviour a reader would test first — that a failing `prisma migrate deploy` aborts the
-  deploy and leaves the previous version serving — are Render's documented answers rather than
-  anything this repository has seen. What has been observed is the image: the Dockerfile's
-  runtime stage now carries `prisma/`, the migrations, `prisma7.config.ts` and `dotenv`, so
-  `npx --no-install prisma migrate deploy` has a schema and a datasource to read instead of
-  dying on an unresolved import. The environment the e2e suites run against is still
-  `docker-compose.yml`'s Postgres and Redis on their own ports, and no API request in this
-  repository has ever been served by the staging service.
+- **The Render blueprint has been checked against Render's schema and docs, and never synced to a
+  workspace.** `render.yaml` parses, and every key in it — `preDeployCommand`, `maxmemoryPolicy:
+  noeviction`, `fromService`, `ipAllowList` — exists in Render's published Blueprint schema
+  (`https://render.com/schema/render.yaml.json`). The three `plan: free` values are the `free` entry in
+  that same file's `postgresPlan`, `keyValuePlan` and `serverPlan` enums, and the free-tier limits this
+  file now opts into are Render's *documented* ones, read from `https://render.com/docs/free`,
+  `/docs/compute-plans` and `/docs/key-value` rather than inferred: a 15-minute spin-down and a ~1-minute
+  wake, a Postgres database that expires 30 days after creation and then has 14 days of grace, a free
+  database fixed at 1 GB with no backups and no managed connection pooling, a Key Value instance at 25 MB
+  and 50 connections that keeps nothing on disk, one free Postgres and one free Key Value per workspace,
+  750 Free instance hours per workspace per month, at which point Render suspends all of your Free web
+  services until the start of the next month, and the service-initiated-traffic threshold that permits
+  suspending a free web service calling external APIs at uncommonly high volume — which this one does, on
+  Horizon, KMS, Africa's Talking and Sentry. None of that is a deployment: no sync has been run, so the
+  behaviour a reader would test first — that a failing `prisma migrate deploy` aborts the deploy and
+  leaves the previous version serving — remains Render's documented answer rather than anything this
+  repository has seen. What has been observed is the image: the Dockerfile's runtime stage now carries
+  `prisma/`, the migrations, `prisma7.config.ts` and `dotenv`, so `npx --no-install prisma migrate deploy`
+  has a schema and a datasource to read instead of dying on an unresolved import. The environment the e2e
+  suites run against is still `docker-compose.yml`'s Postgres and Redis on their own ports, and no API
+  request in this repository has ever been served by the staging service. An earlier revision of this file
+  named Render's smallest paid plans instead; Render's Create page priced *that* file at $27.50/month,
+  which is what going back costs.
+
+- **On the free tier, staging can lose a queued payment, and its database is on a clock.** Both are the
+  price of free and neither is hypothetical. A free Key Value instance is not persisted and Render may
+  restart it at any time, and when it restarts the payment queue goes with it:
+  `PaymentsService.create` adds the submission job inside the transaction that writes the `PENDING` row,
+  `enqueueSubmission` has no other caller in this repository, and nothing sweeps for a `PENDING` row whose
+  job has vanished — so the row stays `PENDING` with its amount reserved against the sender and nothing
+  submits it. The same restart takes the confirmation sweep's schedule with it (re-registered only at the
+  next boot of the API), so `PROCESSING` payments wait for a deploy or a wake, and it resets both
+  rate-limit counters, because those are Redis keys and nothing else. The idempotency *claims* go too,
+  though the row count does not: the unique index on `(senderId, idempotencyKey)` is the guarantee, and
+  the Redis record is only the replay, so the failure a client sees is a worse retry answer rather than a
+  second payment. Separately, a free Postgres database expires 30 days after creation and is deleted 14
+  days after that unless it is upgraded first — and free web services have no shell and no one-off jobs,
+  so an operator diagnosing any of this has the log and the API and nothing else.
 
 ## Deployment
 
