@@ -12,6 +12,7 @@ import {
   IDEMPOTENCY_KEY_HEADER,
   IDEMPOTENCY_REPLAYED_HEADER,
 } from './../src/common/interceptors/idempotency.interceptor.js';
+import { STEP_UP_TOKEN_HEADER } from './../src/identity/pin/step-up-token.js';
 import { createValidationPipe } from './../src/common/pipes/validation.pipe.js';
 import { UserStatus } from './../src/generated/prisma/enums.js';
 import {
@@ -20,6 +21,7 @@ import {
   type SmsSendResult,
   type SmsSender,
 } from './../src/notifications/sms/sms-sender.js';
+import { PaymentsQueueService } from './../src/payments/jobs/payments-queue.service.js';
 import { PrismaService } from './../src/prisma/prisma.service.js';
 import { RedisService } from './../src/redis/redis.service.js';
 import {
@@ -45,7 +47,7 @@ import { StellarService } from './../src/wallet/stellar/stellar.service.js';
  *
  * The app is the real `AppModule`: real Postgres, real Redis, the global validation pipe, the
  * shared exception filter, the JWT guard, the real `PrismaService.$transaction` with its raw
- * `SELECT ... FOR UPDATE`, and the real `BalancesService`. Three providers are replaced, and each
+ * `SELECT ... FOR UPDATE`, and the real `BalancesService`. Four providers are replaced, and each
  * is a thing a test cannot have:
  *
  * - `SMS_SENDER`, because a code has to be read from somewhere (`auth.e2e-spec.ts` does the same).
@@ -56,6 +58,13 @@ import { StellarService } from './../src/wallet/stellar/stellar.service.js';
  *   check is arithmetic against a known balance - so the network is faked and everything above it
  *   (the account row, the trustline decision, `readBalances`, the available-amount calculation,
  *   the lock, the insert) runs for real.
+ * - `PaymentsQueueService`, so a payment this file creates is not picked up by a worker while the
+ *   test is asserting about it. Since Step 27 `PaymentsService.create` adds a submission job inside
+ *   its own transaction, and in this environment the worker consuming it resolves the row within
+ *   milliseconds - a harness wallet's seed is not one any KMS will open, so the attempt *fails* the
+ *   payment instead of settling it. A resolved row is not in flight, and "money already committed
+ *   blocks a new payment" is a claim about rows that are. Submission is covered where it belongs,
+ *   against real custody and a real network: `test/submission.e2e-spec.ts`.
  *
  * ## The race, and how it is forced
  *
@@ -75,7 +84,12 @@ import { StellarService } from './../src/wallet/stellar/stellar.service.js';
 /** The one route under test, and the two auth routes used to build accounts. */
 const PAYMENTS_PATH = `/${GLOBAL_PREFIX}/payments`;
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
+
+/** The PIN every registration sends (Step 34a): exactly four digits, or the DTO refuses the body. */
+const PIN = '1234';
 const VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/otp/verify`;
+/** The step-up call (Step 34a): proving the PIN is what a payment is allowed by. */
+const PIN_VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/pin/verify`;
 
 /** Captures what would have been texted, so the verification code is readable here. */
 class CapturingSmsSender implements SmsSender {
@@ -157,6 +171,26 @@ class FakeStellar {
 
 const stellar = new FakeStellar();
 
+/**
+ * `PaymentsQueueService`, replaced by a recording no-op (see the fourth substitution above).
+ *
+ * It stands in for the producer *and* for the scheduler it would have registered: nothing is added
+ * to Redis, so no worker in this process - or in a sibling suite booting the same app at the same
+ * time - consumes a payment while a test is asserting about the rows `create` wrote. What is
+ * recorded is what `create` asked for, which is the only thing this file could still check about a
+ * job it deliberately does not send.
+ */
+class RecordingQueue {
+  /** The payment ids `create` enqueued for, in the order the requests committed. */
+  readonly enqueued: string[] = [];
+
+  async enqueueSubmission(transactionId: string): Promise<void> {
+    this.enqueued.push(transactionId);
+  }
+}
+
+const queue = new RecordingQueue();
+
 /** A number this run has not registered, in the local spelling. */
 function freshLocalNumber(): string {
   return `024${randomInt(0, 10 ** 7)
@@ -182,10 +216,16 @@ function codeFrom(body: string): string {
   return matches[0] as string;
 }
 
-/** The half of a session response this file needs. */
+/** The half of a session response this file needs, plus the step-up token a payment needs. */
 interface Session {
   userId: string;
   accessToken: string;
+  /**
+   * From `POST /v1/auth/pin/verify` (Step 34a): proof that the transaction PIN was given, which
+   * every request to `POST /v1/payments` has to carry. An actor without one is an actor this API
+   * refuses to move money for, which is the point of the step.
+   */
+  stepUpToken: string;
 }
 
 /** The parts of a response this file asserts about. */
@@ -244,6 +284,9 @@ describe('Payment creation (e2e)', () => {
 
     return sent
       .set('Authorization', `Bearer ${actor.accessToken}`)
+      // Step 34a's second credential. Without it the guard refuses the request with a 403 before
+      // the body is even read, which is what one of the tests below asserts.
+      .set(STEP_UP_TOKEN_HEADER, actor.stepUpToken)
       .send(body)
       .then((response) => ({
         status: response.status,
@@ -276,11 +319,27 @@ describe('Payment creation (e2e)', () => {
       : Amount.fromDatabase(inFlight._sum.amount).toString();
   }
 
+  /**
+   * Proves the PIN and answers with the step-up token (Step 34a).
+   *
+   * A helper rather than a line in each test, because every payment this file sends needs one:
+   * a fixture that can pay is a fixture holding both credentials.
+   */
+  async function provePin(accessToken: string): Promise<string> {
+    const response = await request(app.getHttpServer())
+      .post(PIN_VERIFY_PATH)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({ pin: PIN })
+      .expect(200);
+
+    return response.body.stepUpToken as string;
+  }
+
   /** Registers and verifies an account, the way a real user's is created. */
   async function registerAndVerify(local: string, e164: string, handle: string): Promise<Session> {
     const registration = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: local, handle });
+      .send({ pin: PIN, phoneNumber: local, handle });
 
     expect(
       registration.status,
@@ -303,6 +362,7 @@ describe('Payment creation (e2e)', () => {
     const session: Session = {
       userId: response.body.userId as string,
       accessToken: response.body.accessToken as string,
+      stepUpToken: await provePin(response.body.accessToken as string),
     };
 
     userIds.push(session.userId);
@@ -367,6 +427,10 @@ describe('Payment creation (e2e)', () => {
       .useValue(provisioning)
       .overrideProvider(StellarService)
       .useValue(stellar)
+      // The producer, so nothing this file creates is submitted while the file asserts about it -
+      // see the fourth substitution in the header.
+      .overrideProvider(PaymentsQueueService)
+      .useValue(queue)
       .compile();
 
     app = moduleFixture.createNestApplication();
@@ -512,6 +576,16 @@ describe('Payment creation (e2e)', () => {
       expect(matching[0]?.amount.toString()).toBe('1.5');
       expect(matching[0]?.status).toBe('PENDING');
       expect(matching[0]?.recipientId).toBe(recipient.userId);
+
+      /**
+       * And one job, not two - the same claim told from the queue's side. `create` enqueues inside
+       * its own transaction (see the header), so "one key, one payment" is also "one key, one
+       * submission": the retry above was answered from the stored response, and never reached the
+       * code that adds one. The substituted producer is what makes this readable at all
+       * (`RecordingQueue`), and it is checked here rather than nowhere because a retry that
+       * submitted a second time would be a second payment on the network.
+       */
+      expect(queue.enqueued.filter((id) => id === first.body.id)).toHaveLength(1);
     });
 
     it('produces exactly one row for two rapid duplicate requests sent without awaiting', async () => {

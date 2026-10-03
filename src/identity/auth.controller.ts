@@ -5,20 +5,33 @@ import {
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
+  ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
 import { ApiErrorResponses } from '../common/http/swagger.js';
 import { AuthService } from './auth.service.js';
+import { ChangePasswordDto } from './dto/change-password.dto.js';
+import { ChangePinDto } from './dto/change-pin.dto.js';
+import { ConfirmPasswordResetDto } from './dto/confirm-password-reset.dto.js';
+import { EmailSetResponseDto } from './dto/email-set-response.dto.js';
+import { EmailVerifyResponseDto } from './dto/email-verify-response.dto.js';
 import { LoginCodeResponseDto } from './dto/login-code-response.dto.js';
 import { LoginDto, LoginResponseDto } from './dto/login.dto.js';
+import { LoginPasswordDto } from './dto/login-password.dto.js';
 import { SubmittedPhoneNumberDto } from './dto/phone-number.dto.js';
+import { PasswordSetResponseDto } from './dto/password-set-response.dto.js';
+import { PinChangeResponseDto } from './dto/pin-change-response.dto.js';
+import { PinVerifyResponseDto } from './dto/pin-verify-response.dto.js';
 import { RefreshTokenDto } from './dto/refresh-token.dto.js';
 import { RegisterResponseDto } from './dto/register-response.dto.js';
 import { RegisterDto } from './dto/register.dto.js';
 import { SessionResponseDto } from './dto/session-response.dto.js';
+import { SetEmailDto } from './dto/set-email.dto.js';
 import { TokenPairResponseDto } from './dto/token-pair-response.dto.js';
+import { VerifyEmailDto } from './dto/verify-email.dto.js';
 import { VerifyOtpResponseDto } from './dto/verify-otp-response.dto.js';
 import { VerifyOtpDto } from './dto/verify-otp.dto.js';
+import { VerifyPinDto } from './dto/verify-pin.dto.js';
 import { CurrentUser } from './jwt/current-user.decorator.js';
 import { JwtAuthGuard } from './jwt/jwt-auth.guard.js';
 import { type SessionUser } from './token/token.service.js';
@@ -29,6 +42,17 @@ import { type SessionUser } from './token/token.service.js';
  * under the global prefix, so the paths the frontend calls are `/v1/auth/register`,
  * `/v1/auth/otp/verify`, `/v1/auth/login/otp`, `/v1/auth/login`, `/v1/auth/refresh`,
  * `/v1/auth/logout` and `/v1/auth/session`.
+ *
+ * Step 34a adds the transaction PIN's two endpoints - `/v1/auth/pin/change` (set or change)
+ * and `/v1/auth/pin/verify` (prove it) - and they are the same shape as the rest of this
+ * file: a DTO that establishes the body is well-formed, a delegation to `AuthService`, and
+ * `JwtAuthGuard` on anything that needs the caller to be signed in.
+ *
+ * The one thing that is *not* like the others is what `pin/verify` answers: not a session,
+ * but a short-lived step-up token. It is a credential the client presents on
+ * `POST /v1/payments` in an `X-Step-Up-Token` header, and it is deliberately useless
+ * anywhere else - it expires in minutes, it cannot be refreshed, and it authorises nothing
+ * but proving the PIN again.
  *
  * Every handler is one delegation: the DTOs establish that a request is well-formed
  * and `AuthService` owns the logic and the status codes, which is why nothing here
@@ -56,6 +80,8 @@ export class AuthController {
       '',
       'The number is accepted in any reasonable format - `024 123 4567`, `+233241234567`, `+2330241234567`, `00233241234567` - and stored as E.164.',
       '',
+      '`pin` is required, and it is the account\'s transaction PIN: exactly four numeric digits, stored hashed, never returned by any endpoint. Every payment is refused until it is proved again at `POST /auth/pin/verify`, so it is collected here rather than behind a screen the user can skip. A PIN that is not four numeric digits is a 400, and no account is created.',
+      '',
       'The response never contains the code: the SMS is its only route to the user. Calling this again for an unverified number is the resend path and invalidates the previous code.',
     ].join('\n'),
   })
@@ -66,7 +92,8 @@ export class AuthController {
   @ApiErrorResponses([
     {
       status: 400,
-      description: 'The body is missing `phoneNumber`, or the number is not a valid phone number.',
+      description:
+        'The body is missing `phoneNumber` or `pin`, the number is not a valid phone number, or the PIN is not exactly four numeric digits.',
     },
     {
       status: 403,
@@ -334,5 +361,333 @@ export class AuthController {
     // Synchronous, unlike every other handler here: `JwtStrategy` has already read
     // the row, so there is nothing left to await.
     return this.authService.session(user);
+  }
+
+  @Post('pin/change')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Set or change your transaction PIN',
+    description: [
+      'Sets the PIN when the account has none, or changes it by proving the current one. The PIN is the second factor in front of money: `POST /v1/payments` is refused until it has been proved, so it is the one credential a stolen session does not hand over.',
+      '',
+      'Send `{ pin }` when there is no PIN yet (a Google-SSO account created in Step 34d). Send `{ currentPin, pin }` to change an existing one - a change is a 409 when `currentPin` is missing or wrong, and the response names how many attempts are left.',
+      '',
+      'The PIN is exactly four numeric digits. That is checked before anything is hashed, so a malformed one is a 400 that costs no attempt: only a correct-format PIN that does not match counts against the allowance.',
+      '',
+      'Five wrong `currentPin` values lock the PIN for fifteen minutes and answer 429. The counter and the lockout are the same ones `POST /auth/pin/verify` uses, deliberately: a change path with arithmetic of its own would be a quieter way to guess.',
+      '',
+      'The response contains no PIN, and no hash - it contains when the PIN now in force was written.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: PinChangeResponseDto,
+    description: 'The PIN is set (or changed), and the old one no longer works.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description:
+        'The body is missing `pin`, or `pin`/`currentPin` is not exactly four numeric digits.',
+    },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 409,
+      description:
+        'The account already has a PIN and `currentPin` was omitted or is not correct. The message says how many attempts are left.',
+    },
+    {
+      status: 429,
+      description:
+        'Too many incorrect PIN attempts, so the PIN is locked. The message says when it can be tried again.',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  changePin(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: ChangePinDto,
+  ): Promise<PinChangeResponseDto> {
+    return this.authService.changePin(user, dto);
+  }
+
+  @Post('pin/verify')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Prove your transaction PIN and get a step-up token',
+    description: [
+      'The step-up call. A correct PIN answers with a short-lived token that `POST /v1/payments` requires in an `X-Step-Up-Token` header - the second factor, as a value the client can present rather than a second session.',
+      "The token lives for five minutes and carries one claim: that this account proved its PIN. It cannot be renewed, and it authorises nothing except being a fresh PIN proof - the way to get another is to prove the PIN again.",
+      '',
+      'A wrong PIN is a 401 whose message says how many attempts are left. Five wrong attempts lock the PIN for fifteen minutes and answer 429.',
+      '',
+      'The PIN itself never appears in the response, in an error message, or in the audit log. Neither does the attempt counter on a successful call: a proof that succeeded has none left to report.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: PinVerifyResponseDto,
+    description: 'The PIN was correct; the step-up token is valid for a few minutes.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description: 'The body is missing `pin`, or it is not exactly four numeric digits.',
+    },
+    {
+      status: 401,
+      description:
+        'Either there is no usable access token (no `Authorization` header, or it is expired, malformed, or not one this API signed), or the PIN is not correct. Both are "this credential was not accepted".',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 409,
+      description: 'The account has no PIN set, so there is nothing to prove yet.',
+    },
+    {
+      status: 429,
+      description:
+        'Too many incorrect PIN attempts, so the PIN is locked. The message says when it can be tried again.',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  verifyPin(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: VerifyPinDto,
+  ): Promise<PinVerifyResponseDto> {
+    return this.authService.verifyPin(user, dto);
+  }
+
+  @Post('password/change')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Set or change your password',
+    description: [
+      'Sets the password when the account has none, or changes it by proving the current one. The password is the *recovery* credential - what gets a user back into their account - rather than the second factor in front of money, which is the transaction PIN.',
+      '',
+      'Send `{ password }` when there is no password yet. Send `{ currentPassword, password }` to change an existing one - a change is a 409 when `currentPassword` is missing or wrong.',
+      '',
+      'The password must be at least `PASSWORD_MIN_LENGTH` characters. That is checked before anything is hashed, so a too-short one is a 400 that reaches no hasher.',
+      '',
+      'The response contains no password and no hash - it contains when the password now in force was written.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: PasswordSetResponseDto,
+    description: 'The password is set (or changed), and the old one no longer works.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description: 'The body is missing `password`, or `password` is shorter than the minimum.',
+    },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 409,
+      description:
+        'The account already has a password and `currentPassword` was omitted or is not correct.',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  changePassword(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: ChangePasswordDto,
+  ): Promise<PasswordSetResponseDto> {
+    return this.authService.changePassword(user, dto);
+  }
+
+  @Post('login/password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Sign in with a password',
+    description: [
+      'The password sign-in, the counterpart to `POST /auth/login` (which uses a texted code). A correct password answers the same token pair and profile the code sign-in answers.',
+      '',
+      'A wrong password is a 401 whose message is *identical* to the one for a number with no account: the two are not distinguishable from outside, so this endpoint is not an oracle that tells an attacker which numbers are registered.',
+      '',
+      'Sign-in attempts are counted against the same per-number allowance as OTP sends, so a password guess is priced exactly like a code guess; over the allowance is a 429.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: LoginResponseDto,
+    description: 'The password was accepted and a session started.',
+  })
+  @ApiErrorResponses([
+    { status: 400, description: 'The body is missing `phoneNumber` or `password`.' },
+    {
+      status: 401,
+      description:
+        'The number and password did not match, or the number has no account or no password set. One message for all of them.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 429,
+      description: 'Too many sign-in attempts for this number. The message says how long to wait.',
+    },
+    {
+      status: 503,
+      description: 'Sign-in is temporarily unavailable (the attempt counter is unreachable).',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  loginWithPassword(@Body() dto: LoginPasswordDto): Promise<LoginResponseDto> {
+    return this.authService.loginWithPassword(dto);
+  }
+
+  @Post('password/reset')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: 'Start a password reset',
+    description: [
+      'Begins a forgot-password reset by texting a code to the number, reusing the OTP machinery (a reset code is an OTP with a different purpose, not a second code system).',
+      '',
+      'Answers **202 whether or not the number belongs to an account**, and the body is the same either way - this endpoint must not be an existence oracle. A code is sent, and an audit row written, only when the number really resolves to an `ACTIVE` account.',
+    ].join('\n'),
+  })
+  @ApiResponse({
+    status: HttpStatus.ACCEPTED,
+    type: LoginCodeResponseDto,
+    description:
+      'A code was sent if the number belongs to an account. The response is identical either way.',
+  })
+  @ApiErrorResponses([
+    { status: 400, description: 'The number is not a valid phone number.' },
+    {
+      status: 429,
+      description:
+        'Too many codes have been requested for this number in the current window. The message says how long to wait.',
+    },
+    {
+      status: 503,
+      description: 'No code could be sent (SMS provider or the request counter is unreachable).',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  requestPasswordReset(@Body() dto: SubmittedPhoneNumberDto): Promise<LoginCodeResponseDto> {
+    return this.authService.requestPasswordReset(dto);
+  }
+
+  @Post('password/reset/confirm')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Finish a password reset',
+    description: [
+      'Checks the reset code and writes the new password. The code is checked and spent exactly as it is at verification and sign-in - the same lifetime, attempt count and single-use rules - so a wrong or expired code is a 400 and an exhausted one is a 429.',
+      '',
+      'The code is spent before the new password is written, so a double-tapped confirm cannot write twice.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: PasswordSetResponseDto,
+    description: 'The code was accepted and the password is replaced.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description:
+        'The body failed validation, or the code is wrong, expired, or no reset is outstanding.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    { status: 409, description: 'That code has already been used.' },
+    { status: 429, description: 'Too many incorrect code attempts. Request a new one.' },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  confirmPasswordReset(@Body() dto: ConfirmPasswordResetDto): Promise<PasswordSetResponseDto> {
+    return this.authService.confirmPasswordReset(dto);
+  }
+
+  @Post('email')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Attach an email address and send a verification code',
+    description: [
+      'Attaches (or replaces) the account email address and emails a verification code to it. The address is stored lower-cased, so one mailbox is one value.',
+      '',
+      'The address is written *unverified*: a receipt is only ever sent to an address that has been confirmed, which is what `POST /auth/email/verify` does. Replacing the address clears any earlier confirmation, so a typo cannot leave mail going somewhere unproved.',
+      '',
+      'A 409 means another account already holds that address. The code itself never appears in the response - the email is its only route to the user.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: EmailSetResponseDto,
+    description: 'The address is attached and a verification code has been emailed.',
+  })
+  @ApiErrorResponses([
+    { status: 400, description: 'The body is missing `email`, or the address is not a valid one.' },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 409,
+      description: 'That email address is already in use on another account.',
+    },
+    {
+      status: 503,
+      description: 'The verification email could not be sent (no provider, or it was unreachable).',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  setEmail(@CurrentUser() user: SessionUser, @Body() dto: SetEmailDto): Promise<EmailSetResponseDto> {
+    return this.authService.setEmail(user, dto);
+  }
+
+  @Post('email/verify')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Confirm your email address',
+    description: [
+      'Confirms the address attached to the account with the code that was emailed to it. The address is already on the account, so only the code is sent.',
+      'The code is an OTP with the same lifetime and attempt count as every other code, so a wrong or expired one is a 400 and an exhausted one is a 429.',
+      '',
+      'A 409 means nothing is attached yet, or the attached address is already confirmed.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: EmailVerifyResponseDto,
+    description: 'The address is confirmed, and receipts may now be sent to it.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description: 'The body is missing `code`, or the code is wrong, expired or not outstanding.',
+    },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 409,
+      description: 'No email address is attached, or the attached one is already verified.',
+    },
+    { status: 429, description: 'Too many incorrect code attempts. Attach the address again.' },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  verifyEmail(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: VerifyEmailDto,
+  ): Promise<EmailVerifyResponseDto> {
+    return this.authService.verifyEmail(user, dto);
   }
 }

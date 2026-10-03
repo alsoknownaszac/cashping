@@ -67,6 +67,9 @@ import {
 const SEARCH_PATH = `/${GLOBAL_PREFIX}/recipients/search`;
 const RECIPIENTS_PATH = `/${GLOBAL_PREFIX}/recipients`;
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
+
+/** The PIN every registration sends (Step 34a): exactly four digits, or the DTO refuses the body. */
+const PIN = '1234';
 const VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/otp/verify`;
 
 /** Captures what would have been texted, so the code is readable in the test. */
@@ -180,7 +183,7 @@ async function registerAndVerify(
 ): Promise<Session> {
   const registration = await request(app.getHttpServer())
     .post(REGISTER_PATH)
-    .send({ phoneNumber: local, handle });
+    .send({ pin: PIN, phoneNumber: local, handle });
 
   expect(
     registration.status,

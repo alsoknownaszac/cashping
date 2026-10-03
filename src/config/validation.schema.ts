@@ -49,6 +49,7 @@ const NUMERIC_KEYS = [
   'PORT',
   'STELLAR_PROVISIONING_TIMEOUT_MS',
   'PAYMENTS_CONFIRMATION_INTERVAL_MS',
+  'RECONCILIATION_INTERVAL_MS',
 ] as const;
 
 /**
@@ -448,6 +449,21 @@ export class EnvironmentVariables {
   @Min(0)
   @Max(3_600_000)
   PAYMENTS_CONFIRMATION_INTERVAL_MS?: number;
+
+  /**
+   * [optional] How often the reconciliation sweep runs (Step 31), in milliseconds.
+   *
+   * Zero means "no schedule", exactly as it does for the confirmation sweep above, and for the same
+   * reason: reconciliation is a background process that reads every account's balance from Horizon, so
+   * it is opted into rather than inherited. `@Min(0)` and the same one-hour ceiling as the
+   * confirmation interval - a sweep slower than an hour is not reconciliation, it is a report a
+   * deployment should schedule outside this API.
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(3_600_000)
+  RECONCILIATION_INTERVAL_MS?: number;
 }
 
 /**

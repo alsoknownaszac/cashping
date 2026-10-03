@@ -2,6 +2,7 @@ import { BullModule, type BullRootModuleOptions } from '@nestjs/bullmq';
 import { Injectable, Logger, Module, type OnApplicationShutdown } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Queue } from 'bullmq';
+import { AuditModule } from '../../audit/audit.module.js';
 import { PrismaModule } from '../../prisma/prisma.module.js';
 import { NotificationsModule } from '../../notifications/notifications.module.js';
 import { WalletModule } from '../../wallet/wallet.module.js';
@@ -156,6 +157,15 @@ export class PaymentsQueueProducer implements OnApplicationShutdown {
     BullModule.registerQueue({ name: PAYMENTS_QUEUE }),
     PrismaModule,
     WalletModule,
+    /**
+     * Step 32's `payment.completed` / `payment.failed` entries, and the reason this module has to
+     * import the audit module rather than the one that owns the endpoints: the sweep that resolves a
+     * payment is *provided here* (see the provider below), so this is the module whose injector has
+     * to be able to build it. Found the hard way - the app booted fine everywhere the queue module is
+     * not loaded by hand, and `test/audit.e2e-spec.ts` failed to compile the module with "Nest can't
+     * resolve dependencies of the PaymentsConfirmationService (..., ?)".
+     */
+    AuditModule,
     /**
      * Step 28: the confirmation sweep tells the sender what happened, and `NotificationsService`
      * is the app's only door to that (it owns the SMS template and the `SMS_SENDER` seam). The

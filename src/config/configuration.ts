@@ -78,6 +78,87 @@ export const OTP_REQUESTS_PER_WINDOW = 3;
 export const OTP_REQUEST_WINDOW_MINUTES = 15;
 
 /**
+ * Transaction PIN policy (Step 34a).
+ *
+ * Constants rather than environment variables, for the reason the OTP block above gives:
+ * these are the product's rules - four digits, five guesses, a quarter-hour lock - not
+ * per-environment settings, and every one of them is asserted by a test.
+ *
+ * They are gathered here, beside the OTP's, because the service and the message have to
+ * agree about them for the same reason the SMS text has to agree with the OTP's TTL: a
+ * response that says "3 attempts remaining" while the service allows five is a support
+ * ticket about a bug that does not exist.
+ */
+/**
+ * Digits in a PIN. Four, and exactly four.
+ *
+ * Typed from memory at a payment screen rather than copied from an SMS, so the digit
+ * count is a usability ceiling; the security comes from the allowance below, not from
+ * the length. See `pin-pattern.ts` for the one place the rule is turned into a
+ * validation pattern.
+ */
+export const PIN_LENGTH = 4;
+/**
+ * Wrong PINs one account tolerates before the PIN is locked.
+ *
+ * Five, matching the OTP's allowance, and chosen against the ten thousand possible
+ * PINs rather than against a person's patience: at five guesses per window, an
+ * exhaustive search is two thousand windows long, which is what makes guessing a birth
+ * year or a repeated digit not worth the wait.
+ */
+export const PIN_MAX_ATTEMPTS = 5;
+/**
+ * How long a locked PIN stays locked, in minutes.
+ *
+ * Fifteen, matching the OTP request window: long enough that a scripted sweep of the
+ * key space makes no progress, short enough that someone who mistyped three times and
+ * then remembered their PIN is not sent to support.
+ */
+export const PIN_LOCKOUT_MINUTES = 15;
+/**
+ * How long a step-up token is accepted after a PIN has been proved.
+ *
+ * Five minutes, chosen against the *gap* it has to cover: the user proves the PIN, is
+ * returned to the payment screen and confirms. Long enough that a slow form does not
+ * fail, short enough that a token captured from a log or a proxy is stale before it is
+ * useful - which is what makes "fresh" a property of the token rather than a claim about
+ * the client's behaviour.
+ */
+export const STEP_UP_TOKEN_TTL_MINUTES = 5;
+
+/**
+ * Password policy (Step 34b).
+ *
+ * Constants rather than environment variables, like the OTP and PIN blocks above and for
+ * the same reason: how long a password has to be is the product's rule, not a
+ * per-environment setting, and every one of them is asserted by a test.
+ *
+ * `PASSWORD_MIN_LENGTH` is eight - longer than a PIN and shorter than a passphrase, chosen
+ * because the password is the *recovery* credential as much as the everyday one: it is
+ * drawn from a human's memory, and the value of a minimum is that it stops `1234` from
+ * being a password rather than that it makes one strong. A password is a dictionary attack
+ * rather than a sweep, which is why `secret-hash.ts` hashes one with a stronger work factor
+ * than the PIN's.
+ *
+ * `PASSWORD_MAX_LENGTH` is a ceiling rather than a security rule: scrypt's cost grows with
+ * the input, so an unbounded body would let one request spend a worker's time deriving a
+ * megabyte-long key. The bound is generous enough that no passphrase a person types is
+ * refused.
+ */
+export const PASSWORD_MIN_LENGTH = 8;
+export const PASSWORD_MAX_LENGTH = 128;
+
+/**
+ * The address a verification or receipt email is sent from (Step 34c).
+ *
+ * A constant with an environment override rather than a required variable: the *seam* is
+ * `EMAIL_SENDER` (see `NotificationsModule`), and the from-address is part of the wording
+ * that lives beside the sender rather than a provider credential. `EMAIL_FROM` overrides
+ * it for a deployment whose provider requires a verified sender domain.
+ */
+export const DEFAULT_EMAIL_FROM = 'Cashping <no-reply@cashping.app>';
+
+/**
  * Recipient directory policy (Step 21).
  *
  * Constants rather than environment variables, like the OTP block above and for the same
@@ -286,6 +367,26 @@ export const DEFAULT_PROVISIONING_TIMEOUT_MS = 30_000;
 export const DEFAULT_CONFIRMATION_INTERVAL_MS = 0;
 
 /**
+ * How often the reconciliation sweep runs (Step 31), in milliseconds. `0` means no schedule at all.
+ *
+ * Off by default for the same reason the confirmation sweep is, and one more: reconciliation reads
+ * *every* account's Horizon balance, so switching it on is a standing load against the network as
+ * well as a background process. A deployment opts in (`RECONCILIATION_INTERVAL_MS=60000`) rather than
+ * inheriting a timer, and a test run that boots the real application does not poll the real network
+ * on a schedule behind the assertions.
+ *
+ * `0` disables the schedule without disabling the code: `LedgerQueueService.enqueueReconciliation()`
+ * runs one sweep on demand, which is what a test forcing a mismatch (or an operator who wants an
+ * answer now) does.
+ *
+ * Sixty seconds is the value to use in production. It is chosen against what a sweep costs rather
+ * than against how fast a balance can drift: a drift that matters is one that persists, a single
+ * Testnet ledger closes in ~5 seconds, and a minute keeps the read load on Horizon modest while still
+ * catching a broken credit long before a user would notice.
+ */
+export const DEFAULT_RECONCILIATION_INTERVAL_MS = 0;
+
+/**
  * Resolves the fallback Horizon host.
  *
  * Unset (or blank, which is what `STELLAR_HORIZON_FALLBACK_URL=` in an `.env`
@@ -395,6 +496,46 @@ export default function configuration() {
     },
 
     /**
+     * Transaction PIN policy (Step 34a), including the step-up token that proves one was
+     * given.
+     *
+     * Under its own group rather than inside `auth`, because none of it is about a
+     * session: the PIN is the second factor a payment requires, and the token below is
+     * how that proof travels from the verify endpoint to the payments endpoint. See
+     * `PIN_MAX_ATTEMPTS` and `STEP_UP_TOKEN_TTL_MINUTES` for how the numbers were chosen.
+     */
+    pin: {
+      length: PIN_LENGTH,
+      maxAttempts: PIN_MAX_ATTEMPTS,
+      lockoutMinutes: PIN_LOCKOUT_MINUTES,
+      stepUpTokenTtlMinutes: STEP_UP_TOKEN_TTL_MINUTES,
+    },
+
+    /**
+     * Password policy (Step 34b).
+     *
+     * Under its own group for the same reason the PIN's is: the service, the DTO's
+     * `@MinLength` and the message a refused password carries all have to agree, and one
+     * key is how they do. See `PASSWORD_MIN_LENGTH` for why eight and `secret-hash.ts` for
+     * why a password is hashed with a stronger work factor than a PIN.
+     */
+    password: {
+      minLength: PASSWORD_MIN_LENGTH,
+      maxLength: PASSWORD_MAX_LENGTH,
+    },
+
+    /**
+     * Email policy (Step 34c).
+     *
+     * `from` is the address a verification or receipt email is sent *from*; the provider
+     * that sends it is the `EMAIL_SENDER` binding and the wording lives in
+     * `NotificationsService` beside the SMS wording. See `DEFAULT_EMAIL_FROM`.
+     */
+    email: {
+      from: process.env.EMAIL_FROM ?? DEFAULT_EMAIL_FROM,
+    },
+
+    /**
      * Recipient directory policy (Step 21).
      *
      * Under its own group rather than inside `payments`, because it is not about payments yet:
@@ -496,6 +637,17 @@ export default function configuration() {
        */
       confirmationIntervalMs: Number(
         process.env.PAYMENTS_CONFIRMATION_INTERVAL_MS ?? DEFAULT_CONFIRMATION_INTERVAL_MS,
+      ),
+    },
+
+    /** The ledger (reconciliation) sweep's own settings (Step 31). */
+    ledger: {
+      /**
+       * How often the reconciliation sweep runs. See `DEFAULT_RECONCILIATION_INTERVAL_MS` for why the
+       * default is off and why a minute is the value to use in production.
+       */
+      reconciliationIntervalMs: Number(
+        process.env.RECONCILIATION_INTERVAL_MS ?? DEFAULT_RECONCILIATION_INTERVAL_MS,
       ),
     },
   };

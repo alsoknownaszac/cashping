@@ -1,5 +1,6 @@
 import { NotFoundException } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
+import { type AuditEntry, type AuditService } from '../../audit/audit.service.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { TransactionStatus } from '../../generated/prisma/enums.js';
 import { type SessionUser } from '../../identity/token/token.service.js';
@@ -25,6 +26,11 @@ import { PaymentsService } from './payments.service.js';
  * of the checks (a payment to nobody payable must not take a lock, and the balance is read
  * before the transaction opens rather than inside it), the mapping from each failure to its
  * status, and the exact string that reaches the `numeric(20, 7)` column.
+ *
+ * Step 32 adds one more thing to that list, and it is entirely an *order*: `payment.initiated` is
+ * appended after the commit above it, and a payment that rolled back is not appended at all. Both
+ * halves are asserted here because both are the caller's decision - the entry's columns are
+ * `AuditService`'s business.
  */
 
 const SENDER: SessionUser = {
@@ -161,6 +167,20 @@ function harness(options: HarnessOptions = {}) {
     }),
   };
 
+  /**
+   * The audit service, as `create` uses it: one method, the entries it was handed, and a marker in
+   * `calls` - which is what turns "the entry is written after the commit" into an assertion about
+   * the order the steps actually ran in rather than a reading of where the line sits in the file.
+   */
+  const entries: AuditEntry[] = [];
+
+  const audit = {
+    log: vi.fn(async (entry: AuditEntry) => {
+      calls.push(`audit:${entry.action}`);
+      entries.push(entry);
+    }),
+  };
+
   return {
     calls,
     tx,
@@ -168,11 +188,14 @@ function harness(options: HarnessOptions = {}) {
     balances,
     recipients,
     queue,
+    entries,
+    audit,
     service: new PaymentsService(
       prisma as unknown as PrismaService,
       balances as unknown as BalancesService,
       recipients as unknown as RecipientsService,
       queue as unknown as PaymentsQueueService,
+      audit as unknown as AuditService,
     ),
   };
 }
@@ -256,6 +279,9 @@ describe('the row it writes', () => {
       'insert',
       `enqueue:${created.id}`,
       'commit',
+      // Step 32 last, and *outside* the transaction on purpose: an entry written inside it would
+      // survive a rollback and describe a payment that does not exist (see the call site).
+      'audit:payment.initiated',
     ]);
 
     // And the job names the row the response names: a client that was told about a payment and a
@@ -273,6 +299,57 @@ describe('the row it writes', () => {
     await expect(create(harnessed)).rejects.toBe(timeout);
 
     expect(harnessed.calls).not.toContain('commit');
+    // And nothing appended (Step 32): the row went back with the transaction, so there is no payment
+    // for an entry to describe.
+    expect(harnessed.entries).toEqual([]);
+  });
+});
+
+/**
+ * Step 32's one entry from this file, which is the half of it that is this file's to get wrong.
+ *
+ * The entry's *columns* are `AuditService`'s business (and are pinned in `audit.service.spec.ts`);
+ * what only `create` can decide is that the entry exists at all, that it names the three identities
+ * a payment has, that its amount agrees with the row, and - the ordering claim - that it is never
+ * written for a payment that rolled back.
+ */
+describe('the audit trail', () => {
+  it('appends payment.initiated naming the payment, the payer and the payee', async () => {
+    const harnessed = harness({ wallet: '100.0000000', storedAmount: '12.5000000' });
+
+    const created = await create(harnessed, { amount: '12.5' });
+
+    // The amount is the canonical string `Amount` produced, exactly what the row would hold and what
+    // the response carries: the trail is written from the same value as the money, so the two cannot
+    // disagree about how much was asked for.
+    expect(harnessed.entries).toEqual([
+      {
+        action: 'payment.initiated',
+        userId: SENDER.id,
+        subjectId: created.id,
+        outcome: 'ok',
+        metadata: { amount: '12.5', recipientId: RECIPIENT_ID },
+      },
+    ]);
+  });
+
+  it('appends nothing for a payment that was never written', async () => {
+    // Both ways a `create` ends without a row: the queue refused the job (the row is rolled back with
+    // it) and the database refused the insert - the `P2002` of a retried key, which is the case that
+    // proves the entry is downstream of the commit rather than of the insert.
+    const refusedByQueue = harness({ enqueueError: new Error('Command timed out') });
+    const refusedByDatabase = harness({
+      insertError: new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+        code: 'P2002',
+        clientVersion: '7.10.0',
+      }),
+    });
+
+    await expect(create(refusedByQueue)).rejects.toThrow();
+    await expect(create(refusedByDatabase)).rejects.toThrow();
+
+    expect(refusedByQueue.entries).toEqual([]);
+    expect(refusedByDatabase.entries).toEqual([]);
   });
 });
 
@@ -528,9 +605,10 @@ interface ReadArgs {
 }
 
 /**
- * The two reads, with everything but Prisma real, and the wallet, the recipient check and the queue
- * as spies that nothing should reach: a read of a row this API already wrote must not spend an
- * allowance, ask Horizon anything or enqueue a job.
+ * The two reads, with everything but Prisma real, and the wallet, the recipient check, the queue and
+ * the audit service as spies that nothing should reach: a read of a row this API already wrote must
+ * not spend an allowance, ask Horizon anything, enqueue a job or append to a table that only ever
+ * grows.
  */
 function readHarness(options: ReadHarnessOptions = {}) {
   const findOneArgs: ReadArgs[] = [];
@@ -552,6 +630,7 @@ function readHarness(options: ReadHarnessOptions = {}) {
     balanceFor: vi.fn(),
     assertPayableRecipient: vi.fn(),
     enqueueSubmission: vi.fn(),
+    auditLog: vi.fn(),
   };
 
   return {
@@ -565,6 +644,7 @@ function readHarness(options: ReadHarnessOptions = {}) {
       { balanceFor: spies.balanceFor } as unknown as BalancesService,
       { assertPayableRecipient: spies.assertPayableRecipient } as unknown as RecipientsService,
       { enqueueSubmission: spies.enqueueSubmission } as unknown as PaymentsQueueService,
+      { log: spies.auditLog } as unknown as AuditService,
     ),
   };
 }
@@ -631,7 +711,7 @@ describe('one payment, by id', () => {
     expect(response.stellarTxHash).toBe(TX_HASH);
   });
 
-  it('reaches no wallet, no allowance and no queue', async () => {
+  it('reaches no wallet, no allowance, no queue and no audit table', async () => {
     const harnessed = readHarness({ row: detailedRow() });
 
     await harnessed.service.findOne(SENDER.id, PAYMENT_ID);
@@ -639,6 +719,9 @@ describe('one payment, by id', () => {
     expect(harnessed.spies.balanceFor).not.toHaveBeenCalled();
     expect(harnessed.spies.assertPayableRecipient).not.toHaveBeenCalled();
     expect(harnessed.spies.enqueueSubmission).not.toHaveBeenCalled();
+    // A read is not an auditable event (Step 32): the entry that matters for this payment was
+    // appended when it was created, and one per lookup would be a row per support request.
+    expect(harnessed.spies.auditLog).not.toHaveBeenCalled();
   });
 });
 

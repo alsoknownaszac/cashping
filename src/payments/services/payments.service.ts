@@ -5,6 +5,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { AuditService } from '../../audit/audit.service.js';
 import { Amount, InvalidAmountError } from '../../common/money/amount.js';
 import { Prisma } from '../../generated/prisma/client.js';
 import { TransactionStatus } from '../../generated/prisma/enums.js';
@@ -188,6 +189,15 @@ export class PaymentsService {
      * payload shape or a retry policy - see `PaymentsQueueService`.
      */
     private readonly queue: PaymentsQueueService,
+    /**
+     * Step 32's record of what was asked, as opposed to what money did.
+     *
+     * One entry from this file (`payment.initiated`), and the reason it is a constructor dependency
+     * rather than something the controller does on the way out is that only `create` knows the three
+     * facts the entry needs together: the id of the row that was written, who wrote it, and that the
+     * transaction above it actually committed.
+     */
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -276,6 +286,29 @@ export class PaymentsService {
     } catch (error) {
       throw asKeyReuse(error, idempotencyKey);
     }
+
+    /**
+     * Step 32: `payment.initiated`, written *after* the transaction above has committed.
+     *
+     * The placement is the whole decision, and it is the mirror image of the enqueue's. The enqueue
+     * had to be inside the transaction because a committed row with no job is silent - nothing would
+     * ever report it. This entry has to be outside for the opposite reason: an append-only table
+     * cannot be corrected, so an entry written inside the transaction would survive a rollback - the
+     * `P2002` caught above, a lost lock, a crash before the commit - and describe a payment that
+     * does not exist. A missing entry for a payment that does exist is a gap somebody can find; a
+     * phantom entry is a false record, and "only ever grows with facts" is this table's one promise.
+     *
+     * The idempotency key is deliberately *not* in the metadata. It is a value a client chose, three
+     * identities are enough to answer "what was initiated" (payment, sender, recipient), and a
+     * retried key would otherwise put a client-controlled string in an append-only row for no gain.
+     */
+    await this.audit.log({
+      action: 'payment.initiated',
+      userId: sender.id,
+      subjectId: created.id,
+      outcome: 'ok',
+      metadata: { amount: amount.toString(), recipientId: recipient.id },
+    });
 
     return {
       id: created.id,

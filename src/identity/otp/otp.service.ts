@@ -1,7 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service.js';
-import { generateOtpCode, hashOtpCode, verifyOtpCode } from './otp-crypto.js';
+import { hashSecret, verifySecret } from '../credentials/secret-hash.js';
+import { generateOtpCode } from './otp-crypto.js';
 
 /**
  * The result of checking a submitted code.
@@ -30,7 +31,7 @@ export interface IssuedOtp {
  * OTP lifecycle (Step 12): issue a hashed code, check one against storage.
  *
  * Storage rules this class exists to enforce:
- *   - the plaintext code is never persisted (only `hashOtpCode` output);
+ *   - the plaintext code is never persisted (only `hashSecret` output);
  *   - at most one live code per user, so a resend kills the previous one rather
  *     than leaving two valid codes behind;
  *   - a code is single-use, bounded by an expiry and by an attempt counter.
@@ -64,7 +65,7 @@ export class OtpService {
 
     const now = new Date();
     const code = generateOtpCode(codeLength);
-    const codeHash = await hashOtpCode(code);
+    const codeHash = await hashSecret(code);
     const expiresAt = new Date(now.getTime() + ttlMinutes * 60_000);
 
     await this.prisma.$transaction(async (tx) => {
@@ -121,7 +122,7 @@ export class OtpService {
       return { ok: false, reason: 'too_many_attempts', attemptsRemaining: 0 };
     }
 
-    if (await verifyOtpCode(code, row.codeHash)) {
+    if (await verifySecret(code, row.codeHash)) {
       return { ok: true, otpId: row.id };
     }
 

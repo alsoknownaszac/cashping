@@ -1,6 +1,9 @@
 import { Module } from '@nestjs/common';
+import { AuditModule } from '../audit/audit.module.js';
+import { AuditService } from '../audit/audit.service.js';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { BalancesService } from './balances/balances.service.js';
+import { AuditedKeyWrapper } from './custody/audited-key-wrapper.js';
 import { KEY_WRAPPER } from './custody/key-wrapper.js';
 import { KMS_CLIENT_FACTORY, KmsKeyWrapper, createKmsClient } from './custody/kms-key-wrapper.js';
 import { SeedCustodyService } from './custody/seed-custody.service.js';
@@ -41,6 +44,13 @@ import { WalletController } from './wallet.controller.js';
  *
  * - `KEY_WRAPPER` is the port `SeedCustodyService` depends on, bound here to
  *   `KmsKeyWrapper`. That binding is the only place AWS enters the wallet module.
+ *
+ * Step 32 rebinds `KEY_WRAPPER` to a *decorator* over that implementation, and the shape of the
+ * change is the argument for it: `KmsKeyWrapper` stays the only file in the app that knows AWS,
+ * `SeedCustodyService` stays a class that holds no database handle, and the one place both facts
+ * are visible together is the binding below. `AuditedKeyWrapper`'s docstring records why the
+ * alternative - a call to `AuditService` inside either of those two classes - would have been
+ * worse.
  * - `KMS_CLIENT_FACTORY` is bound to the real SDK constructor and to an injected
  *   fake in `KmsKeyWrapper`'s spec, so every branch of the KMS error mapping is
  *   testable without a network - the same reason `HORIZON_SERVER_FACTORY` exists.
@@ -115,8 +125,11 @@ import { WalletController } from './wallet.controller.js';
  * `PaymentsModule` will be the first module allowed to.
  */
 @Module({
-  /** The `stellar_accounts` table, and nothing else: see the docstring above. */
-  imports: [PrismaModule],
+  /**
+   * The one table this context owns and the one it only writes to: see the docstring above for why
+   * `AuditModule` is here despite being nothing like the other.
+   */
+  imports: [AuditModule, PrismaModule],
   controllers: [WalletController],
   providers: [
     StellarService,
@@ -131,7 +144,22 @@ import { WalletController } from './wallet.controller.js';
      */
     { provide: STELLAR_TRANSACTION_LOOKUP, useClass: HorizonTransactionLookup },
     SeedCustodyService,
-    { provide: KEY_WRAPPER, useClass: KmsKeyWrapper },
+    /**
+     * Two providers where Step 18 had one, and the split *is* the audit.
+     *
+     * The concrete wrapper became a dependency of the binding rather than the binding itself, which
+     * is what lets `AuditedKeyWrapper` take it. `useFactory` rather than `useClass` because the
+     * decorator takes `AuditService` from outside this context, and naming both `inject` entries
+     * here keeps "which class talks to KMS" and "what is audited" one line apart - so a reader who
+     * wants to know whether custody events reach the audit table has exactly one place to look.
+     */
+    KmsKeyWrapper,
+    {
+      provide: KEY_WRAPPER,
+      useFactory: (inner: KmsKeyWrapper, audit: AuditService) =>
+        new AuditedKeyWrapper(inner, audit),
+      inject: [KmsKeyWrapper, AuditService],
+    },
     { provide: KMS_CLIENT_FACTORY, useValue: createKmsClient },
     UsdcTrustlineService,
     { provide: ACCOUNT_FUNDER, useClass: FriendbotFunder },

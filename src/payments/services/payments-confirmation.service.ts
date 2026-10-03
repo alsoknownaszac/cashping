@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { AuditService } from '../../audit/audit.service.js';
 import { Amount } from '../../common/money/amount.js';
 import { TransactionStatus } from '../../generated/prisma/enums.js';
 import { NotificationsService } from '../../notifications/notifications.service.js';
@@ -95,8 +96,10 @@ export const STUCK_WITHOUT_HASH_AFTER_MS = 5 * 60_000;
  * 4. Write through the state machine's writers (`markSuccessful`, `markFailed`), and act on the
  *    answer: a lost compare-and-set means another caller resolved the payment first, so this tick
  *    logs it and does nothing else.
- * 5. Notify the sender, *after* the write and only when the write was this tick's. A notification
- *    is a consequence of a resolution, never a condition of one.
+ * 5. Record the resolution in the audit trail, then notify the sender - both *after* the write and
+ *    only when the write was this tick's. An entry and a message are consequences of a resolution,
+ *    never conditions of one, and running each in the tick that won the compare-and-set is what
+ *    makes both at-most-once without any bookkeeping of their own.
  *
  * ## What a tick never does
  *
@@ -122,6 +125,16 @@ export class PaymentsConfirmationService {
      */
     private readonly stellar: StellarService,
     private readonly notifications: NotificationsService,
+    /**
+     * Step 32's record of what was asked, as opposed to what money did.
+     *
+     * The two entries here (`payment.completed`, `payment.failed`) are the ones that close the loop
+     * `payment.initiated` opens, and they are written from *this* class rather than from
+     * `markSuccessful`/`markFailed` because the writers are a state machine over one column and this
+     * is the only class that knows a payment id, its sender, a ledger number or a failure reason at
+     * the same time.
+     */
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -138,12 +151,17 @@ export class PaymentsConfirmationService {
       where: { status: TransactionStatus.PROCESSING, stellarTxHash: { not: null } },
       select: {
         id: true,
+        // Who created the payment, which the audit entry for its resolution names as the actor: the
+        // sender is who the outcome happened to, and the id is the one identity here the sender's
+        // phone number (below) is not allowed to stand in for.
+        senderId: true,
         amount: true,
         stellarTxHash: true,
         submissionDeadline: true,
         // The sender's number is how a settlement reaches them (and is masked in every log line);
-        // the recipient's handle is what the message names.
-        sender: { select: { phoneNumber: true } },
+        // the recipient's handle is what the message names. Step 34c adds the address: a receipt
+        // goes to it as well, but only once verified - see `verifiedEmail`.
+        sender: { select: { phoneNumber: true, email: true, emailVerifiedAt: true } },
         recipient: { select: { handle: true } },
       },
       orderBy: { submissionDeadline: 'asc' },
@@ -226,12 +244,14 @@ export class PaymentsConfirmationService {
   }
 
   /**
-   * Resolves a payment as successful, notifies, and counts it - in that order.
+   * Resolves a payment as successful, records it, notifies, and counts it - in that order - and the
+   * order is the design.
    *
    * The compare-and-set decides who gets to do the rest: `false` means another caller (a second
    * API instance, an overlapping tick) resolved this payment between this tick's read and this
-   * write, so this tick says nothing about it. That is also what makes the notification
-   * at-most-once per resolution without any bookkeeping of its own.
+   * write, so this tick says nothing about it. That is what makes the audit entry and the
+   * notification at-most-once per resolution without any bookkeeping of their own - the winner of
+   * the write is the only caller that produces either.
    */
   private async confirm(
     row: SweepRow,
@@ -251,10 +271,40 @@ export class PaymentsConfirmationService {
       `Payment ${row.id} confirmed in ledger ${ledger} (${row.stellarTxHash ?? 'no hash'})`,
     );
 
+    /**
+     * Step 32: `payment.completed`, written after the compare-and-set and before the notification,
+     * and both halves of that are decisions.
+     *
+     * After the write, because the entry records an outcome and there is no outcome until the row
+     * says so - the `false` above returns before this line, which is the tick that lost the race and
+     * therefore records nothing. Before the notification, because the two failures are not equally
+     * bad: a provider outage that loses the SMS leaves the money fact recorded here, where an entry
+     * written after a `notify` that threw would leave a settled payment with nothing in the trail.
+     *
+     * The ledger number is the one piece of context worth the row - it is what an operator takes to
+     * an explorer, and it is a number this app read from Horizon rather than anything a client sent.
+     * The hash is deliberately not repeated: the `transactions` row holds it, and a copy in a table
+     * that cannot be corrected is a copy that can be wrong.
+     */
+    await this.audit.log({
+      action: 'payment.completed',
+      userId: row.senderId,
+      subjectId: row.id,
+      outcome: 'ok',
+      metadata: { ledger },
+    });
+
     await this.notify(row, 'SUCCESSFUL');
   }
 
-  /** The same, for a definitive no. The reason is the writer's column value and this line's text. */
+  /**
+   * The same, for a definitive no. The reason is the writer's column value and this line's text.
+   *
+   * `payment.failed` carries that reason for the same purpose the entry above carries its ledger: it
+   * is a code this app produced (`not-found-after-deadline`, `landed-unsuccessful:tx_failed` - see
+   * `triageConfirmation`, which is a pure function precisely so every one of them is a test), not a
+   * provider's words, which is what makes it safe in a table support reads.
+   */
   private async fail(
     row: SweepRow,
     reason: string,
@@ -271,6 +321,14 @@ export class PaymentsConfirmationService {
 
     this.logger.warn(`Payment ${row.id} failed: ${reason}`);
 
+    await this.audit.log({
+      action: 'payment.failed',
+      userId: row.senderId,
+      subjectId: row.id,
+      outcome: 'failed',
+      metadata: { reason },
+    });
+
     await this.notify(row, 'FAILED');
   }
 
@@ -285,13 +343,21 @@ export class PaymentsConfirmationService {
    */
   private async notify(row: SweepRow, status: 'SUCCESSFUL' | 'FAILED'): Promise<void> {
     try {
-      await this.notifications.sendPaymentResult(row.sender.phoneNumber, {
-        status,
-        // The stored amount, read back through the money module rather than echoed: the message
-        // then cannot disagree with the column.
-        amount: Amount.fromDatabase(row.amount).toString(),
-        recipientHandle: row.recipient.handle,
-      });
+      await this.notifications.sendPaymentResult(
+        row.sender.phoneNumber,
+        {
+          status,
+          // The stored amount, read back through the money module rather than echoed: the message
+          // then cannot disagree with the column.
+          amount: Amount.fromDatabase(row.amount).toString(),
+          recipientHandle: row.recipient.handle,
+        },
+        // Step 34c: the address, but only once a code has proved it. An address merely attached
+        // (`email` set, `email_verified_at` null) is passed as `null`, so a receipt cannot be sent
+        // to a mailbox nobody has shown they can read - and `sendPaymentResult`'s email arm treats
+        // `null` as "no second channel".
+        this.verifiedEmail(row.sender),
+      );
     } catch (error) {
       this.logger.error(
         `Payment ${row.id} is ${status}, but the notification could not be sent - ${
@@ -299,6 +365,19 @@ export class PaymentsConfirmationService {
         }`,
       );
     }
+  }
+
+  /**
+   * The address a receipt may go to, or `null` (Step 34c).
+   *
+   * `email` is the address the account *claims* and `emailVerifiedAt` is when a code proved the
+   * account controls it; only the second makes the address a delivery channel, so the two columns
+   * are read together here and an attached-but-unproved address is reported as `null` rather than
+   * as itself. That is the one rule this method exists to state: a receipt is email, and email
+   * goes only where someone has proved they can read it.
+   */
+  private verifiedEmail(sender: SweepRow['sender']): string | null {
+    return sender.emailVerifiedAt === null ? null : sender.email;
   }
 
   /**
@@ -322,9 +401,16 @@ export class PaymentsConfirmationService {
 /** The columns one in-flight row is polled with - the query's `select`, as a type. */
 interface SweepRow {
   readonly id: string;
+  /** `transactions.sender_id`: the actor the resolution's audit entry is attributed to. */
+  readonly senderId: string;
   readonly amount: { toString(): string };
   readonly stellarTxHash: string | null;
   readonly submissionDeadline: Date | null;
-  readonly sender: { readonly phoneNumber: string };
+  readonly sender: {
+    readonly phoneNumber: string;
+    /** The claimed address, or `null`. Only sent to when `emailVerifiedAt` is set - see `verifiedEmail`. */
+    readonly email: string | null;
+    readonly emailVerifiedAt: Date | null;
+  };
   readonly recipient: { readonly handle: string | null };
 }

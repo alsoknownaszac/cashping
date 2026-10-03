@@ -937,6 +937,11 @@ the deploy's own gates are the build (`npm ci`, `prisma generate`, `nest build`)
 instance runs as it starts, which is why the workflow is the check that is supposed to fail first rather
 than one Render consults.
 
+**In one line: Render builds and runs the API as native Node, and does not use the image.** The
+multi-stage `Dockerfile` and `docker-compose.yml` stay in the repository for local development and for
+any non-Render deployment; nothing in the Render service consumes them. The rest of this section is the
+argument for that split, and the gaps it leaves.
+
 **The API is native, not an image, and the reason is where the migration lives.** The first revision of this
 file ran the API from the multi-stage `Dockerfile`, on the argument that the repository already built and ran
 that way. The argument wore out when the migration moved out of `preDeployCommand` and into the start

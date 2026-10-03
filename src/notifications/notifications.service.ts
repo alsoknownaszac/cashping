@@ -1,18 +1,24 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { maskPhoneNumber } from '../common/phone/phone-number.js';
+import { EMAIL_SENDER, type EmailSender } from './email/email-sender.js';
 import { SMS_SENDER, type SmsSender } from './sms/sms-sender.js';
 
 /**
  * Outbound user-facing messages.
  *
- * The only thing the rest of the app knows about SMS. `AuthService` calls
- * `sendOtp` and gets either "the provider accepted it" or an error - it never
- * learns which provider, which host, or how the message is worded.
+ * The only thing the rest of the app knows about SMS *and email*. `AuthService` calls
+ * `sendOtp` or `sendEmailVerification` and gets either "the provider accepted it" or an
+ * error - it never learns which provider, which host, or how the message is worded.
  *
- * This is a *delivery* service, not a template engine: the text of the one
- * message this API sends today lives here, next to the code that sends it, so
- * reading this file answers "what does our OTP SMS say".
+ * This is a *delivery* service, not a template engine: the text of each message lives here,
+ * next to the code that sends it, so reading this file answers "what does our verification
+ * SMS say" and "what does our receipt email say".
+ *
+ * Step 34c added the email channel, and the way it was added is the point of the seam: a
+ * second injected sender and two new methods, with no caller of `sendOtp` or
+ * `sendPaymentResult` changed. The receipt is the one message that goes out on *both*
+ * channels, and it says the same thing on each.
  */
 @Injectable()
 export class NotificationsService {
@@ -22,6 +28,7 @@ export class NotificationsService {
     // Injected by token, so the binding (not this class) decides which provider
     // sends the message. See `NotificationsModule`.
     @Inject(SMS_SENDER) private readonly smsSender: SmsSender,
+    @Inject(EMAIL_SENDER) private readonly emailSender: EmailSender,
     private readonly config: ConfigService,
   ) {}
 
@@ -54,6 +61,36 @@ export class NotificationsService {
   }
 
   /**
+   * Sends the email verification code (Step 34c).
+   *
+   * The same shape as `sendOtp` and for the same reasons: the TTL in the body is read from
+   * the same `otp.ttlMinutes` the row's expiry is computed from, so the sentence and the
+   * database cannot disagree; the code is passed through and never logged; and a rejection
+   * means the provider did not accept the message, so the caller decides what an
+   * undeliverable code means (it is not a 2xx).
+   *
+   * The wording lives here, beside the sender, exactly as the SMS wording does - and it is
+   * plain text, because the seam is a plain-text sender and markup is a feature of whichever
+   * provider is eventually chosen.
+   */
+  async sendEmailVerification(to: string, code: string): Promise<void> {
+    const ttlMinutes = this.config.getOrThrow<number>('otp.ttlMinutes');
+
+    const result = await this.emailSender.send({
+      to,
+      from: this.from(),
+      subject: 'Your Cashping verification code',
+      body: `Cashping: ${code} is your email verification code. It expires in ${ttlMinutes} minutes. Never share it with anyone.`,
+    });
+
+    this.logger.log(
+      `Verification email accepted by the provider (to=${maskEmailAddress(to)}${
+        result.providerMessageId === undefined ? '' : `, messageId=${result.providerMessageId}`
+      })`,
+    );
+  }
+
+  /**
    * Tells the sender how a payment ended (Step 28).
    *
    * The two sentences, and nothing else: a payment has two endings a customer cares about, and
@@ -68,8 +105,18 @@ export class NotificationsService {
    * Rejects when the provider did not accept the message, like `sendOtp` - the caller decides
    * what an undeliverable notice means, and the confirmation sweep's answer is to log it and
    * keep the resolution, because the payment is already written.
+   *
+   * Step 34c adds the second channel: when `email` is non-null (a *verified* address - the
+   * caller passes `null` for an address nobody has proved) the same body is emailed as well.
+   * The SMS is attempted first and its failure propagates, because a phone number is the
+   * channel every account has; the email is secondary, so its failure is logged and swallowed
+   * here rather than turning a delivered SMS into a rejected call.
    */
-  async sendPaymentResult(phoneNumber: string, notice: PaymentResultNotice): Promise<void> {
+  async sendPaymentResult(
+    phoneNumber: string,
+    notice: PaymentResultNotice,
+    email: string | null = null,
+  ): Promise<void> {
     const to = notice.recipientHandle === null ? '' : ` to @${notice.recipientHandle}`;
     const body =
       notice.status === 'SUCCESSFUL'
@@ -83,7 +130,71 @@ export class NotificationsService {
         result.providerMessageId === undefined ? '' : `, messageId=${result.providerMessageId}`
       })`,
     );
+
+    if (email !== null) {
+      await this.sendReceiptEmail(email, notice, body);
+    }
   }
+
+  /**
+   * The email arm of a payment receipt (Step 34c).
+   *
+   * Swallows its own failure on purpose - see `sendPaymentResult`. The subject carries the
+   * outcome so the inbox line is informative without opening it, and the body is the *same
+   * string* the SMS used, so the two channels cannot say different things about one payment.
+   */
+  private async sendReceiptEmail(
+    to: string,
+    notice: PaymentResultNotice,
+    body: string,
+  ): Promise<void> {
+    try {
+      const result = await this.emailSender.send({
+        to,
+        from: this.from(),
+        subject:
+          notice.status === 'SUCCESSFUL'
+            ? 'Your Cashping payment went through'
+            : 'Your Cashping payment did not go through',
+        body,
+      });
+
+      this.logger.log(
+        `Payment ${notice.status} email accepted by the provider (to=${maskEmailAddress(to)}${
+          result.providerMessageId === undefined ? '' : `, messageId=${result.providerMessageId}`
+        })`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Payment ${notice.status} email to ${maskEmailAddress(to)} could not be sent - ${
+          error instanceof Error ? error.message : 'unknown failure'
+        }`,
+      );
+    }
+  }
+
+  /** The one from-address, read from configuration so the template and the binding agree. */
+  private from(): string {
+    return this.config.getOrThrow<string>('email.from');
+  }
+}
+
+/**
+ * `m***@example.com`: enough of the address for an operator to recognise the account, and not
+ * the address itself.
+ *
+ * Local because this is the only file that logs one, and the rule it follows is the one
+ * `maskPhoneNumber` exists for: a log line is a place an identifier can leak from, so the
+ * value in front of a human is the masked form and only the masked form.
+ */
+function maskEmailAddress(email: string): string {
+  const at = email.indexOf('@');
+
+  if (at <= 1) {
+    return '***';
+  }
+
+  return `${email[0]}***${email.slice(at)}`;
 }
 
 /**

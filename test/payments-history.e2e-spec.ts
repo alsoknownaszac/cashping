@@ -83,6 +83,9 @@ import { StellarService } from './../src/wallet/stellar/stellar.service.js';
 
 const PAYMENTS_PATH = `/${GLOBAL_PREFIX}/payments`;
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
+
+/** The PIN every registration sends (Step 34a): exactly four digits, or the DTO refuses the body. */
+const PIN = '1234';
 const VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/otp/verify`;
 
 /** One row of history, as a page spells it. */
@@ -397,7 +400,7 @@ describe('Payment history (e2e)', () => {
   async function registerAndVerify(local: string, e164: string, handle: string): Promise<Session> {
     const registration = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: local, handle });
+      .send({ pin: PIN, phoneNumber: local, handle });
 
     expect(
       registration.status,

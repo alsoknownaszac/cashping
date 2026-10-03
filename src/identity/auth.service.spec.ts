@@ -1,6 +1,7 @@
 import { HttpException, UnauthorizedException } from '@nestjs/common';
 import { type ConfigService } from '@nestjs/config';
 import { describe, expect, it } from 'vitest';
+import { type AuditEntry, type AuditService } from '../audit/audit.service.js';
 import { UserStatus } from '../generated/prisma/enums.js';
 import { type NotificationsService } from '../notifications/notifications.service.js';
 import { SmsDeliveryError } from '../notifications/sms/sms-sender.js';
@@ -16,25 +17,42 @@ import {
   type OtpRateLimiterService,
 } from './otp/otp-rate-limiter.service.js';
 import { type IssuedOtp, type OtpCheckOutcome, type OtpService } from './otp/otp.service.js';
+import {
+  type PinAttemptOutcome,
+  type PinChangeOutcome,
+  type PinService,
+} from './pin/pin.service.js';
+import { type IssuedStepUpToken, type StepUpTokenService } from './pin/step-up-token.service.js';
 import { type IssuedTokens, type SessionUser, type TokenService } from './token/token.service.js';
+import {
+  type EmailService,
+  type EmailSetOutcome,
+  type EmailVerifyOutcome,
+} from './email/email.service.js';
+import { type PasswordChangeOutcome, type PasswordService } from './password/password.service.js';
 
 /**
- * Steps 10, 14 and 16: the decisions `AuthService` makes, in the order it makes them.
+ * Steps 10, 14, 16 and 32: the decisions `AuthService` makes, in the order it makes them.
  *
  * Everything around it is faked, so each test names one behaviour - which status
  * code a given situation produces, and crucially *what must not have happened*
  * (no SMS on a 409, no row on a 429, no user created for an unparseable number, no
  * session started by a code that was already spent, no wallet for a code that was
- * refused). The database and Redis are exercised for real in `test/auth.e2e-spec.ts`.
+ * refused, and no audit entry for a request that never got as far as doing anything).
+ * The database and Redis are exercised for real in `test/auth.e2e-spec.ts`.
  */
 
 /** A Ghanaian mobile written the way a user types it, and how it must be stored. */
 const LOCAL_NUMBER = '024 123 4567';
 const E164_NUMBER = '+233241234567';
 
+/** The PIN every registration in this file sends (Step 34a): four digits, or the DTO refuses it. */
+const PIN = '1234';
+
 const OTP_CONFIG: Readonly<Record<string, number | string>> = {
   'phone.defaultRegion': 'GH',
   'otp.codeLength': 6,
+  'otp.ttlMinutes': 10,
 };
 
 function createConfig(): ConfigService {
@@ -47,6 +65,8 @@ interface FakeUser {
   status: UserStatus;
   phoneVerifiedAt: Date | null;
   handle: string | null;
+  /** The scrypt hash registration writes (Step 34a) - never the PIN itself. */
+  transactionPinHash: string | null;
 }
 
 /** The two tables `AuthService` touches, plus a log of the calls it made. */
@@ -111,7 +131,7 @@ class FakePrisma {
       return this.users.get(args.where.phoneNumber) ?? null;
     },
     create: async (args: {
-      data: { phoneNumber: string; handle?: string | null };
+      data: { phoneNumber: string; handle?: string | null; transactionPinHash?: string };
     }): Promise<FakeUser> => {
       this.calls.push('create');
 
@@ -122,9 +142,39 @@ class FakePrisma {
         // The column default, not something the service restates.
         status: UserStatus.PENDING_VERIFICATION,
         phoneVerifiedAt: null,
+        transactionPinHash: args.data.transactionPinHash ?? null,
       };
 
       this.users.set(user.phoneNumber, user);
+
+      return user;
+    },
+    /**
+     * The resend path, which Step 34a made unconditional: the PIN is written with the row
+     * every time, so the update happens even when the handle is not resubmitted.
+     *
+     * `undefined` means "column not provided" here exactly as it does in Prisma, which is what
+     * the service relies on when it sends a handle that was not resubmitted.
+     */
+    update: async (args: {
+      where: { id: string };
+      data: { handle?: string; transactionPinHash?: string };
+    }): Promise<FakeUser> => {
+      this.calls.push('update');
+
+      const user = [...this.users.values()].find((candidate) => candidate.id === args.where.id);
+
+      if (user === undefined) {
+        throw new Error(`no user with id ${args.where.id}`);
+      }
+
+      if (args.data.handle !== undefined) {
+        user.handle = args.data.handle;
+      }
+
+      if (args.data.transactionPinHash !== undefined) {
+        user.transactionPinHash = args.data.transactionPinHash;
+      }
 
       return user;
     },
@@ -180,7 +230,10 @@ class FakeRateLimiter {
 /** The SMS boundary, recording the messages that would have gone out. */
 class FakeNotifications {
   readonly sent: Array<{ phoneNumber: string; code: string }> = [];
+  /** Step 34c: what was emailed, so a test can read the code back out of it. */
+  readonly emails: Array<{ email: string; code: string }> = [];
   error: Error | null = null;
+  emailError: Error | null = null;
 
   sendOtp = async (phoneNumber: string, code: string): Promise<void> => {
     if (this.error !== null) {
@@ -188,6 +241,14 @@ class FakeNotifications {
     }
 
     this.sent.push({ phoneNumber, code });
+  };
+
+  sendEmailVerification = async (email: string, code: string): Promise<void> => {
+    if (this.emailError !== null) {
+      throw this.emailError;
+    }
+
+    this.emails.push({ email, code });
   };
 }
 
@@ -283,6 +344,149 @@ class FakeProvisioning {
   };
 }
 
+/**
+ * `AuditService` as `AuthService` is allowed to see it (Step 32).
+ *
+ * It shares `FakePrisma`'s call log, exactly as `FakeProvisioning` does, because *where* an entry
+ * lands in that sequence is one of this step's decisions: `auth.otp.verified` after the commit and
+ * before the wallet, `auth.login` after the code has been spent.
+ */
+class FakeAudit {
+  calls: string[] = [];
+
+  readonly entries: AuditEntry[] = [];
+
+  log = async (entry: AuditEntry): Promise<void> => {
+    this.calls.push(`audit:${entry.action}`);
+    this.entries.push(entry);
+  };
+}
+
+/**
+ * `PinService` as `AuthService` is allowed to see it (Step 34a).
+ *
+ * Two methods, and the outcome each test wants - which is what lets this file assert the mapping
+ * from an outcome to a status code (401 on the step-up call, 409 on a change, 429 when locked)
+ * without a database, a lockout clock or a scrypt hash in the way. `pin.service.spec.ts` is where
+ * the arithmetic itself is asserted.
+ */
+class FakePinService {
+  readonly changed: Array<{ userId: string; currentPin: string | undefined; pin: string }> = [];
+  readonly verified: Array<{ userId: string; pin: string }> = [];
+
+  changeOutcome: PinChangeOutcome = {
+    ok: true,
+    pinSetAt: new Date('2026-10-02T10:00:00.000Z'),
+  };
+
+  verifyOutcome: PinAttemptOutcome = { ok: true };
+
+  change = async (
+    userId: string,
+    currentPin: string | undefined,
+    pin: string,
+  ): Promise<PinChangeOutcome> => {
+    this.changed.push({ userId, currentPin, pin });
+
+    return this.changeOutcome;
+  };
+
+  verify = async (userId: string, pin: string): Promise<PinAttemptOutcome> => {
+    this.verified.push({ userId, pin });
+
+    return this.verifyOutcome;
+  };
+}
+
+/** `StepUpTokenService`, recording whose PIN a token was minted for. */
+class FakeStepUpTokenService {
+  readonly issued: string[] = [];
+
+  issuedToken: IssuedStepUpToken = {
+    token: 'step-up-token-1',
+    expiresAt: new Date('2026-10-02T10:05:00.000Z'),
+  };
+
+  issue = async (userId: string): Promise<IssuedStepUpToken> => {
+    this.issued.push(userId);
+
+    return this.issuedToken;
+  };
+}
+
+/**
+ * `PasswordService` as `AuthService` is allowed to see it (Step 34b).
+ *
+ * An outcome each test chooses, so the mapping from an outcome to a status code (409 on a
+ * missing or wrong current password) can be asserted without a scrypt hash in the way.
+ * `password.service.spec.ts` is where the hashing and the write are asserted.
+ */
+class FakePasswordService {
+  readonly changed: Array<{
+    userId: string;
+    currentPassword: string | undefined;
+    password: string;
+  }> = [];
+  readonly verified: Array<{ userId: string; password: string }> = [];
+
+  changeOutcome: PasswordChangeOutcome = {
+    ok: true,
+    passwordSetAt: new Date('2026-10-03T10:00:00.000Z'),
+  };
+
+  verifyResult = true;
+
+  change = async (
+    userId: string,
+    currentPassword: string | undefined,
+    password: string,
+  ): Promise<PasswordChangeOutcome> => {
+    this.changed.push({ userId, currentPassword, password });
+
+    return this.changeOutcome;
+  };
+
+  verify = async (userId: string, password: string): Promise<boolean> => {
+    this.verified.push({ userId, password });
+
+    return this.verifyResult;
+  };
+
+  set = async (_userId: string, _password: string): Promise<Date> =>
+    new Date('2026-10-03T10:00:00.000Z');
+}
+
+/** `EmailService` as `AuthService` is allowed to see it (Step 34c). */
+class FakeEmailService {
+  readonly setCalls: Array<{ userId: string; email: string }> = [];
+  readonly verified: Array<{ userId: string; code: string }> = [];
+
+  setOutcome: EmailSetOutcome = {
+    ok: true,
+    email: 'miriam@example.com',
+    code: '123456',
+    expiresAt: new Date('2026-10-03T10:10:00.000Z'),
+  };
+
+  verifyOutcome: EmailVerifyOutcome = {
+    ok: true,
+    email: 'miriam@example.com',
+    emailVerifiedAt: new Date('2026-10-03T10:05:00.000Z'),
+  };
+
+  set = async (userId: string, email: string): Promise<EmailSetOutcome> => {
+    this.setCalls.push({ userId, email });
+
+    return this.setOutcome;
+  };
+
+  verify = async (userId: string, code: string): Promise<EmailVerifyOutcome> => {
+    this.verified.push({ userId, code });
+
+    return this.verifyOutcome;
+  };
+}
+
 interface Harness {
   prisma: FakePrisma;
   otp: FakeOtpService;
@@ -290,6 +494,11 @@ interface Harness {
   notifications: FakeNotifications;
   tokens: FakeTokenService;
   provisioning: FakeProvisioning;
+  audit: FakeAudit;
+  pins: FakePinService;
+  stepUpTokens: FakeStepUpTokenService;
+  passwords: FakePasswordService;
+  emails: FakeEmailService;
   auth: AuthService;
 }
 
@@ -300,8 +509,14 @@ function createHarness(): Harness {
   const notifications = new FakeNotifications();
   const tokens = new FakeTokenService();
   const provisioning = new FakeProvisioning();
+  const audit = new FakeAudit();
+  const pins = new FakePinService();
+  const stepUpTokens = new FakeStepUpTokenService();
+  const passwords = new FakePasswordService();
+  const emails = new FakeEmailService();
 
   provisioning.calls = prisma.calls;
+  audit.calls = prisma.calls;
 
   return {
     prisma,
@@ -310,6 +525,11 @@ function createHarness(): Harness {
     notifications,
     tokens,
     provisioning,
+    audit,
+    pins,
+    stepUpTokens,
+    passwords,
+    emails,
     auth: new AuthService(
       prisma as unknown as PrismaService,
       createConfig(),
@@ -318,6 +538,11 @@ function createHarness(): Harness {
       notifications as unknown as NotificationsService,
       tokens as unknown as TokenService,
       provisioning as unknown as AccountProvisioningService,
+      audit as unknown as AuditService,
+      pins as unknown as PinService,
+      stepUpTokens as unknown as StepUpTokenService,
+      passwords as unknown as PasswordService,
+      emails as unknown as EmailService,
     ),
   };
 }
@@ -330,6 +555,9 @@ function seedUser(prisma: FakePrisma, overrides: Partial<FakeUser> = {}): FakeUs
     status: UserStatus.PENDING_VERIFICATION,
     phoneVerifiedAt: null,
     handle: null,
+    // The PIN a previous registration would have written. `null` is the honest default for a row
+    // seeded directly, and it is what Step 34d's Google accounts look like.
+    transactionPinHash: null,
     ...overrides,
   };
 
@@ -367,7 +595,7 @@ describe('AuthService.register', () => {
   it('normalizes the number before it is looked up, stored or texted', async () => {
     const { auth, prisma, notifications } = createHarness();
 
-    const response = await auth.register({ phoneNumber: LOCAL_NUMBER });
+    const response = await auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER });
 
     // Stored as E.164: the unique index is on this column, so a row written from
     // the raw input would not collide with the next registration of the same
@@ -380,7 +608,7 @@ describe('AuthService.register', () => {
   it('answers with the account, the expiry and the code length - never the code', async () => {
     const { auth } = createHarness();
 
-    const response = await auth.register({ phoneNumber: LOCAL_NUMBER });
+    const response = await auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER });
 
     expect(response.status).toBe(UserStatus.PENDING_VERIFICATION);
     expect(response.userId).toBe('user-1');
@@ -398,7 +626,7 @@ describe('AuthService.register', () => {
     const { auth, prisma, notifications } = createHarness();
 
     const { status, message } = await captureHttpError(() =>
-      auth.register({ phoneNumber: 'definitely-not-a-number' }),
+      auth.register({ pin: PIN, phoneNumber: 'definitely-not-a-number' }),
     );
 
     expect(status).toBe(400);
@@ -412,10 +640,10 @@ describe('AuthService.register', () => {
   });
 
   it('refuses an already active number with a 409, without sending an SMS', async () => {
-    const { auth, prisma, limiter, notifications } = createHarness();
+    const { auth, prisma, limiter, notifications, audit } = createHarness();
     seedUser(prisma, { status: UserStatus.ACTIVE });
 
-    const { status } = await captureHttpError(() => auth.register({ phoneNumber: LOCAL_NUMBER }));
+    const { status } = await captureHttpError(() => auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER }));
 
     expect(status).toBe(409);
     // Deliberately *before* the rate limit: otherwise anyone could spend a real
@@ -423,13 +651,17 @@ describe('AuthService.register', () => {
     expect(limiter.consumed).toEqual([]);
     expect(notifications.sent).toHaveLength(0);
     expect(prisma.calls).toEqual(['findUnique']);
+    // And no entry (Step 32): nothing was set, so there is nothing to record - and an append-only
+    // table that could be filled by a refused request would be a table nobody could trust the shape
+    // of. The handles this user does have were recorded when they were claimed.
+    expect(audit.entries).toEqual([]);
   });
 
   it('refuses a suspended number with a 403', async () => {
     const { auth, prisma, notifications } = createHarness();
     seedUser(prisma, { status: UserStatus.SUSPENDED });
 
-    const { status } = await captureHttpError(() => auth.register({ phoneNumber: LOCAL_NUMBER }));
+    const { status } = await captureHttpError(() => auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER }));
 
     expect(status).toBe(403);
     expect(notifications.sent).toHaveLength(0);
@@ -439,7 +671,7 @@ describe('AuthService.register', () => {
     const { auth, prisma, otp, notifications } = createHarness();
     const existing = seedUser(prisma);
 
-    const response = await auth.register({ phoneNumber: LOCAL_NUMBER });
+    const response = await auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER });
 
     expect(response.userId).toBe(existing.id);
     expect(prisma.users.size).toBe(1);
@@ -450,12 +682,80 @@ describe('AuthService.register', () => {
     expect(notifications.sent).toHaveLength(1);
   });
 
+  /**
+   * Step 32's registration entry, and the reason it is written *before* the code is issued and the
+   * SMS sent: by that line the row exists with this handle, and that fact does not become untrue
+   * because the provider was down. The other half of the assertion is `source`, which is what makes
+   * the trail readable - and the middle call is why that matters: a handle changed on a resend is
+   * two entries with two different values for one user id, which is exactly the history an
+   * append-only table is for.
+   */
+  it('appends user.handle.set, naming the row and how the handle was claimed', async () => {
+    const { auth, prisma, audit } = createHarness();
+    // Drawn from the row the first call creates, so the two later entries point at the same user -
+    // which is the claim: one id, three entries, and a `source` that says which was which.
+    const number = LOCAL_NUMBER;
+
+    await auth.register({ pin: PIN, phoneNumber: number, handle: 'ama1' });
+    const user = prisma.users.get(E164_NUMBER);
+
+    // A mistyped handle, corrected on the resend: allowed by Step 14, and visible here.
+    await auth.register({ pin: PIN, phoneNumber: number, handle: 'ama_1' });
+    // And a resend that submits nothing: the row's own handle is what the entry carries.
+    await auth.register({ pin: PIN, phoneNumber: number });
+    // The updates are Prisma's own, so the spec asserts what the entry says rather than what the
+    // fake's map holds. Two of them now (Step 34a): the handle change, and the third registration -
+    // which submits no handle at all - because the PIN is written with the row on every path.
+    expect(prisma.calls.filter((call) => call === 'update')).toHaveLength(2);
+
+    expect(audit.entries).toEqual([
+      {
+        action: 'user.handle.set',
+        userId: user?.id,
+        outcome: 'ok',
+        metadata: { handle: 'ama1', source: 'registration' },
+      },
+      {
+        action: 'auth.pin.set',
+        userId: user?.id,
+        outcome: 'ok',
+        metadata: { source: 'registration' },
+      },
+      {
+        action: 'user.handle.set',
+        userId: user?.id,
+        outcome: 'ok',
+        metadata: { handle: 'ama_1', source: 'resend' },
+      },
+      {
+        action: 'auth.pin.set',
+        userId: user?.id,
+        outcome: 'ok',
+        metadata: { source: 'resend' },
+      },
+      {
+        action: 'user.handle.set',
+        userId: user?.id,
+        outcome: 'ok',
+        metadata: { handle: 'ama_1', source: 'resend' },
+      },
+      {
+        action: 'auth.pin.set',
+        userId: user?.id,
+        outcome: 'ok',
+        metadata: { source: 'resend' },
+      },
+    ]);
+    // The row agrees, so the entries are not the only witness.
+    expect(user?.handle).toBe('ama_1');
+  });
+
   it('refuses the request past the rate limit with a 429, leaving nothing behind', async () => {
     const { auth, prisma, limiter, otp, notifications } = createHarness();
     limiter.error = new OtpRateLimitExceededError(900);
 
     const { status, message } = await captureHttpError(() =>
-      auth.register({ phoneNumber: LOCAL_NUMBER }),
+      auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER }),
     );
 
     expect(status).toBe(429);
@@ -474,7 +774,7 @@ describe('AuthService.register', () => {
     const { auth, limiter, notifications } = createHarness();
     limiter.error = new OtpRateLimitUnavailableError();
 
-    const { status } = await captureHttpError(() => auth.register({ phoneNumber: LOCAL_NUMBER }));
+    const { status } = await captureHttpError(() => auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER }));
 
     expect(status).toBe(503);
     // Fail closed, the same way the limiter does: an unanswerable limit means no
@@ -483,16 +783,35 @@ describe('AuthService.register', () => {
   });
 
   it('answers 503 and keeps the pending row when the SMS provider refuses', async () => {
-    const { auth, prisma, notifications } = createHarness();
+    const { auth, prisma, notifications, audit } = createHarness();
     notifications.error = new SmsDeliveryError('the provider rejected the message');
 
-    const { status } = await captureHttpError(() => auth.register({ phoneNumber: LOCAL_NUMBER }));
+    const { status } = await captureHttpError(() => auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER }));
 
     expect(status).toBe(503);
     // The row and the code stay: the account cannot be activated without a code
     // the user never received, and deleting the row would race with a concurrent
     // registration for the same number.
     expect(prisma.users.get(E164_NUMBER)?.status).toBe(UserStatus.PENDING_VERIFICATION);
+    // The entries stay too (Step 32), and they are written before the send on purpose: the row above
+    // *does* exist with this handle, so the only thing that failed was an SMS. An entry placed after
+    // `sendOtp` would claim no handle was ever set when the user retries and finds their account.
+    // Step 34a's `auth.pin.set` is written on the same path and for the same reason: the PIN was
+    // stored with the row, and a provider outage afterwards does not make that untrue.
+    expect(audit.entries).toEqual([
+      {
+        action: 'user.handle.set',
+        userId: 'user-1',
+        outcome: 'ok',
+        metadata: { handle: null, source: 'registration' },
+      },
+      {
+        action: 'auth.pin.set',
+        userId: 'user-1',
+        outcome: 'ok',
+        metadata: { source: 'registration' },
+      },
+    ]);
   });
 });
 
@@ -649,18 +968,26 @@ describe('AuthService.verifyOtp', () => {
    * verification because a third party was slow).
    */
   it('provisions the wallet for the user it just verified, after the commit', async () => {
-    const { auth, prisma, provisioning } = createHarness();
+    const { auth, prisma, provisioning, audit } = createHarness();
     const user = seedUser(prisma);
 
     await auth.verifyOtp({ phoneNumber: LOCAL_NUMBER, code: '123456' });
 
+    // The entry is the third thing in that window and its position is the decision (Step 32): after
+    // the commit, because verification is durable by then, and *before* provisioning, because an
+    // entry that waited on a Horizon round trip would arrive seconds late and an `incomplete` wallet
+    // would leave the trail looking as though nothing had been verified.
     expect(prisma.calls).toEqual([
       'findUnique',
       'begin',
       'tx.consume',
       'tx.activate',
       'commit',
+      'audit:auth.otp.verified',
       'provision',
+    ]);
+    expect(audit.entries).toEqual([
+      { action: 'auth.otp.verified', userId: user.id, outcome: 'ok' },
     ]);
     // For the id the *database* holds, not the number the client sent: the wallet is
     // attached to a user row, and the number is only what was verified.
@@ -708,7 +1035,7 @@ describe('AuthService.verifyOtp', () => {
   });
 
   it('refuses a code that was already used, without activating the user', async () => {
-    const { auth, prisma } = createHarness();
+    const { auth, prisma, audit } = createHarness();
     const user = seedUser(prisma);
     // The row was live when it was checked and is not any more: the same person
     // double-tapping "verify", most likely.
@@ -726,6 +1053,10 @@ describe('AuthService.verifyOtp', () => {
     expect(prisma.calls).not.toContain('tx.activate');
     expect(user.status).toBe(UserStatus.PENDING_VERIFICATION);
     expect(user.phoneVerifiedAt).toBeNull();
+    // Nothing appended either (Step 32): the number was not proved, so `auth.otp.verified` would be
+    // a false record - and the code being refused is exactly the case where a false one would be
+    // least visible in the table.
+    expect(audit.entries).toEqual([]);
   });
 });
 
@@ -824,7 +1155,7 @@ describe('AuthService.requestLoginCode', () => {
 });
 describe('AuthService.login', () => {
   it('spends the code and starts a session, writing nothing to the user row', async () => {
-    const { auth, prisma, otp, tokens } = createHarness();
+    const { auth, prisma, otp, tokens, audit } = createHarness();
     const verifiedAt = new Date('2026-09-01T08:30:00.000Z');
     const user = seedUser(prisma, {
       status: UserStatus.ACTIVE,
@@ -849,9 +1180,12 @@ describe('AuthService.login', () => {
     expect(otp.checked).toEqual([{ userId: user.id, code: '123456' }]);
 
     // One write - spending the code - and no transaction around it: signing in changes
-    // nothing about the account, which is the whole difference from verification.
-    expect(prisma.calls).toEqual(['findUnique', 'consume']);
+    // nothing about the account, which is the whole difference from verification. Step 32's
+    // `auth.login` comes last, after the code is spent (which is what makes it a sign-in rather than
+    // a check on a live code) and after the pair is minted, so the row means "a session exists".
+    expect(prisma.calls).toEqual(['findUnique', 'consume', 'audit:auth.login']);
     expect(prisma.transactionCount).toBe(0);
+    expect(audit.entries).toEqual([{ action: 'auth.login', userId: user.id, outcome: 'ok' }]);
     // `phoneVerifiedAt` records when the *number* was proven; a sign-in that re-stamped it
     // would be a lie about that.
     expect(user.phoneVerifiedAt).toEqual(verifiedAt);
@@ -874,12 +1208,14 @@ describe('AuthService.login', () => {
     await auth.login({ phoneNumber: LOCAL_NUMBER, code: '123456' });
 
     expect(provisioning.provisioned).toEqual([]);
-    expect(prisma.calls).toEqual(['findUnique', 'consume']);
+    // Signing in is still an auditable event (Step 32): the wallet is what this test says is absent,
+    // not the record of the sign-in.
+    expect(prisma.calls).toEqual(['findUnique', 'consume', 'audit:auth.login']);
     expect(tokens.issued).toHaveLength(1);
   });
 
   it('refuses a code that was already used, and starts no session for it', async () => {
-    const { auth, prisma, otp, tokens } = createHarness();
+    const { auth, prisma, otp, tokens, audit } = createHarness();
     seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
     // Live when it was checked and gone by the time it is spent: the same person
     // double-tapping "sign in", or two devices racing with one code.
@@ -896,6 +1232,9 @@ describe('AuthService.login', () => {
     // live session behind on a failed write, and a session nobody was handed is an open
     // door - while a lost code costs one SMS to replace.
     expect(tokens.issued).toEqual([]);
+    // And no `auth.login` (Step 32): no session exists, so the entry would describe a sign-in that
+    // did not happen - the same rule that keeps `auth.otp.verified` off a refused code.
+    expect(audit.entries).toEqual([]);
   });
 
   it('answers 404 for a number with no account, without checking any code', async () => {
@@ -1053,5 +1392,146 @@ describe('AuthService.session', () => {
     });
 
     expect(response).toHaveProperty('handle', null);
+  });
+});
+
+describe('AuthService.register and the transaction PIN (Step 34a)', () => {
+  it('stores a hash of the PIN with the row, never the PIN', async () => {
+    const { auth, prisma } = createHarness();
+
+    await auth.register({ pin: PIN, phoneNumber: LOCAL_NUMBER });
+
+    const stored = prisma.users.get(E164_NUMBER)?.transactionPinHash;
+
+    // The one format `secret-hash.ts` writes. The column is never four digits, which is the whole
+    // reason a `char(4)` was refused in the migration.
+    expect(stored).toMatch(/^scrypt\$/);
+    expect(stored).not.toContain(PIN);
+  });
+
+  it('writes the PIN again when an unverified account registers again', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma);
+
+    await auth.register({ pin: '4321', phoneNumber: LOCAL_NUMBER });
+
+    // The row is reused and there is still only one; the PIN is written with it, because the code
+    // about to be sent is the proof that this is the same person. The alternative - a resend that
+    // skipped the write - is an account whose first payment fails for a reason its owner cannot see.
+    expect(prisma.users.size).toBe(1);
+    expect(prisma.calls).toContain('update');
+    expect(prisma.users.get(E164_NUMBER)?.transactionPinHash).not.toBeNull();
+  });
+});
+
+describe('AuthService.changePin / verifyPin (Step 34a)', () => {
+  /** The signed-in caller both endpoints receive, as `JwtStrategy` would have left it. */
+  const session: SessionUser = {
+    id: 'user-1',
+    phoneNumber: E164_NUMBER,
+    status: UserStatus.ACTIVE,
+    handle: 'ama_1',
+  };
+
+  it('answers with when the PIN was written, and passes both PINs through untouched', async () => {
+    const { auth, pins } = createHarness();
+
+    const response = await auth.changePin(session, { pin: '1234', currentPin: '4321' });
+
+    expect(pins.changed).toEqual([{ userId: session.id, currentPin: '4321', pin: '1234' }]);
+    expect(response.pinSetAt).toBe('2026-10-02T10:00:00.000Z');
+  });
+
+  it('maps a change with no currentPin to a 409 that names the field', async () => {
+    const { auth, pins } = createHarness();
+    pins.changeOutcome = { ok: false, reason: 'current_pin_required' };
+
+    const { status, message } = await captureHttpError(() =>
+      auth.changePin(session, { pin: '1234' }),
+    );
+
+    expect(status).toBe(409);
+    expect(message).toContain('currentPin');
+  });
+
+  it('maps a wrong current PIN to a 409 that says how many attempts are left', async () => {
+    const { auth, pins } = createHarness();
+    pins.changeOutcome = { ok: false, reason: 'invalid_pin', attemptsRemaining: 3 };
+
+    const { status, message } = await captureHttpError(() =>
+      auth.changePin(session, { pin: '1234', currentPin: '4321' }),
+    );
+
+    // A 409 rather than a 401: the access token is fine and the conflict is with the *account's*
+    // state. The same outcome is a 401 on the step-up call below, which is why the mapping lives
+    // here rather than in `PinService`.
+    expect(status).toBe(409);
+    expect(message).toContain('3 attempts remaining');
+  });
+
+  it('maps a wrong PIN on the step-up call to a 401 that says how many attempts are left', async () => {
+    const { auth, pins } = createHarness();
+    pins.verifyOutcome = { ok: false, reason: 'invalid_pin', attemptsRemaining: 4 };
+
+    const { status, message } = await captureHttpError(() =>
+      auth.verifyPin(session, { pin: '9999' }),
+    );
+
+    expect(status).toBe(401);
+    expect(message).toContain('4 attempts remaining');
+  });
+
+  it('maps a locked PIN to a 429 that says when it can be tried again', async () => {
+    const { auth, pins } = createHarness();
+    pins.verifyOutcome = {
+      ok: false,
+      reason: 'locked',
+      lockedUntil: new Date('2026-10-02T10:15:00.000Z'),
+    };
+
+    const { status, message } = await captureHttpError(() =>
+      auth.verifyPin(session, { pin: '1234' }),
+    );
+
+    // Waiting is the action, so it is a 429 rather than another refusal - and the message carries
+    // the instant, because "try again later" is not something a client can show anyone.
+    expect(status).toBe(429);
+    expect(message).toContain('2026-10-02T10:15:00.000Z');
+  });
+
+  it('maps an account with no PIN to a 409, because nothing was refused', async () => {
+    const { auth, pins } = createHarness();
+    pins.verifyOutcome = { ok: false, reason: 'not_set' };
+
+    const { status, message } = await captureHttpError(() =>
+      auth.verifyPin(session, { pin: '1234' }),
+    );
+
+    expect(status).toBe(409);
+    expect(message).toContain('No transaction PIN is set');
+  });
+
+  it('mints a step-up token for the caller, and answers with nothing else', async () => {
+    const { auth, pins, stepUpTokens } = createHarness();
+
+    const response = await auth.verifyPin(session, { pin: '1234' });
+
+    expect(pins.verified).toEqual([{ userId: session.id, pin: '1234' }]);
+    // Minted for the caller, not for the token's own sake: the guard compares this against the
+    // authenticated user, which is what stops one account's proof authorising another's payment.
+    expect(stepUpTokens.issued).toEqual([session.id]);
+    expect(response.stepUpToken).toBe('step-up-token-1');
+    expect(response.stepUpTokenExpiresAt).toBe('2026-10-02T10:05:00.000Z');
+    expect(Object.keys(response).sort()).toEqual(['stepUpToken', 'stepUpTokenExpiresAt']);
+  });
+
+  it('never puts the PIN in a refusal message', async () => {
+    const { auth, pins } = createHarness();
+    pins.verifyOutcome = { ok: false, reason: 'invalid_pin', attemptsRemaining: 4 };
+
+    const { message } = await captureHttpError(() => auth.verifyPin(session, { pin: '9999' }));
+
+    expect(message).not.toContain('9999');
+    expect(message).not.toContain('1234');
   });
 });

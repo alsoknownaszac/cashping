@@ -49,6 +49,9 @@ import {
  */
 
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
+
+/** The PIN every registration sends (Step 34a): exactly four digits, or the DTO refuses the body. */
+const PIN = '1234';
 const VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/otp/verify`;
 const LOGIN_CODE_PATH = `/${GLOBAL_PREFIX}/auth/login/otp`;
 const LOGIN_PATH = `/${GLOBAL_PREFIX}/auth/login`;
@@ -327,7 +330,7 @@ async function registerAndVerify(
    */
   const registration = await request(app.getHttpServer())
     .post(REGISTER_PATH)
-    .send({ phoneNumber: local });
+    .send({ pin: PIN, phoneNumber: local });
 
   expect(
     registration.status,
@@ -503,7 +506,7 @@ describe('Registration, verification and sessions (e2e)', () => {
     const response = await request(app.getHttpServer())
       .post(REGISTER_PATH)
       // Local format, spaced: exactly how someone types it into a signup form.
-      .send({ phoneNumber: toSpaced(local) })
+      .send({ pin: PIN, phoneNumber: toSpaced(local) })
       .expect(201);
 
     expect(response.body).toMatchObject({
@@ -553,7 +556,7 @@ describe('Registration, verification and sessions (e2e)', () => {
 
     const claimed = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: first.local, handle: '@Miriam' })
+      .send({ pin: PIN, phoneNumber: first.local, handle: '@Miriam' })
       .expect(201);
 
     // The *canonical* form is what was stored, and it is what the answer reports. This
@@ -563,7 +566,7 @@ describe('Registration, verification and sessions (e2e)', () => {
 
     const conflict = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: secondLocal, handle: '@miriam' })
+      .send({ pin: PIN, phoneNumber: secondLocal, handle: '@miriam' })
       .expect(409);
 
     expect(conflict.body.message).toContain('@miriam is already taken');
@@ -581,7 +584,7 @@ describe('Registration, verification and sessions (e2e)', () => {
 
     const refused = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: local, handle: '@admin' })
+      .send({ pin: PIN, phoneNumber: local, handle: '@admin' })
       .expect(400);
 
     expect(refused.body.message).toContain('"@admin" is reserved by Cashping');
@@ -595,7 +598,7 @@ describe('Registration, verification and sessions (e2e)', () => {
     // number nobody has claimed.
     const accepted = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: local, handle: 'admiral' })
+      .send({ pin: PIN, phoneNumber: local, handle: 'admiral' })
       .expect(201);
 
     expect(accepted.body.handle).toBe('admiral');
@@ -646,7 +649,7 @@ describe('Registration, verification and sessions (e2e)', () => {
 
     const registration = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: local })
+      .send({ pin: PIN, phoneNumber: local })
       .expect(201);
 
     const code = latestCodeFor(e164);
@@ -684,7 +687,7 @@ describe('Registration, verification and sessions (e2e)', () => {
   it('refuses to verify an already active number with a 409', async () => {
     const { local, e164 } = freshNumber();
 
-    await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+    await request(app.getHttpServer()).post(REGISTER_PATH).send({ pin: PIN, phoneNumber: local }).expect(201);
     const code = latestCodeFor(e164);
 
     await request(app.getHttpServer())
@@ -731,7 +734,7 @@ describe('Registration, verification and sessions (e2e)', () => {
   it('counts wrong guesses, then locks the code on the attempt that uses them up', async () => {
     const { local, e164 } = freshNumber();
 
-    await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+    await request(app.getHttpServer()).post(REGISTER_PATH).send({ pin: PIN, phoneNumber: local }).expect(201);
     const code = latestCodeFor(e164);
     const wrong = wrongCode(code);
 
@@ -777,7 +780,7 @@ describe('Registration, verification and sessions (e2e)', () => {
   it('refuses an expired code and consumes it', async () => {
     const { local, e164 } = freshNumber();
 
-    await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+    await request(app.getHttpServer()).post(REGISTER_PATH).send({ pin: PIN, phoneNumber: local }).expect(201);
     const code = latestCodeFor(e164);
 
     const user = await prisma.user.findUnique({ where: { phoneNumber: e164 } });
@@ -811,7 +814,7 @@ describe('Registration, verification and sessions (e2e)', () => {
     for (let send = 0; send < REQUESTS_PER_WINDOW; send += 1) {
       await request(app.getHttpServer())
         .post(REGISTER_PATH)
-        .send({ phoneNumber: local })
+        .send({ pin: PIN, phoneNumber: local })
         .expect(201);
     }
 
@@ -819,7 +822,7 @@ describe('Registration, verification and sessions (e2e)', () => {
 
     const blocked = await request(app.getHttpServer())
       .post(REGISTER_PATH)
-      .send({ phoneNumber: local })
+      .send({ pin: PIN, phoneNumber: local })
       .expect(429);
 
     expect(blocked.body.message).toContain('Try again in 15 minutes');

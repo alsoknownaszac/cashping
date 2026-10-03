@@ -7,6 +7,7 @@ import { QueueEvents } from 'bullmq';
 import { Redis } from 'ioredis';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AppModule } from './../src/app.module.js';
+import { AuditService } from './../src/audit/audit.service.js';
 import {
   DEFAULT_FALLBACK_HORIZON_URL,
   DEFAULT_FRIENDBOT_URL,
@@ -417,6 +418,15 @@ describe('the enqueue bound (Step 27)', () => {
     // the lock was held for is not in the table.
     expect(
       await prisma.transaction.count({ where: { senderId: sender.id, idempotencyKey: key } }),
+    ).toBe(0);
+
+    // Nothing in the audit table for it either (Step 32). This is the assertion the *placement* of
+    // the entry exists for: `payment.initiated` is written after the commit, so a payment that
+    // rolled back leaves no row - and it could not have been written inside the transaction, because
+    // an append-only table has no way to take that row back. The count is read from the real table,
+    // not from a spy.
+    expect(
+      await prisma.auditLog.count({ where: { userId: sender.id, action: 'payment.initiated' } }),
     ).toBe(0);
 
     await pause;
@@ -980,7 +990,8 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
     expect(before.stellarTxHash).toMatch(/^[0-9a-f]{64}$/);
 
     // The real confirmation service, with only the SMS provider substituted (this run is about the
-    // poll, not the message). Horizon is real, the row is real, and the writers are the app's.
+    // poll, not the message). Horizon is real, the row is real, and the writers are the app's -
+    // including Step 32's `AuditService`, which is the real one over the real `audit_log`.
     const notices: PaymentResultNotice[] = [];
     const confirmations = new PaymentsConfirmationService(
       prisma,
@@ -993,6 +1004,7 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
           notices.push(notice);
         },
       } as unknown as NotificationsService,
+      new AuditService(prisma),
     );
 
     const result = await confirmations.sweep();
@@ -1014,6 +1026,18 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
 
     // The sender was told, from the row.
     expect(notices.some((notice) => notice.status === 'SUCCESSFUL')).toBe(true);
+
+    // Step 32's entry for the resolution, read from the real table: the sweep that won the
+    // compare-and-set appended it, with the sender as the actor and the ledger number Horizon
+    // reported - so the trail and the network agree on which ledger closed this payment.
+    const completed = await prisma.auditLog.findFirstOrThrow({
+      where: { action: 'payment.completed', subjectId: paymentId },
+      select: { userId: true, outcome: true, metadata: true },
+    });
+
+    expect(completed.userId).toBe(senderUserId);
+    expect(completed.outcome).toBe('ok');
+    expect(completed.metadata).toEqual({ ledger: onLedger?.ledger });
 
     console.log(
       `[step 28] sweep: payment=${paymentId} hash=${after.stellarTxHash} PROCESSING -> SUCCESSFUL (polled=${result.polled} confirmed=${result.confirmed})`,
@@ -1082,6 +1106,7 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
           notices.push(notice);
         },
       } as unknown as NotificationsService,
+      new AuditService(prisma),
     );
 
     const result = await confirmations.sweep();
@@ -1092,6 +1117,17 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
     });
 
     expect(after.status).toBe('FAILED');
+
+    // And the entry, read from the table: the reason it carries is the row's own `failure_reason`,
+    // written from the same decision, so the trail and the payment cannot disagree about why.
+    const resolved = await prisma.auditLog.findFirstOrThrow({
+      where: { action: 'payment.failed', subjectId: failedPaymentId },
+      select: { userId: true, outcome: true, metadata: true },
+    });
+
+    expect(resolved.userId).toBe(senderUserId);
+    expect(resolved.outcome).toBe('failed');
+    expect(resolved.metadata).toEqual({ reason: after.failureReason });
 
     // The readable reason: the transaction-level code the decoded result XDR names, in the same
     // vocabulary - and under the same prefix - the submit path writes for the same code, because

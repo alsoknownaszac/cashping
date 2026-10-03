@@ -77,6 +77,9 @@ import { RedisService } from './../src/redis/redis.service.js';
 const ENABLED = process.env['RUN_STELLAR_IT'] === '1';
 
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
+
+/** The PIN every registration sends (Step 34a): exactly four digits, or the DTO refuses the body. */
+const PIN = '1234';
 const VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/otp/verify`;
 const ACCOUNT_PATH = `/${GLOBAL_PREFIX}/wallet/account`;
 const BALANCE_PATH = `/${GLOBAL_PREFIX}/wallet/balance`;
@@ -280,7 +283,7 @@ describe.skipIf(!ENABLED)('wallet endpoints against Testnet (e2e, live)', () => 
     const local = uniqueLocalNumber();
     phoneNumber = toE164(local);
 
-    await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+    await request(app.getHttpServer()).post(REGISTER_PATH).send({ pin: PIN, phoneNumber: local }).expect(201);
 
     const code = latestCodeFor(phoneNumber);
 

@@ -8,9 +8,11 @@ import {
   Logger,
   NotFoundException,
   ServiceUnavailableException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { type CountryCode } from 'libphonenumber-js';
+import { AuditService } from '../audit/audit.service.js';
 import {
   InvalidPhoneNumberError,
   maskPhoneNumber,
@@ -27,6 +29,8 @@ import {
   AccountProvisioningService,
   type ProvisioningOutcome,
 } from '../wallet/provisioning/account-provisioning.service.js';
+import { type ChangePinDto } from './dto/change-pin.dto.js';
+import { hashSecret } from './credentials/secret-hash.js';
 import { type LoginCodeResponseDto } from './dto/login-code-response.dto.js';
 import { type LoginDto, type LoginResponseDto } from './dto/login.dto.js';
 import { type SubmittedPhoneNumberDto } from './dto/phone-number.dto.js';
@@ -34,9 +38,31 @@ import { type RefreshTokenDto } from './dto/refresh-token.dto.js';
 import { type RegisterDto } from './dto/register.dto.js';
 import { type RegisterResponseDto } from './dto/register-response.dto.js';
 import { type SessionResponseDto } from './dto/session-response.dto.js';
+import { type PinChangeResponseDto } from './dto/pin-change-response.dto.js';
+import { type PinVerifyResponseDto } from './dto/pin-verify-response.dto.js';
 import { type TokenPairResponseDto } from './dto/token-pair-response.dto.js';
 import { type VerifyOtpDto } from './dto/verify-otp.dto.js';
 import { type VerifyOtpResponseDto } from './dto/verify-otp-response.dto.js';
+import { type VerifyPinDto } from './dto/verify-pin.dto.js';
+import { type ChangePasswordDto } from './dto/change-password.dto.js';
+import { type ConfirmPasswordResetDto } from './dto/confirm-password-reset.dto.js';
+import { type EmailSetResponseDto } from './dto/email-set-response.dto.js';
+import { type EmailVerifyResponseDto } from './dto/email-verify-response.dto.js';
+import { type LoginPasswordDto } from './dto/login-password.dto.js';
+import { type PasswordSetResponseDto } from './dto/password-set-response.dto.js';
+import { type SetEmailDto } from './dto/set-email.dto.js';
+import { type VerifyEmailDto } from './dto/verify-email.dto.js';
+import {
+  InvalidEmailAddressError,
+  MAX_EMAIL_LENGTH,
+  normalizeEmailAddress,
+} from './email/email-address.js';
+import {
+  EmailService,
+  type EmailSetRefusal,
+  type EmailVerifyRefusal,
+} from './email/email.service.js';
+import { PasswordService, type PasswordChangeRefusal } from './password/password.service.js';
 import {
   HANDLE_MAX_LENGTH,
   HANDLE_MIN_LENGTH,
@@ -49,6 +75,8 @@ import {
   OtpRateLimiterService,
 } from './otp/otp-rate-limiter.service.js';
 import { OtpService, type OtpCheckOutcome } from './otp/otp.service.js';
+import { PinService, type PinChangeRefusal } from './pin/pin.service.js';
+import { StepUpTokenService } from './pin/step-up-token.service.js';
 import { TokenService, type IssuedTokens, type SessionUser } from './token/token.service.js';
 
 /**
@@ -93,6 +121,14 @@ function describeWallet(outcome: ProvisioningOutcome): string {
  * Step 19 adds the second consequence of verification: it provisions the wallet. That call
  * is inside `verifyOtp`, below the transaction that activates the user, and the note there
  * is the long version of why it sits exactly there and why it cannot change the answer.
+ *
+ * Step 34a adds a third kind of credential to this service: `changePin` sets or changes the
+ * transaction PIN, and `verifyPin` proves it and mints the short-lived step-up token that
+ * `POST /v1/payments` requires. The PIN's own rules - the hash, the attempt counter, the
+ * lockout - belong to `PinService`, and what belongs *here* is the HTTP mapping, which for
+ * one fact is two answers: a wrong PIN is a 401 on the step-up endpoint (the credential was
+ * not accepted) and a 409 on the change endpoint (there is a conflict to resolve, and the
+ * message names how many attempts are left).
  */
 @Injectable()
 export class AuthService {
@@ -112,6 +148,55 @@ export class AuthService {
      * number is verified" - and `WalletModule` is the module that knows how.
      */
     private readonly provisioning: AccountProvisioningService,
+    /**
+     * Step 32's append-only record of what was *asked*, as opposed to what money did.
+     *
+     * Injected rather than reached through an interceptor, and the reason is visible in what the
+     * entries need: every one of the three this service writes is keyed by a user id that only
+     * these methods hold, and two of them (`user.handle.set` with its source, and
+     * `auth.otp.verified`) describe facts that no request-level view of `POST /auth/*` can see.
+     * `AuditModule`'s docstring records the split; `AuditService` records why a failed write is
+     * swallowed instead of being allowed to fail a sign-in.
+     */
+    private readonly audit: AuditService,
+    /**
+     * The transaction PIN (Step 34a): the set/change/verify rules, the attempt counter and
+     * the lockout.
+     *
+     * Injected rather than reimplemented, and the boundary is deliberate - `PinService`
+     * never sees a `SessionUser`, an HTTP exception or a status code, so the only thing
+     * this service contributes is which answer each outcome becomes over HTTP. That is what
+     * lets the same "wrong PIN" outcome be a 401 here and a 409 there.
+     */
+    private readonly pins: PinService,
+    /**
+     * The step-up token (Step 34a): minted here when `verifyPin` succeeds, and verified by
+     * `StepUpAuthGuard` in front of `POST /v1/payments`.
+     *
+     * A service of its own rather than a method on `TokenService`, because it is a
+     * different credential with a different lifetime and audience - and one shared signing
+     * secret is exactly why the audience has to be stated on both sides.
+     */
+    private readonly stepUpTokens: StepUpTokenService,
+    /**
+     * The password (Step 34b): the set/change/verify rules, and the hashing that goes with
+     * them.
+     *
+     * Injected rather than reimplemented, exactly as `PinService` is, and for the same reason:
+     * it decides no status codes and never sees a `SessionUser`, so the only thing this
+     * service adds is which answer each outcome becomes over HTTP.
+     */
+    private readonly passwords: PasswordService,
+    /**
+     * The email address (Step 34c): attaching one and confirming it, and the verification
+     * code that goes with it.
+     *
+     * Injected rather than reimplemented. It does not *send* anything - the code comes back
+     * here and goes out through `NotificationsService`, so the wording and the transport stay
+     * behind the notification seam and this method is the one place a set is both written and
+     * delivered.
+     */
+    private readonly emails: EmailService,
   ) {}
 
   /**
@@ -159,11 +244,58 @@ export class AuthService {
     const handle =
       dto.handle === undefined ? undefined : await this.resolveHandle(dto.handle, existing?.id);
 
+    /**
+     * The PIN is hashed *here*, before any write and outside the transaction (there is none
+     * yet), and it cannot be a source of failures: its shape was settled by `RegisterDto`
+     * (four digits, or a 400 before this method was reached), and scrypt does not care which
+     * four digits they are. It is computed before the request is counted because it is not a
+     * request the number's allowance should pay for - it touches no network and no row.
+     *
+     * The hash goes into `claimAccount` rather than being written afterwards, so the account
+     * never exists without the credential its first payment will require.
+     */
+    const transactionPinHash = await hashSecret(dto.pin);
+
     // Counted before the user row is created, so a blocked request leaves nothing
     // behind: an over-limit caller gets no row, no code and no SMS.
     await this.assertWithinRequestLimit(phoneNumber);
 
-    const user = await this.claimAccount(phoneNumber, handle, existing);
+    const user = await this.claimAccount(phoneNumber, handle, existing, transactionPinHash);
+
+    /**
+     * Step 32: `user.handle.set`, written here - before the code is issued and the SMS sent -
+     * because the fact it records has already happened by this line: the row exists with this
+     * handle. That is true whether or not the send below succeeds, and an entry written after
+     * `sendOtp` would claim the handle was never set when the only thing that failed was an SMS.
+     *
+     * `metadata.source` is the useful half: 'registration' is a first claim, 'resend' is the
+     * `PENDING_VERIFICATION` path reusing the row, and a handle that changed hands is visible as
+     * two entries with different values for one user id.
+     */
+    await this.audit.log({
+      action: 'user.handle.set',
+      userId: user.id,
+      outcome: 'ok',
+      metadata: { handle: user.handle, source: existing === null ? 'registration' : 'resend' },
+    });
+
+    /**
+     * Step 34a: `auth.pin.set`, written beside the handle entry and for the same reason -
+     * the fact is already true by this line, because the hash was written with the row
+     * above. `metadata.source` carries the same split the handle entry records, so "a PIN
+     * was chosen at registration" and "a PIN was chosen on a resend" are distinguishable in
+     * the trail without a second literal.
+     *
+     * What is deliberately absent: the PIN, and its hash. A row that recorded either would
+     * make the audit table a place secrets live, which is the one thing `AuditService`
+     * forbids in as many words.
+     */
+    await this.audit.log({
+      action: 'auth.pin.set',
+      userId: user.id,
+      outcome: 'ok',
+      metadata: { source: existing === null ? 'registration' : 'resend' },
+    });
 
     const { code, expiresAt } = await this.otp.issue(user.id);
     await this.sendOtp(phoneNumber, code);
@@ -201,7 +333,27 @@ export class AuthService {
     phoneNumber: string,
     handle: string | undefined,
     existing: RegisteredUser | null,
+    transactionPinHash: string,
   ): Promise<RegisteredUser> {
+    /**
+     * The PIN travels with the row on both paths (Step 34a), which is why it is one object
+     * rather than four fields spelled out twice: "an account exists" and "it holds the PIN
+     * it was registered with" are one fact, and a create path that wrote only one of them
+     * would produce an account whose first payment fails for a reason the user cannot see.
+     *
+     * `attempts` and `lockedUntil` are written explicitly rather than left to the column
+     * defaults, because this is a *new* credential: a hash written over a row that somehow
+     * carried a spent allowance would otherwise inherit it. The default would be right for a
+     * freshly created row and wrong for a reused one, and one statement that is right on
+     * both paths is worth more than two that differ.
+     */
+    const pin = {
+      transactionPinHash,
+      transactionPinSetAt: new Date(),
+      transactionPinAttempts: 0,
+      transactionPinLockedUntil: null,
+    };
+
     try {
       if (existing === null) {
         return await this.prisma.user.create({
@@ -212,15 +364,26 @@ export class AuthService {
           // `handle` is `undefined` when none was submitted, which Prisma reads as
           // "column not provided" - it stays NULL rather than becoming an empty
           // string, so "no handle" has exactly one representation.
-          data: { phoneNumber, handle },
+          data: { phoneNumber, handle, ...pin },
         });
       }
 
-      if (handle === undefined || existing.handle === handle) {
-        return existing;
-      }
-
-      return await this.prisma.user.update({ where: { id: existing.id }, data: { handle } });
+      /**
+       * The pending row is reused (the resend path), and the PIN is written with it. That is
+       * safe for exactly the reason reusing the row is safe at all: the account is still
+       * unproven, and the code about to be sent is the proof that this is the same person -
+       * so replacing a PIN here is the same act as registering one, and it gives a
+       * half-finished signup nothing that a fresh one would not have.
+       *
+       * A handle that was not resubmitted, or resubmitted unchanged, is left alone:
+       * `handle: undefined` means "column not provided" to Prisma. The previous early return
+       * for that case is gone because the PIN now has to be written on every path, and a
+       * second, PIN-less return is precisely the state this step exists to prevent.
+       */
+      return await this.prisma.user.update({
+        where: { id: existing.id },
+        data: { handle, ...pin },
+      });
     } catch (error) {
       throw this.toRegistrationConflict(error, handle);
     }
@@ -401,6 +564,19 @@ export class AuthService {
      * the wrong place to put it, because a failed attempt is retried by the service that
      * knows how, not by a user who cannot.
      */
+    /**
+     * Step 32: `auth.otp.verified`, written after the transaction above has committed and before
+     * provisioning is attempted.
+     *
+     * The placement is the point. Verification is already done - `phoneVerifiedAt` is set and the
+     * code is spent in one transaction - so the entry must not wait on a Horizon round trip that
+     * can take seconds, and an `incomplete` provisioning below must not leave the trail looking as
+     * though nothing was verified. What is deliberately *not* here is the provisioning outcome:
+     * that is what `provisionFor` logs in detail and what Step 20's balance endpoint reflects, and
+     * a second copy of it in this table would be a copy that can disagree with the chain.
+     */
+    await this.audit.log({ action: 'auth.otp.verified', userId: user.id, outcome: 'ok' });
+
     const wallet = await this.provisioning.provisionFor(user.id);
 
     const issued = await this.tokens.issue(session);
@@ -499,6 +675,17 @@ export class AuthService {
 
     const issued = await this.tokens.issue(user);
 
+    /**
+     * Step 32: `auth.login`, after the code has been spent *and* the token pair issued.
+     *
+     * `consumeCode` is what makes this a sign-in rather than a check on a live code, so the entry
+     * follows it; it follows `tokens.issue` so that the row means "a session exists" rather than "a
+     * session was about to". No phone number in `metadata` - the masked number in the log line
+     * below is this codebase's disclosure rule for it, and the row's `user_id` already names the
+     * account to anyone with a reason to be reading it.
+     */
+    await this.audit.log({ action: 'auth.login', userId: user.id, outcome: 'ok' });
+
     this.logger.log(`Code sign-in for ${maskPhoneNumber(phoneNumber)} (user ${user.id})`);
 
     return {
@@ -573,6 +760,319 @@ export class AuthService {
       status: user.status,
       handle: user.handle,
     };
+  }
+
+  /**
+   * Sets the transaction PIN, or changes it by proving the current one (Step 34a).
+   *
+   * The three failures are mapped apart on purpose. A missing `currentPin` and a wrong one
+   * are both 409s - "this account already has a PIN and you have not proved it" is a state
+   * conflict either way - while a locked PIN is a 429, because waiting is the action rather
+   * than correcting the request.
+   */
+  async changePin(user: SessionUser, dto: ChangePinDto): Promise<PinChangeResponseDto> {
+    const outcome = await this.pins.change(user.id, dto.currentPin, dto.pin);
+
+    if (!outcome.ok) {
+      throw this.toPinRejection(outcome, 'change');
+    }
+
+    return { pinSetAt: outcome.pinSetAt.toISOString() };
+  }
+
+  /**
+   * Proves the transaction PIN and mints the step-up token a payment needs (Step 34a).
+   *
+   * The token is minted here rather than inside `PinService`, which knows nothing about
+   * tokens, and it is returned in the body because that is the only way the client can
+   * present it: setting a cookie would introduce a second authentication mechanism - with
+   * its own CSRF story - to carry a value that lives for five minutes.
+   *
+   * Nothing about the PIN is in the response: not the digits, not the hash, and not the
+   * attempt counter. A successful proof has no attempts left to report, and the failure path
+   * is where that number belongs.
+   */
+  async verifyPin(user: SessionUser, dto: VerifyPinDto): Promise<PinVerifyResponseDto> {
+    const outcome = await this.pins.verify(user.id, dto.pin);
+
+    if (!outcome.ok) {
+      throw this.toPinRejection(outcome, 'verify');
+    }
+
+    const issued = await this.stepUpTokens.issue(user.id);
+
+    return {
+      stepUpToken: issued.token,
+      stepUpTokenExpiresAt: issued.expiresAt.toISOString(),
+    };
+  }
+
+  /**
+   * Turns a refused PIN into the answer the caller can act on.
+   *
+   * The status depends on the *endpoint* as well as on the outcome, which is why this takes
+   * the context rather than living in `PinService`: `invalid_pin` is a 401 on the step-up
+   * call (a credential was presented and not accepted) and a 409 on a change (the account's
+   * PIN is not the one the caller thinks it is). `locked` is a 429 either way - the caller
+   * has to wait, and the message says until when - and `not_set` is a 409, because nothing
+   * was refused: there is simply no PIN to prove yet, which is the state a Google-SSO
+   * account starts in (Step 34d).
+   */
+  private toPinRejection(outcome: PinChangeRefusal, context: 'verify' | 'change'): HttpException {
+    switch (outcome.reason) {
+      case 'current_pin_required':
+        return new ConflictException(
+          'This account already has a PIN. Send currentPin to change it.',
+        );
+
+      case 'not_set':
+        return new ConflictException(
+          'No transaction PIN is set for this account. Set one with POST /auth/pin/change.',
+        );
+
+      case 'invalid_pin':
+        return context === 'verify'
+          ? new UnauthorizedException(
+              `That PIN is not correct. ${outcome.attemptsRemaining} attempts remaining.`,
+            )
+          : new ConflictException(
+              `That current PIN is not correct. ${outcome.attemptsRemaining} attempts remaining.`,
+            );
+
+      case 'locked':
+        return new HttpException(
+          `Too many incorrect PIN attempts. Try again after ${outcome.lockedUntil.toISOString()}.`,
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+    }
+  }
+
+  /**
+   * Sets or changes the account password (Step 34b).
+   *
+   * The status codes are the same split the PIN's change uses: a missing or wrong
+   * `currentPassword` is a 409 - there is a conflict to resolve, and the message names what to
+   * send - rather than a 401, because the caller *is* authenticated and is being told what
+   * their request lacked.
+   */
+  async changePassword(
+    user: SessionUser,
+    dto: ChangePasswordDto,
+  ): Promise<PasswordSetResponseDto> {
+    const outcome = await this.passwords.change(user.id, dto.currentPassword, dto.password);
+
+    if (!outcome.ok) {
+      throw this.toPasswordRejection(outcome);
+    }
+
+    return { passwordSetAt: outcome.passwordSetAt.toISOString() };
+  }
+
+  /**
+   * Signs in with a password, and starts a session (Step 34b).
+   *
+   * Outcomes, in the order they are decided:
+   *   - `SUSPENDED`                -> 403, before the password is even looked at;
+   *   - over the attempt allowance -> 429 (the counter is the OTP limiter's, so a password
+   *                                   guess is priced exactly like a code guess);
+   *   - no account, no password set, wrong password, or not `ACTIVE` -> one 401;
+   *   - otherwise                  -> 200 with the same token pair `POST /auth/login` answers.
+   *
+   * The single 401 is the point: "no such user", "no password set" and "wrong password" are the
+   * same answer, for the reason `TokenService`'s refresh failures share one message - the
+   * endpoint is otherwise an oracle that tells an anonymous caller which numbers are
+   * registered. The audit row records which of them it was, and it is `denied` for all three.
+   */
+  async loginWithPassword(dto: LoginPasswordDto): Promise<LoginResponseDto> {
+    const refused = 'That phone number and password do not match. Check both and try again.';
+
+    const phoneNumber = this.normalize(dto.phoneNumber);
+
+    const user = await this.prisma.user.findUnique({ where: { phoneNumber } });
+
+    if (user !== null && user.status === UserStatus.SUSPENDED) {
+      throw new ForbiddenException('This account is suspended. Contact support.');
+    }
+
+    await this.assertWithinPasswordAttemptLimit(phoneNumber);
+
+    if (user === null || user.status !== UserStatus.ACTIVE) {
+      await this.audit.log({ action: 'auth.password.login', userId: user?.id, outcome: 'denied' });
+
+      throw new UnauthorizedException(refused);
+    }
+
+    if (!(await this.passwords.verify(user.id, dto.password))) {
+      await this.audit.log({ action: 'auth.password.login', userId: user.id, outcome: 'denied' });
+
+      throw new UnauthorizedException(refused);
+    }
+
+    const issued = await this.tokens.issue(user);
+
+    await this.audit.log({ action: 'auth.password.login', userId: user.id, outcome: 'ok' });
+
+    this.logger.log(`Password sign-in for ${maskPhoneNumber(phoneNumber)} (user ${user.id})`);
+
+    return {
+      ...this.toTokenPair(issued),
+      userId: user.id,
+      phoneNumber,
+      status: user.status,
+      handle: user.handle,
+    };
+  }
+
+  /**
+   * Starts a forgot-password reset by texting a code (Step 34b).
+   *
+   * Answers 202 whether or not the number belongs to an account, and the *response* must not
+   * tell an anonymous caller which numbers are registered: without that, this endpoint is an
+   * enumeration oracle that the sign-in endpoint deliberately is not. Both paths therefore run
+   * the same code up to the point where one has a row - an account gets a code and an SMS, an
+   * unknown number gets neither - and the two answers are byte-identical because the second is
+   * computed (`now + ttl`) rather than read from a row that does not exist.
+   *
+   * The send is counted only when it really happens (`register`'s ordering, unchanged): a
+   * request for an unknown number must not spend that number's allowance.
+   */
+  async requestPasswordReset(dto: SubmittedPhoneNumberDto): Promise<LoginCodeResponseDto> {
+    const phoneNumber = this.normalize(dto.phoneNumber);
+    const codeLength = this.config.getOrThrow<number>('otp.codeLength');
+    const ttlMinutes = this.config.getOrThrow<number>('otp.ttlMinutes');
+
+    const user = await this.prisma.user.findUnique({ where: { phoneNumber } });
+
+    if (user !== null && user.status === UserStatus.ACTIVE) {
+      await this.assertWithinRequestLimit(phoneNumber);
+
+      const { code, expiresAt } = await this.otp.issue(user.id);
+
+      await this.sendOtp(phoneNumber, code);
+
+      /**
+       * Written only when a code was really sent. A request for an unknown number changes
+       * nothing, so there is no event to record - and recording one keyed to nothing would
+       * make the table a log of *attempts against unknown numbers*, which is a shape nobody
+       * asked for and one more place a number could be inferred from.
+       */
+      await this.audit.log({
+        action: 'auth.password.reset.requested',
+        userId: user.id,
+        outcome: 'ok',
+      });
+
+      return { phoneNumber, expiresAt: expiresAt.toISOString(), codeLength };
+    }
+
+    return {
+      phoneNumber,
+      expiresAt: new Date(Date.now() + ttlMinutes * 60_000).toISOString(),
+      codeLength,
+    };
+  }
+
+  /**
+   * Finishes a reset: checks the code and writes the new password (Step 34b).
+   *
+   * The code is checked and spent exactly as it is at verification and sign-in - the same
+   * `checkCode`/`consumeCode` pair, so the expiry, attempt and single-use rules cannot drift -
+   * and a wrong, expired or exhausted code is answered with the same 400/429 the OTP endpoints
+   * use. The code is spent *before* the password is written, so a double-tapped confirm cannot
+   * write twice: the second call fails the compare-and-set and changes nothing.
+   */
+  async confirmPasswordReset(dto: ConfirmPasswordResetDto): Promise<PasswordSetResponseDto> {
+    const phoneNumber = this.normalize(dto.phoneNumber);
+
+    const user = await this.prisma.user.findUnique({ where: { phoneNumber } });
+
+    if (user === null) {
+      // The same 400 a live code lookup would give, rather than a 404: whether the number
+      // exists is not something an unauthenticated reset endpoint should answer.
+      throw new BadRequestException(
+        'No verification code is outstanding for this number. Request a new one.',
+      );
+    }
+
+    if (user.status === UserStatus.SUSPENDED) {
+      throw new ForbiddenException('This account is suspended. Contact support.');
+    }
+
+    const outcome = await this.checkCode(user.id, dto.code);
+
+    await this.consumeCode(this.prisma, outcome.otpId, new Date());
+
+    const passwordSetAt = await this.passwords.set(user.id, dto.newPassword);
+
+    await this.audit.log({
+      action: 'auth.password.reset.completed',
+      userId: user.id,
+      outcome: 'ok',
+    });
+
+    return { passwordSetAt: passwordSetAt.toISOString() };
+  }
+
+  /**
+   * Attaches (or replaces) the account's email address and sends a verification code
+   * (Step 34c).
+   *
+   * The address is normalized (trimmed, lower-cased) and the shape rule is enforced before
+   * anything is written, so a malformed address is a 400 that names the rule it broke rather
+   * than an anonymous "invalid email". The write and the code belong to `EmailService`; what
+   * belongs *here* is turning the code into a delivery - through `NotificationsService`, so
+   * the wording and the transport stay behind the notification seam.
+   */
+  async setEmail(user: SessionUser, dto: SetEmailDto): Promise<EmailSetResponseDto> {
+    const email = this.normalizeEmail(dto.email);
+
+    const outcome = await this.emails.set(user.id, email);
+
+    if (!outcome.ok) {
+      throw this.toEmailSetRejection(outcome);
+    }
+
+    await this.sendEmailVerification(outcome.email, outcome.code);
+
+    return {
+      email: outcome.email,
+      expiresAt: outcome.expiresAt.toISOString(),
+      codeLength: this.config.getOrThrow<number>('otp.codeLength'),
+    };
+  }
+
+  /**
+   * Confirms the attached address with a code (Step 34c).
+   *
+   * A wrong, expired or exhausted code is answered with the same 400/429 the OTP endpoints use,
+   * because it *is* the same code: the email verification code is an OTP with a different
+   * destination, and its failure modes are the OTP's. Only the two account-shaped refusals -
+   * "nothing is attached" and "already confirmed" - get their own answers.
+   */
+  async verifyEmail(user: SessionUser, dto: VerifyEmailDto): Promise<EmailVerifyResponseDto> {
+    const outcome = await this.emails.verify(user.id, dto.code);
+
+    if (!outcome.ok) {
+      throw this.toEmailVerifyRejection(outcome);
+    }
+
+    return { email: outcome.email, emailVerifiedAt: outcome.emailVerifiedAt.toISOString() };
+  }
+
+  private normalizeEmail(input: string): string {
+    try {
+      return normalizeEmailAddress(input);
+    } catch (error) {
+      if (error instanceof InvalidEmailAddressError) {
+        throw new BadRequestException(
+          error.problem === 'too_long'
+            ? `An email address can be at most ${MAX_EMAIL_LENGTH} characters.`
+            : `"${error.input}" is not a valid email address.`,
+        );
+      }
+
+      throw error;
+    }
   }
 
   /**
@@ -778,6 +1278,113 @@ export class AuthService {
 
     if (count === 0) {
       throw new ConflictException('That code has already been used. Request a new one.');
+    }
+  }
+
+  /**
+   * Turns a refused password change into the answer the caller can act on.
+   *
+   * Both refusals are a 409: the caller is authenticated, and a 409 says "this conflicts with
+   * the state of the account" - which is exactly what a missing or wrong `currentPassword` is,
+   * and it keeps the message in front of the user rather than in a 401 that would say "you are
+   * not who you say you are" about a request whose identity was never in question.
+   */
+  private toPasswordRejection(outcome: PasswordChangeRefusal): HttpException {
+    switch (outcome.reason) {
+      case 'current_password_required':
+        return new ConflictException(
+          'This account already has a password. Send currentPassword to change it.',
+        );
+
+      case 'invalid_password':
+        return new ConflictException('That current password is not correct.');
+    }
+  }
+
+  /** Turns a refused email attach into the answer the caller can act on. */
+  private toEmailSetRejection(outcome: EmailSetRefusal): HttpException {
+    switch (outcome.reason) {
+      case 'address_taken':
+        return new ConflictException(
+          'That email address is already in use on another account. Use a different address.',
+        );
+    }
+  }
+
+  /**
+   * Turns a refused email confirmation into the answer the caller can act on.
+   *
+   * The two account-shaped reasons get their own answers; everything else is the OTP check's
+   * outcome, mapped by the same table the phone endpoints use so the two cannot differ.
+   */
+  private toEmailVerifyRejection(outcome: EmailVerifyRefusal): HttpException {
+    switch (outcome.reason) {
+      case 'no_address':
+        return new ConflictException(
+          'No email address is attached to this account. Attach one with POST /auth/email.',
+        );
+
+      case 'already_verified':
+        return new ConflictException('That email address is already verified.');
+
+      case 'code':
+        return this.toHttpException(outcome.failure);
+    }
+  }
+
+  /**
+   * Sends the email verification code, translating a delivery failure into "nothing was sent".
+   *
+   * The mirror of `sendOtp`, and for the same reason: a provider that did not accept the
+   * message means the user has no code, so the answer is a 503 rather than a success. The
+   * address is deliberately not logged - a log line is one place an identifier must not appear
+   * in the clear, and the `auth.email.set` entry already names the account.
+   */
+  private async sendEmailVerification(email: string, code: string): Promise<void> {
+    try {
+      await this.notifications.sendEmailVerification(email, code);
+    } catch (error) {
+      this.logger.error(
+        'Could not send an email verification code',
+        error instanceof Error ? error.stack : String(error),
+      );
+
+      throw new ServiceUnavailableException(
+        'We could not send the verification email right now. Please try again.',
+      );
+    }
+  }
+
+  /**
+   * Counts one password sign-in against the number's allowance, or refuses (Step 34b).
+   *
+   * The counter is `OtpRateLimiterService`'s, deliberately: a password guess is then priced
+   * exactly like a code guess, and there is one place - not two that could disagree - deciding
+   * how many tries a number gets in a window. What this adds is the wording: a caller who has
+   * been signing in, rather than requesting codes, is told about sign-in attempts.
+   */
+  private async assertWithinPasswordAttemptLimit(phoneNumber: string): Promise<void> {
+    try {
+      await this.otpRateLimiter.consume(phoneNumber);
+    } catch (error) {
+      if (error instanceof OtpRateLimitExceededError) {
+        const minutes = Math.ceil(error.retryAfterSeconds / 60);
+
+        throw new HttpException(
+          `Too many sign-in attempts for this number. Try again in ${minutes} minute${
+            minutes === 1 ? '' : 's'
+          }.`,
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+
+      if (error instanceof OtpRateLimitUnavailableError) {
+        throw new ServiceUnavailableException(
+          'Sign-in is temporarily unavailable. Please try again in a moment.',
+        );
+      }
+
+      throw error;
     }
   }
 

@@ -1,8 +1,10 @@
 import { Module } from '@nestjs/common';
+import { AuditModule } from '../audit/audit.module.js';
 import { IdempotencyInterceptor } from '../common/interceptors/idempotency.interceptor.js';
 import { RedisIdempotencyStore } from '../common/interceptors/idempotency-store.js';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { RedisModule } from '../redis/redis.module.js';
+import { StepUpModule } from '../identity/pin/step-up.module.js';
 import { WalletModule } from '../wallet/wallet.module.js';
 import { PaymentsController } from './controllers/payments.controller.js';
 import { RecipientsController } from './controllers/recipients.controller.js';
@@ -63,9 +65,25 @@ import { RecipientsService } from './services/recipients.service.js';
  * `RecipientsService` is injected by `PaymentsService` rather than duplicated: "may this id be
  * paid" has one answer (`assertPayableRecipient`), and the payment path is the second reader of
  * it - which is why that method exists without the lookup limit (see its docstring).
+ *
+ * Step 32 adds `AuditModule`, and the fifth import is the whole of that step here. The entries this
+ * module writes are `payment.initiated` - from `PaymentsService.create`, *after* the transaction
+ * that created the row has committed and its submission been queued, because an entry written
+ * inside that transaction could survive a rollback and describe a payment that does not exist - and
+ * the confirmation sweep's `payment.completed` / `payment.failed`. The sweep is provided by this
+ * module, so it needs no import of its own.
+ *
+ * Step 34a adds `StepUpModule`, and it is worth being exact about what it is not. It is *not*
+ * `IdentityModule`: that boundary is the one described above, and this step did not move it. The
+ * second factor is a leaf contract both contexts import - identity mints the token when the PIN is
+ * proved, this module verifies it on the route that moves money - so `PaymentsController` gets the
+ * guard without this module gaining an edge into the context that owns sessions. Nothing in this
+ * module has learned what a PIN is, and `PaymentsService` least of all: it never sees a token, a
+ * header or a credential, because `StepUpAuthGuard` is the only thing that knows, and it refuses
+ * the request before the service is reached.
  */
 @Module({
-  imports: [PrismaModule, RedisModule, WalletModule, PaymentsQueueModule],
+  imports: [AuditModule, PrismaModule, RedisModule, WalletModule, PaymentsQueueModule, StepUpModule],
   controllers: [RecipientsController, PaymentsController],
   providers: [
     RecipientsService,

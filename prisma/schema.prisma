@@ -42,18 +42,46 @@ datasource db {
 /// `phoneVerifiedAt` is the timestamp Day 2 keys off - Stellar account
 /// provisioning triggers on it - so it is set in the same write that flips the
 /// status to ACTIVE, and never cleared.
+///
+/// `transactionPinHash` is the second factor in front of money (Step 34a): four digits
+/// collected at registration and proved again before every payment. It is a scrypt hash,
+/// never the digits themselves, and its *length* is a validation rule (`PIN_LENGTH`)
+/// rather than a property of this column - which is why there is no `char(4)` here and no
+/// column recording how many digits a PIN has.
 model User {
-  id              String     @id @default(uuid()) @db.Uuid
-  phoneNumber     String     @unique @map("phone_number")
-  phoneVerifiedAt DateTime?  @map("phone_verified_at")
-  handle          String?    @unique
-  displayName     String?    @map("display_name")
+  id                        String     @id @default(uuid()) @db.Uuid
+  phoneNumber               String     @unique @map("phone_number")
+  phoneVerifiedAt           DateTime?  @map("phone_verified_at")
+  /// The account's email address, if one is attached (Step 34c), lower-cased and trimmed by
+  /// `normalizeEmailAddress` so one mailbox is one value. Nullable: an account is useful
+  /// without one, and the Google-SSO account of Step 34d may arrive already carrying one.
+  email                     String?    @unique
+  /// When a code proved the account controls `email`, so "attached" and "verified" are two
+  /// facts about one address rather than one boolean. A receipt is sent only when this is set.
+  emailVerifiedAt           DateTime?  @map("email_verified_at")
+  handle                    String?    @unique
+  displayName               String?    @map("display_name")
   /// Nullable: MVP registration is OTP-only, so a user has no password until
   /// (and unless) password login is added. A non-null value is always a hash.
-  passwordHash    String?    @map("password_hash")
-  status          UserStatus @default(PENDING_VERIFICATION)
-  createdAt       DateTime   @default(now()) @map("created_at")
-  updatedAt       DateTime   @updatedAt @map("updated_at")
+  passwordHash              String?    @map("password_hash")
+  /// Nullable: the registration path always writes one, but a Google-SSO account
+  /// (Step 34d) is created without a PIN and is asked for it as its next step - so this
+  /// column cannot be `NOT NULL`, and "has a PIN" is exactly "this is not null".
+  transactionPinHash        String?    @map("transaction_pin_hash")
+  /// When the PIN in force was written, set in the same write as the hash above, so "has
+  /// a PIN" and "when it was set" cannot disagree.
+  transactionPinSetAt       DateTime?  @map("transaction_pin_set_at")
+  /// Wrong PINs in the current window. Incremented by the database rather than in the
+  /// application: a read-then-write would let concurrent guesses share one attempt, and
+  /// for a four-digit PIN that is the difference between a lockout and a sweep.
+  transactionPinAttempts    Int        @default(0) @map("transaction_pin_attempts")
+  /// Set when the allowance is spent, and cleared by a correct PIN or a new one. Stored
+  /// as an instant rather than as a count of minutes so that a lockout survives a
+  /// redeploy with the time it has actually been in force.
+  transactionPinLockedUntil DateTime?  @map("transaction_pin_locked_until")
+  status                    UserStatus @default(PENDING_VERIFICATION)
+  createdAt                 DateTime   @default(now()) @map("created_at")
+  updatedAt                 DateTime   @updatedAt @map("updated_at")
 
   otpVerifications     OtpVerification[]
   refreshTokens        RefreshToken[]
@@ -208,14 +236,14 @@ model StellarAccount {
 /// Step 28's poll bookkeeping (when the row was last polled, and how many times): it
 /// arrives with the step that writes it, the same way every other model here grew.
 model Transaction {
-  id             String            @id @default(uuid()) @db.Uuid
-  senderId       String            @map("sender_id") @db.Uuid
-  recipientId    String            @map("recipient_id") @db.Uuid
+  id                 String            @id @default(uuid()) @db.Uuid
+  senderId           String            @map("sender_id") @db.Uuid
+  recipientId        String            @map("recipient_id") @db.Uuid
   /// The money, as `numeric(20, 7)`: 13 integer digits - see this model's docblock.
-  amount         Decimal           @db.Decimal(20, 7)
-  status         TransactionStatus @default(PENDING)
+  amount             Decimal           @db.Decimal(20, 7)
+  status             TransactionStatus @default(PENDING)
   /// The client's `Idempotency-Key` for this payment, unique per sender.
-  idempotencyKey String            @map("idempotency_key")
+  idempotencyKey     String            @map("idempotency_key")
   /// The hash of the *signed* transaction this payment carries (Step 27).
   ///
   /// `NULL` until a transaction has been built and its hash committed; once written it
@@ -261,8 +289,8 @@ model Transaction {
   /// spec asserts the reservation over it). An unrecognised code gets no prefix at all.
   /// See `docs/step-28-29-proposal.md` §6 for the measurement behind the split.
   failureReason      String?           @map("failure_reason")
-  createdAt      DateTime          @default(now()) @map("created_at")
-  updatedAt      DateTime          @updatedAt @map("updated_at")
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
 
   sender    User @relation("SentTransactions", fields: [senderId], references: [id], onDelete: Restrict)
   recipient User @relation("ReceivedTransactions", fields: [recipientId], references: [id], onDelete: Restrict)
@@ -275,6 +303,58 @@ model Transaction {
   /// Step 30's history: one side of the list, newest first.
   @@index([recipientId, createdAt])
   @@map("transactions")
+}
+
+/// One sensitive action, appended (Step 32).
+///
+/// **Append-only, enforced by the database rather than by this file.** `AuditService` only ever
+/// calls `create`, but "only ever calls create" is a promise about code - a migration, a psql
+/// session or a repair script can break it without touching this repository. So the table carries
+/// its own `BEFORE UPDATE OR DELETE` trigger
+/// (`20261001120000_add_audit_log/migration.sql`), which raises. What that is *not* is
+/// tamper-evident: see `AuditService`'s docstring for the difference and for what closing it
+/// would cost.
+///
+/// **There are deliberately no foreign keys.** Every other row in this schema points at the row
+/// it belongs to; this one does not, for two reasons. `user_id` and `subject_id` are sometimes
+/// written by code that never had the other row in hand - a `payment.completed` entry is written
+/// by a sweep that selected a payment and a recipient handle, not a user - and an audit entry
+/// that a `DELETE FROM users` could cascade away, or that could *block* one, would be an audit
+/// trail with an owner. `subject_id` is `TEXT` rather than `UUID` for the same reason: it names a
+/// payment, a `stellar_accounts` row or a user depending on the action, so one type would be a
+/// lie about two thirds of the rows.
+///
+/// **`action` is `TEXT`, not an enum.** The vocabulary is closed in TypeScript
+/// (`src/audit/audit-events.ts`) and open in the database, so a new sensitive point is a
+/// recompile rather than a migration - and nobody is ever tempted to bypass the service to add
+/// one. A `CHECK` constraint here would have the opposite effect: the first person it blocked
+/// would write the row directly, and the vocabulary would rot.
+///
+/// `metadata` is `jsonb` and holds identifiers and short codes: an amount, a ledger number, a
+/// failure classification. Never a secret - no seed, no data key, no OTP code, no phone number in
+/// the clear, no signature, no raw Horizon body. `AuditService` is where that rule is stated to
+/// its callers.
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  /// The event, as `<area>.<event>`. See `AuditAction`.
+  action    String
+  /// The account the entry is about, when one is known. `NULL` for an event that happened
+  /// before anything was identified - a KMS failure on an account whose row is not written
+  /// yet, or an event attributed only by `subjectId`.
+  userId    String?  @map("user_id") @db.Uuid
+  /// The row the entry is about: a payment id, a `stellar_accounts` id, a user id.
+  subjectId String?  @map("subject_id")
+  /// What the answer was: `ok`, or `failed` with the classification in `metadata`.
+  outcome   String?
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  /// "Everything that happened to this user", newest first - the read an audit log exists to
+  /// answer, and the one a complaint is reviewed with.
+  @@index([userId, createdAt])
+  /// "Every custody event last week": the other read, and a prefix scan on the action.
+  @@index([action, createdAt])
+  @@map("audit_log")
 }
 
 /// Where a payment is in its life (Steps 25 and 29).

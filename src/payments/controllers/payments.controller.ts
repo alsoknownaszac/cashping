@@ -21,6 +21,7 @@ import {
   ApiParam,
   ApiTags,
 } from '@nestjs/swagger';
+import { StepUpAuthGuard } from '../../common/guards/step-up-auth.guard.js';
 import { ApiErrorResponses } from '../../common/http/swagger.js';
 import {
   IDEMPOTENCY_KEY_HEADER,
@@ -29,6 +30,7 @@ import {
 } from '../../common/interceptors/idempotency.interceptor.js';
 import { CurrentUser } from '../../identity/jwt/current-user.decorator.js';
 import { JwtAuthGuard } from '../../identity/jwt/jwt-auth.guard.js';
+import { STEP_UP_TOKEN_HEADER } from '../../identity/pin/step-up-token.js';
 import { type SessionUser } from '../../identity/token/token.service.js';
 import { CreatePaymentDto } from '../dto/create-payment.dto.js';
 import { ListPaymentsQueryDto } from '../dto/list-payments.dto.js';
@@ -62,14 +64,19 @@ import { PaymentsService } from '../services/payments.service.js';
  * and answering 202 rather than 201 is exactly that statement: the request has been *taken*, and
  * the payment has a life ahead of it. A 201 with a body saying `PENDING` would read as "done".
  *
- * ## Two enhancers, for two different questions
+ * ## Three enhancers, for three different questions
  *
- * `JwtAuthGuard` answers *who is this*, and `IdempotencyInterceptor` answers *have I seen this
- * request*. Guards always run before interceptors, which is what the interceptor needs: a key
- * belongs to a caller, and the claim is scoped per caller so one client's key cannot replay
- * another's request. Declared the other way round the order would not change - which is why the
- * order here is a reading order and not a mechanism - but the interceptor's dependence on
+ * `JwtAuthGuard` answers *who is this*, `StepUpAuthGuard` answers *was the second factor proved
+ * just now* (Step 34a), and `IdempotencyInterceptor` answers *have I seen this request*. Guards
+ * always run before interceptors, and guards run in the order they are listed, which is what the
+ * other two need: a key belongs to a caller, and the claim is scoped per caller so one client's
+ * key cannot replay another's request; and a step-up token names an account, so it can only be
+ * compared against a caller that has already been established. The interceptor's dependence on
  * `request.user` is real, and it fails closed (a 401) if it ever runs without a user.
+ *
+ * Note what the interceptor does *not* answer any more: a replayed request still has to present a
+ * fresh step-up token, because the replay path returns a stored response to a request that got as
+ * far as the interceptor. A stored payment is not a licence to stop proving the PIN.
  *
  * ## The key is required, and the body has no total
  *
@@ -93,7 +100,7 @@ export class PaymentsController {
 
   @Post()
   @HttpCode(HttpStatus.ACCEPTED)
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, StepUpAuthGuard)
   @UseInterceptors(IdempotencyInterceptor)
   @ApiBearerAuth()
   @ApiOperation({
@@ -101,10 +108,22 @@ export class PaymentsController {
     description: [
       'Writes a `PENDING` transaction and reserves its amount against the sender, then answers `202` with the transaction id. Nothing is sent to Stellar yet - Day 4 submits it (Steps 27-29).',
       '',
+      '**Sending money needs the transaction PIN.** Besides the access token, the request must carry a fresh `X-Step-Up-Token`, which `POST /auth/pin/verify` answers with when the caller proves its four-digit PIN. A request without a usable one is refused with a 403 - the token was accepted, the second credential was not presented - and the refusal is recorded in the audit log. The token expires in five minutes; get another by proving the PIN again.',
+      '',
       "`amount` is read by the server, in full: the sender's wallet balance comes from Horizon, the amount already committed by in-flight payments is summed from the ledger table, and a payment that cannot be covered is refused with a 409. A client-computed total is not read, and cannot be sent.",
       '',
-      '**This endpoint is idempotent.** Send a unique `Idempotency-Key` with each payment and reuse it for every retry of that payment: the first request writes the transaction, and any later request with the same key and the same body receives that transaction again (with `Idempotency-Replayed: true`) instead of creating a second one. A request with the same key while the first is still running is a 409, and the same key with a different body is a 400.',
+      '**This endpoint is idempotent.** Send a unique `Idempotency-Key` with each payment and reuse it for every retry of that payment: the first request writes the transaction, and any later request with the same key and the same body receives that transaction again (with `Idempotency-Replayed: true`) instead of creating a second one. A request with the same key while the first is still running is a 409, and the same key with a different body is a 400. A retry needs a fresh step-up token like any other request - a stored response is not a way around the PIN.',
     ].join('\n'),
+  })
+  @ApiHeader({
+    name: STEP_UP_TOKEN_HEADER,
+    required: true,
+    description: [
+      'The step-up token from `POST /auth/pin/verify`, proving the transaction PIN has just been given. It is valid for five minutes, and it belongs to one account: a token minted for somebody else is refused like a forged one.',
+      '',
+      'Header names are case-insensitive, so `X-Step-Up-Token` and `x-step-up-token` are the same header. It is deliberately *not* sent in the body: a credential in a body would be payment data, which the idempotency store keeps a copy of and a request log may print.',
+    ].join('\n'),
+    example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
   })
   @ApiHeader({
     name: IDEMPOTENCY_KEY_HEADER,
@@ -135,7 +154,16 @@ export class PaymentsController {
       description:
         'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
     },
-    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 403,
+      description: [
+        'One of two refusals, and the message says which.',
+        '',
+        'The account is suspended, so nothing may be done with it until support lifts it.',
+        '',
+        'Or the transaction PIN has not been proved recently, and no fresh step-up token was presented. Call `POST /auth/pin/verify`, then retry with its token in `X-Step-Up-Token`. This is a 403 rather than a 401 because the access token *was* accepted - the caller is signed in and has simply not presented the second factor - and the refusal is written to the audit log with the outcome `denied`.',
+      ].join('\n'),
+    },
     {
       status: 404,
       description:

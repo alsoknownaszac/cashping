@@ -5,6 +5,7 @@ import { Test, type TestingModule } from '@nestjs/testing';
 import { describe, expect, it, vi } from 'vitest';
 import { StellarNetwork } from '../config/validation.schema.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { AuditedKeyWrapper } from './custody/audited-key-wrapper.js';
 import { KEY_WRAPPER } from './custody/key-wrapper.js';
 import { KMS_CLIENT_FACTORY, KmsKeyWrapper, createKmsClient } from './custody/kms-key-wrapper.js';
 import { SeedCustodyService } from './custody/seed-custody.service.js';
@@ -33,6 +34,10 @@ import { WalletController } from './wallet.controller.js';
  * Step 18 extends the same reasoning to key custody: `KEY_WRAPPER` must be the
  * KMS-backed implementation and `KMS_CLIENT_FACTORY` the SDK constructor, while
  * *nothing* may reach AWS merely because the module was instantiated.
+ *
+ * Step 32 changes what `KEY_WRAPPER` resolves to - an `AuditedKeyWrapper` over the KMS-backed one -
+ * so the binding assertion below has to name both halves. It is the same question the other swap
+ * points are asked ("is the real implementation bound?"), now that there are two reals.
  *
  * Step 19 adds two more swap points (`STELLAR_TRANSACTION_SUBMITTER`, `ACCOUNT_FUNDER`)
  * and two concrete services, so it is also where the module stopped being purely
@@ -158,12 +163,26 @@ describe('WalletModule', () => {
     expect(moduleRef.get<StellarAccountSource | unknown>(HORIZON_SERVER_FACTORY)).toBe(factory);
   });
 
-  it('binds the key-wrapper token to the KMS-backed implementation', async () => {
+  it('binds the key-wrapper token to the audited decorator over the KMS-backed implementation', async () => {
     moduleRef = await Test.createTestingModule({
       imports: [importConfig(), WalletModule],
     }).compile();
 
-    expect(moduleRef.get(KEY_WRAPPER)).toBeInstanceOf(KmsKeyWrapper);
+    /**
+     * Step 32 rebinds `KEY_WRAPPER`, so the assertion has two halves and both matter: every custody
+     * call goes through the decorator (which is what makes every key access recorded), and the
+     * decorator's inner is still the KMS-backed implementation (which is what makes the recorded
+     * call a real one). A decorator over a stub would satisfy the first alone.
+     *
+     * `instanceof` rather than `toBeInstanceOf`, deliberately: the token now resolves to an object
+     * that holds an `AuditService`, which holds a `PrismaService`, and a matcher that fails tries to
+     * print the received value - which is how this test first failed, with `RangeError: Maximum call
+     * stack size exceeded` instead of a diff that says what the binding is.
+     */
+    const wrapper: unknown = moduleRef.get(KEY_WRAPPER);
+
+    expect(wrapper instanceof AuditedKeyWrapper).toBe(true);
+    expect(moduleRef.get(KmsKeyWrapper)).toBeInstanceOf(KmsKeyWrapper);
     expect(moduleRef.get(SeedCustodyService)).toBeInstanceOf(SeedCustodyService);
   });
 

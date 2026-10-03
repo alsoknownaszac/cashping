@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import { describe, expect, it, vi } from 'vitest';
+import { type AuditEntry, type AuditService } from '../../audit/audit.service.js';
 import { TransactionStatus } from '../../generated/prisma/enums.js';
 import { type NotificationsService, type PaymentResultNotice } from '../../notifications/notifications.service.js';
 import { type PrismaService } from '../../prisma/prisma.service.js';
@@ -29,6 +30,11 @@ import { CONFIRMATION_GRACE_MS } from './confirmation-triage.js';
  * - **The quiet answers stay quiet.** `waiting` and `unknown` write nothing at all, and a row whose
  *   verdict was already written by somebody else must not notify: those are the assertions that
  *   keep a race from becoming a second SMS and a slow payment from becoming a failed one.
+ * - **The audit entries follow the write.** Step 32 appends exactly one entry per resolution, under
+ *   the same winner-takes-the-write rule the message follows: the tick that lost the compare-and-set
+ *   records nothing, and a tick that decided nothing records nothing. What the *insert* does is
+ *   `audit.service.spec.ts`, and whether the table really refuses an `UPDATE` is the migration's
+ *   trigger - so what is asserted here is the part only this class can get wrong.
  *
  * The live proof - a real transaction on Testnet, polled until it lands - is the Step 28 audit item
  * and needs a network; this file is what can be checked without one.
@@ -45,13 +51,21 @@ function at(offsetMs: number): Date {
 const HASH = 'a'.repeat(64);
 const OTHER_HASH = 'b'.repeat(64);
 
+/** The sender of every fake row: the actor Step 32's entries are attributed to. */
+const SENDER_ID = '2c9d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f';
+
 /** One in-flight row, in the shape the sweep's `select` reads it. */
 interface FakeRow {
   readonly id: string;
+  readonly senderId: string;
   readonly amount: string;
   readonly stellarTxHash: string | null;
   readonly submissionDeadline: Date | null;
-  readonly sender: { readonly phoneNumber: string };
+  readonly sender: {
+    readonly phoneNumber: string;
+    readonly email: string | null;
+    readonly emailVerifiedAt: Date | null;
+  };
   readonly recipient: { readonly handle: string | null };
 }
 
@@ -59,10 +73,11 @@ interface FakeRow {
 function row(id: string, overrides: Partial<FakeRow> = {}): FakeRow {
   return {
     id,
+    senderId: SENDER_ID,
     amount: '10.0000000',
     stellarTxHash: HASH,
     submissionDeadline: at(10 * 60_000),
-    sender: { phoneNumber: '+254700000001' },
+    sender: { phoneNumber: '+254700000001', email: null, emailVerifiedAt: null },
     recipient: { handle: 'bob' },
     ...overrides,
   };
@@ -128,16 +143,43 @@ function fakeStellar(answers: Readonly<Record<string, TransactionLookupResult | 
 /** The provider, with the messages it was asked to send. */
 function fakeNotifications(failWith?: Error) {
   const sent: { phoneNumber: string; notice: PaymentResultNotice }[] = [];
+  /** Step 34c: the addresses receipts were *also* emailed to, when the address was verified. */
+  const emailed: string[] = [];
 
-  const sendPaymentResult = async (phoneNumber: string, notice: PaymentResultNotice) => {
+  const sendPaymentResult = async (
+    phoneNumber: string,
+    notice: PaymentResultNotice,
+    email: string | null = null,
+  ) => {
     if (failWith !== undefined) {
       throw failWith;
     }
 
     sent.push({ phoneNumber, notice });
+
+    if (email !== null) {
+      emailed.push(email);
+    }
   };
 
-  return { sent, sendPaymentResult };
+  return { sent, emailed, sendPaymentResult };
+}
+
+/**
+ * `AuditService`, as this class uses it: one method, and the entries it was handed.
+ *
+ * The fake records where the real one inserts, which is the only difference: what Step 32 has to
+ * prove *from here* is which entries a tick writes and when, while the insert itself - and its
+ * refusal to throw - belongs to `audit.service.spec.ts`.
+ */
+function fakeAudit() {
+  const entries: AuditEntry[] = [];
+
+  const log = async (entry: AuditEntry): Promise<void> => {
+    entries.push(entry);
+  };
+
+  return { entries, log };
 }
 
 /** One service over the three fakes, with everything it touched handed back. */
@@ -149,16 +191,19 @@ function sweepOver(
   const prisma = fakePrisma(rows, options);
   const stellar = fakeStellar(lookups);
   const notifications = fakeNotifications(options.notifyFailsWith);
+  const audit = fakeAudit();
 
   return {
     service: new PaymentsConfirmationService(
       prisma.prisma,
       stellar as unknown as StellarService,
       notifications as unknown as NotificationsService,
+      audit as unknown as AuditService,
     ),
     ...prisma,
     ...stellar,
     ...notifications,
+    ...audit,
   };
 }
 
@@ -176,10 +221,11 @@ describe('the work list', () => {
         where: { status: TransactionStatus.PROCESSING, stellarTxHash: { not: null } },
         select: {
           id: true,
+          senderId: true,
           amount: true,
           stellarTxHash: true,
           submissionDeadline: true,
-          sender: { select: { phoneNumber: true } },
+          sender: { select: { phoneNumber: true, email: true, emailVerifiedAt: true } },
           recipient: { select: { handle: true } },
         },
         orderBy: { submissionDeadline: 'asc' },
@@ -244,7 +290,7 @@ describe('the work list', () => {
 
 describe('a payment that landed', () => {
   it("resolves it through the state machine and tells the sender in the row's own words", async () => {
-    const { service, writes, sent } = sweepOver([row('tx-1')], {
+    const { service, writes, sent, entries } = sweepOver([row('tx-1')], {
       [HASH]: { kind: 'settled', ledger: 4321, successful: true, transactionCode: null },
     });
 
@@ -268,10 +314,24 @@ describe('a payment that landed', () => {
         notice: { status: 'SUCCESSFUL', amount: '10', recipientHandle: 'bob' },
       },
     ]);
+
+    // Step 32's entry, and its shape is the decision: the actor is the sender's *id* rather than the
+    // phone number the message uses (the table points at `users`, which is what makes an entry
+    // traceable to an account and not just to a number), the subject is the payment, and the ledger
+    // is the one piece of network context an operator would ask for from a settled payment.
+    expect(entries).toEqual([
+      {
+        action: 'payment.completed',
+        userId: SENDER_ID,
+        subjectId: 'tx-1',
+        outcome: 'ok',
+        metadata: { ledger: 4321 },
+      },
+    ]);
   });
 
   it('fails one the ledger refused, storing the reason and sending the failure wording', async () => {
-    const { service, writes, sent } = sweepOver([row('tx-1')], {
+    const { service, writes, sent, entries } = sweepOver([row('tx-1')], {
       [HASH]: { kind: 'settled', ledger: 4321, successful: false, transactionCode: 'tx_failed' },
     });
 
@@ -284,10 +344,22 @@ describe('a payment that landed', () => {
       },
     ]);
     expect(sent[0]?.notice.status).toBe('FAILED');
+
+    // The other half of the pair, carrying the reason the row was given: the same string, decided by
+    // the same function, so the trail and the `failure_reason` column cannot disagree about why.
+    expect(entries).toEqual([
+      {
+        action: 'payment.failed',
+        userId: SENDER_ID,
+        subjectId: 'tx-1',
+        outcome: 'failed',
+        metadata: { reason: 'landed-unsuccessful:tx_failed' },
+      },
+    ]);
   });
 
   it('does not notify a second time when another caller resolved the row first', async () => {
-    const { service, sent } = sweepOver(
+    const { service, sent, entries } = sweepOver(
       [row('tx-1')],
       { [HASH]: { kind: 'settled', ledger: 4321, successful: true, transactionCode: null } },
       { writesLanded: 0 },
@@ -299,13 +371,16 @@ describe('a payment that landed', () => {
     const result = await service.sweep(NOW);
 
     expect(sent).toEqual([]);
+    // The audit entry is the second thing the lost tick must not produce, for the same reason: a row
+    // appended here would claim this tick resolved a payment that somebody else's write resolved.
+    expect(entries).toEqual([]);
     expect(result).toMatchObject({ polled: 1, confirmed: 0, failed: 0 });
   });
 });
 
 describe('a payment that is not decided yet', () => {
   it('leaves a transaction Horizon has not seen alone while its deadline is ahead', async () => {
-    const { service, writes, sent } = sweepOver([row('tx-1')]);
+    const { service, writes, sent, entries } = sweepOver([row('tx-1')]);
 
     await expect(service.sweep(NOW)).resolves.toMatchObject({ polled: 1, waiting: 1, failed: 0 });
 
@@ -313,6 +388,9 @@ describe('a payment that is not decided yet', () => {
     // That is the whole difference between a payment that is slow and one that is reported wrongly.
     expect(writes).toEqual([]);
     expect(sent).toEqual([]);
+    // And nothing appended (Step 32): an entry is a record that a payment was *decided*, so a tick
+    // that decided nothing has nothing to record - the same reason it sends nothing.
+    expect(entries).toEqual([]);
   });
 
   it('fails it once its deadline *and* the grace window have both passed', async () => {
@@ -356,6 +434,47 @@ describe('a payment that is not decided yet', () => {
   });
 });
 
+describe('the receipt email (Step 34c)', () => {
+  it('emails a verified address as well as texting, and texts alone when the address is unproved', async () => {
+    const verified = sweepOver(
+      [
+        row('tx-1', {
+          sender: {
+            phoneNumber: '+254700000001',
+            email: 'miriam@example.com',
+            emailVerifiedAt: new Date(),
+          },
+        }),
+      ],
+      { [HASH]: { kind: 'settled', ledger: 4321, successful: true, transactionCode: null } },
+    );
+
+    await verified.service.sweep(NOW);
+
+    expect(verified.sent).toHaveLength(1);
+    expect(verified.emailed).toEqual(['miriam@example.com']);
+
+    const unverified = sweepOver(
+      [
+        row('tx-2', {
+          sender: {
+            phoneNumber: '+254700000002',
+            email: 'typo@example.com',
+            emailVerifiedAt: null,
+          },
+        }),
+      ],
+      { [HASH]: { kind: 'settled', ledger: 4322, successful: true, transactionCode: null } },
+    );
+
+    await unverified.service.sweep(NOW);
+
+    expect(unverified.sent).toHaveLength(1);
+    // Attached but unproved: nobody has shown they can read that mailbox, so no receipt goes to it.
+    expect(unverified.emailed).toEqual([]);
+  });
+});
+
 describe("failures that must not become the payment's outcome", () => {
   it('keeps the resolution when the sender cannot be told about it', async () => {
     const logged: unknown[] = [];
@@ -364,7 +483,7 @@ describe("failures that must not become the payment's outcome", () => {
     });
 
     try {
-      const { service, writes } = sweepOver(
+      const { service, writes, entries } = sweepOver(
         [row('tx-1')],
         { [HASH]: { kind: 'settled', ledger: 4321, successful: true, transactionCode: null } },
         { notifyFailsWith: new Error('provider is down') },
@@ -376,6 +495,9 @@ describe("failures that must not become the payment's outcome", () => {
       await expect(service.sweep(NOW)).resolves.toMatchObject({ confirmed: 1 });
 
       expect(writes).toHaveLength(1);
+      // The same ordering, one step on: the audit entry is written *before* the notification too, so
+      // a provider that is down costs the message and not the record of the settlement.
+      expect(entries.map((entry) => entry.action)).toEqual(['payment.completed']);
       expect(String(logged[0])).toContain('tx-1 is SUCCESSFUL, but the notification could not be sent');
     } finally {
       spy.mockRestore();

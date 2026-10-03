@@ -1,15 +1,8 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { IsString, Matches } from 'class-validator';
 import { OTP_CODE_LENGTH } from '../../config/configuration.js';
+import { CODE_PATTERN, codeRuleMessage } from './otp-code-pattern.js';
 import { SubmittedPhoneNumberDto } from './phone-number.dto.js';
-
-/**
- * The code is exactly `OTP_CODE_LENGTH` digits, and the pattern is built from
- * that constant rather than written as `\d{6}`: if the policy in
- * `configuration.ts` ever changes, this rule changes with it instead of rejecting
- * the codes the service just issued.
- */
-const CODE_PATTERN = new RegExp(`^\\d{${OTP_CODE_LENGTH}}$`);
 
 /**
  * Body of `POST /v1/auth/otp/verify` (Step 14), and - through `LoginDto` - of
@@ -35,6 +28,6 @@ export class VerifyOtpDto extends SubmittedPhoneNumberDto {
   // Only the shape is checked here. Whether the code is *right*, still valid, or
   // has attempts left are three different answers with three different responses,
   // and all of them belong to the service that can see the row.
-  @Matches(CODE_PATTERN, { message: `code must be the ${OTP_CODE_LENGTH} digits from the SMS` })
+  @Matches(CODE_PATTERN, { message: codeRuleMessage('SMS') })
   code!: string;
 }

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
+import { AuditModule } from '../audit/audit.module.js';
 import { NotificationsModule } from '../notifications/notifications.module.js';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { RedisModule } from '../redis/redis.module.js';
@@ -13,8 +14,12 @@ import {
   ACCESS_TOKEN_ISSUER,
 } from './jwt/access-token.js';
 import { JwtStrategy } from './jwt/jwt.strategy.js';
+import { EmailService } from './email/email.service.js';
 import { OtpRateLimiterService } from './otp/otp-rate-limiter.service.js';
 import { OtpService } from './otp/otp.service.js';
+import { PasswordService } from './password/password.service.js';
+import { PinService } from './pin/pin.service.js';
+import { StepUpModule } from './pin/step-up.module.js';
 import { TokenService } from './token/token.service.js';
 
 /** Seconds in a minute, for turning the configured token lifetime into `expiresIn`. */
@@ -38,6 +43,16 @@ const SECONDS_PER_MINUTE = 60;
  *     a `StellarService` would be a second place that decides how a transaction is built.
  *     The dependency runs one way - identity asks for a wallet, the wallet knows nothing
  *     about users' sessions - and `WalletModule` does not import this one.
+ *   - `AuditModule` - the audit trail (Step 32), and the one import here that is not about
+ *     serving a request. Three of the vocabulary's eight entries are written from this
+ *     module (`auth.otp.verified`, `auth.login`, `user.handle.set`) because this is where an
+ *     account is created, proved and signed into; the module owns the table, so there is
+ *     nothing to configure on this side. Step 34a adds four more (`auth.pin.*`), which is
+ *     what makes this module the majority writer of the table.
+ *   - `StepUpModule` - the transaction PIN's step-up token (Step 34a). This module *mints*
+ *     one from `AuthService.verifyPin`; `PaymentsModule` imports the same module to verify
+ *     one. See the note in the `imports` array for why the shared thing is a module of its
+ *     own rather than an export of this one.
  *
  * There is no separate token or session module, and that is a decision rather than
  * an omission: `TokenService` and `JwtStrategy` are two halves of one agreement -
@@ -50,16 +65,42 @@ const SECONDS_PER_MINUTE = 60;
  * `TokenService` from outside - *that* is the change that adds the export, because an
  * export nothing imports is a guess about the future. (`WalletModule`'s export is the
  * other half of this rule: it arrived when this module became its consumer, not before.)
+ * Step 34a did not change this, and the way it avoided changing it is worth noting: the one
+ * thing payments needs from this context - proof that a PIN was given - travels as
+ * `StepUpModule`, a leaf module both sides import, so no boundary had to be crossed and
+ * nothing had to be exported "for later".
  *
  * `ConfigService` is not imported here because `ConfigModule` is global
  * (`app.module.ts`), which is the one thing that should be.
  */
 @Module({
   imports: [
+    /**
+     * The audit trail (Step 32). Listed first because it is the module's only cross-cutting
+     * dependency - nothing on this side configures it, and it imports nothing back.
+     */
+    AuditModule,
     PrismaModule,
     RedisModule,
     NotificationsModule,
     WalletModule,
+    /**
+     * The second factor (Step 34a): the transaction PIN's step-up token, and the guard that
+     * accepts it.
+     *
+     * A module of its own rather than more providers here, because the token has a *second*
+     * consumer outside this context: `PaymentsModule` imports the same module to put
+     * `StepUpAuthGuard` in front of `POST /v1/payments`. The alternative - exporting the
+     * guard and the token service from this module - would have made payments import
+     * identity, which its docstring records as the boundary the module graph exists to keep.
+     * This side imports it to *mint*; that side imports it to *verify*; neither imports the
+     * other.
+     *
+     * `PinService` below is *not* in there. It is this context's own service - it reads the
+     * user row, owns the attempt counter and the lockout, and nothing outside identity has
+     * any business calling it.
+     */
+    StepUpModule,
     /**
      * The secret *and* the signing options, registered once so that signing and
      * verifying cannot disagree: `JwtStrategy` reads the same three constants and the
@@ -89,6 +130,21 @@ const SECONDS_PER_MINUTE = 60;
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, OtpService, OtpRateLimiterService, TokenService, JwtStrategy],
+  providers: [
+    AuthService,
+    OtpService,
+    OtpRateLimiterService,
+    PinService,
+    /**
+     * The password (Step 34b) and the email address (Step 34c). Both belong to this context's
+     * own services rather than to `StepUpModule`: neither is a credential that travels outside
+     * identity - `PasswordService` reads the user row, and `EmailService` owns an address on it -
+     * so nothing outside identity has any business calling either.
+     */
+    PasswordService,
+    EmailService,
+    TokenService,
+    JwtStrategy,
+  ],
 })
 export class IdentityModule {}

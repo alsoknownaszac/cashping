@@ -9,6 +9,7 @@ import { GLOBAL_PREFIX } from './../src/common/http/prefix.js';
 import { SWAGGER_PATH, setupSwagger } from './../src/common/http/swagger.js';
 import { createValidationPipe } from './../src/common/pipes/validation.pipe.js';
 import configuration from './../src/config/configuration.js';
+import { STEP_UP_TOKEN_HEADER } from './../src/identity/pin/step-up-token.js';
 
 /** The path the frontend calls for liveness, prefixed exactly as `main.ts` does. */
 const HEALTH_PATH = `/${GLOBAL_PREFIX}/health`;
@@ -27,6 +28,12 @@ const HEALTH_PATH = `/${GLOBAL_PREFIX}/health`;
  */
 const PROTECTED_GET_PATHS = new Set([
   `/${GLOBAL_PREFIX}/auth/session`,
+  // Step 30's history pair, added here the way the comment above asks for. Both read the caller's
+  // own payments (`JwtAuthGuard`), so both answer 401 to the tokenless request below - and
+  // `payments/{id}` is again Swagger's placeholder, whose 401 proves the guard ran before the
+  // router's `ParseUUIDPipe`.
+  `/${GLOBAL_PREFIX}/payments`,
+  `/${GLOBAL_PREFIX}/payments/{id}`,
   `/${GLOBAL_PREFIX}/recipients/search`,
   // The documented path, with Swagger's own `{id}` placeholder rather than a UUID: the guard
   // runs before the router's `ParseUUIDPipe`, so this answers 401. A 400 here would mean the
@@ -47,7 +54,20 @@ const PROTECTED_GET_PATHS = new Set([
  * request carrying an undeclared field and asserts the 400 - and what this file keeps proving is
  * the part it can: the route exists, and the guard is attached to it.
  */
-const PROTECTED_POST_PATHS = new Set([`/${GLOBAL_PREFIX}/payments`]);
+const PROTECTED_POST_PATHS = new Set([
+  `/${GLOBAL_PREFIX}/auth/pin/change`,
+  `/${GLOBAL_PREFIX}/auth/pin/verify`,
+  // Step 34b and 34c's guarded POSTs, added here the way the GET set above asks for. Every one of
+  // them writes a credential or a contact detail *on the caller's account*, so every one of them
+  // needs the caller: without a token each answers 401, and the empty body this file sends never
+  // reaches the validation pipe. The three that are deliberately *not* here are the other half of
+  // the same statement - `login/password` and the reset pair answer 400, because needing no session
+  // is the point of them.
+  `/${GLOBAL_PREFIX}/auth/password/change`,
+  `/${GLOBAL_PREFIX}/auth/email`,
+  `/${GLOBAL_PREFIX}/auth/email/verify`,
+  `/${GLOBAL_PREFIX}/payments`,
+]);
 
 /**
  * What the frontend engineer actually consumes, over real HTTP and wired exactly
@@ -104,20 +124,50 @@ describe('Frontend hand-off (e2e)', () => {
     // it really showed up in the docs (it is generated from the app, so it should).
     expect(Object.keys(response.body.paths as Record<string, unknown>).sort()).toEqual([
       `/${GLOBAL_PREFIX}`,
+      `/${GLOBAL_PREFIX}/auth/email`,
+      `/${GLOBAL_PREFIX}/auth/email/verify`,
       `/${GLOBAL_PREFIX}/auth/login`,
       `/${GLOBAL_PREFIX}/auth/login/otp`,
+      `/${GLOBAL_PREFIX}/auth/login/password`,
       `/${GLOBAL_PREFIX}/auth/logout`,
       `/${GLOBAL_PREFIX}/auth/otp/verify`,
+      `/${GLOBAL_PREFIX}/auth/password/change`,
+      `/${GLOBAL_PREFIX}/auth/password/reset`,
+      `/${GLOBAL_PREFIX}/auth/password/reset/confirm`,
+      `/${GLOBAL_PREFIX}/auth/pin/change`,
+      `/${GLOBAL_PREFIX}/auth/pin/verify`,
       `/${GLOBAL_PREFIX}/auth/refresh`,
       `/${GLOBAL_PREFIX}/auth/register`,
       `/${GLOBAL_PREFIX}/auth/session`,
       HEALTH_PATH,
       `/${GLOBAL_PREFIX}/payments`,
+      `/${GLOBAL_PREFIX}/payments/{id}`,
       `/${GLOBAL_PREFIX}/recipients/search`,
       `/${GLOBAL_PREFIX}/recipients/{id}`,
       `/${GLOBAL_PREFIX}/wallet/account`,
       `/${GLOBAL_PREFIX}/wallet/balance`,
     ]);
+  });
+
+  it('documents the step-up credential that POST /v1/payments demands (Step 34a)', async () => {
+    const response = await request(app.getHttpServer()).get(`/${SWAGGER_PATH}-json`).expect(200);
+
+    const documented = response.body.paths as Record<string, Record<string, unknown>>;
+    const post = documented[`/${GLOBAL_PREFIX}/payments`]?.post as
+      | { parameters?: { name?: string; in?: string; required?: boolean }[] }
+      | undefined;
+
+    const stepUp = (post?.parameters ?? []).find(
+      (parameter) => parameter.in === 'header' && parameter.name === STEP_UP_TOKEN_HEADER,
+    );
+
+    // A header the route requires and the document does not mention is half a contract, and the
+    // missing half is the one that answers 403. `required: true` is the other half of the same
+    // point: it is what makes the docs UI send the header at all.
+    expect(
+      stepUp,
+      `POST /${GLOBAL_PREFIX}/payments does not document ${STEP_UP_TOKEN_HEADER}`,
+    ).toMatchObject({ required: true });
   });
 
   it('lists every documented path and method as a request the app really serves', async () => {

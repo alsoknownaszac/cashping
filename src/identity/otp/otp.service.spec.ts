@@ -1,7 +1,7 @@
 import { type ConfigService } from '@nestjs/config';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { type PrismaService } from '../../prisma/prisma.service.js';
-import { hashOtpCode } from './otp-crypto.js';
+import { hashSecret } from '../credentials/secret-hash.js';
 import { OtpService } from './otp.service.js';
 
 /**
@@ -259,7 +259,7 @@ describe('OtpService.check', () => {
   let correctHash: string;
 
   beforeAll(async () => {
-    correctHash = await hashOtpCode(CODE);
+    correctHash = await hashSecret(CODE);
   });
 
   it('reports no live code without writing anything', async () => {
