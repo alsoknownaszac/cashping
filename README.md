@@ -122,6 +122,15 @@ it is no substitute for auth on an endpoint. A request with no `Origin` header a
 (curl, the container healthcheck, server-to-server) is not a CORS request and is passed
 through untouched.
 
+### The auth flows a client implements
+
+`docs/frontend-auth-flow.md` is the client-side companion to this README: the register,
+add-an-email, sign-in and password-recovery calls in the order a screen makes them, with the
+status code each answer maps to and the copy it implies. It is written against Step 34c, so it
+also says plainly what does *not* exist yet — registering *with* an email and Google SSO — rather
+than describing them as though they did, and it records the small API gaps the frontend has to
+work around in the meantime (`GET /auth/session` carries no email state, and codes are SMS-only).
+
 ## Registration and phone verification (Day 1)
 
 The identity flow is two calls. Both take the number in whatever form the user typed it,
