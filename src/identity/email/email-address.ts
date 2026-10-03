@@ -75,3 +75,28 @@ export function normalizeEmailAddress(input: string): string {
 
   return normalized;
 }
+
+/**
+ * The masked form of an address: `m***@example.com`.
+ *
+ * Lives here, next to the rule it belongs to, rather than in the file that happens to log one:
+ * this is the file that says what an address *is*, and the mask is part of that - the reason
+ * `phone/phone-number.ts` holds `maskPhoneNumber`. A log line is a place an identity can leak
+ * from, so the value put in front of a human is the masked form and only the masked form, and
+ * there is one definition of what that form is (Step 34c).
+ *
+ * Enough of the address survives for an operator to recognise the account, and not enough to
+ * read back the mailbox: the domain is kept whole (it names no person, and it is what a delivery
+ * problem is usually about) while the local part is reduced to its first character.
+ */
+export function maskEmailAddress(email: string): string {
+  const at = email.indexOf('@');
+
+  // Nothing to keep: `a@example.com` would be echoed almost in full, and a value with no `@` at
+  // all is not an address, so the safe answer is that there is no safe excerpt of it.
+  if (at <= 1) {
+    return '***';
+  }
+
+  return `${email[0]}***${email.slice(at)}`;
+}

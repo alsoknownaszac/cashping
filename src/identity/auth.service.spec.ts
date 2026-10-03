@@ -67,6 +67,13 @@ interface FakeUser {
   handle: string | null;
   /** The scrypt hash registration writes (Step 34a) - never the PIN itself. */
   transactionPinHash: string | null;
+  /**
+   * The address the account holds, and when it was *proved* (Step 34c). Both are columns the
+   * sign-in reads: an address with a null `emailVerifiedAt` is attached rather than verified, and
+   * is not a credential.
+   */
+  email: string | null;
+  emailVerifiedAt: Date | null;
 }
 
 /** The two tables `AuthService` touches, plus a log of the calls it made. */
@@ -125,10 +132,26 @@ class FakePrisma {
   };
 
   readonly user = {
-    findUnique: async (args: { where: { phoneNumber: string } }): Promise<FakeUser | null> => {
+    /**
+     * The one indexed read a sign-in is: the identifier names the column, so the fake looks in
+     * that column rather than scanning an `OR` across both (Step 34c).
+     */
+    findUnique: async (args: {
+      where: { phoneNumber?: string; email?: string };
+    }): Promise<FakeUser | null> => {
       this.calls.push('findUnique');
 
-      return this.users.get(args.where.phoneNumber) ?? null;
+      if (args.where.email !== undefined) {
+        const email = args.where.email;
+
+        return [...this.users.values()].find((user) => user.email === email) ?? null;
+      }
+
+      if (args.where.phoneNumber !== undefined) {
+        return this.users.get(args.where.phoneNumber) ?? null;
+      }
+
+      return null;
     },
     create: async (args: {
       data: { phoneNumber: string; handle?: string | null; transactionPinHash?: string };
@@ -143,6 +166,9 @@ class FakePrisma {
         status: UserStatus.PENDING_VERIFICATION,
         phoneVerifiedAt: null,
         transactionPinHash: args.data.transactionPinHash ?? null,
+        // Registration writes no address (Step 34c): an address arrives later, at `POST /auth/email`.
+        email: null,
+        emailVerifiedAt: null,
       };
 
       this.users.set(user.phoneNumber, user);
@@ -213,17 +239,21 @@ class FakeOtpService {
   };
 }
 
-/** The Redis limiter, recording which numbers were counted and how they answered. */
+/** The Redis limiter, recording which identifiers were counted and how they answered. */
 class FakeRateLimiter {
+  /** The subjects counted, in order: the identifier the counted request was about. */
   readonly consumed: string[] = [];
+  /** The mask that travelled with each subject, which is what the limiter would log (Step 34c). */
+  readonly masks: string[] = [];
   error: Error | null = null;
 
-  consume = async (phoneNumber: string): Promise<void> => {
+  consume = async (subject: string, masked: string = subject): Promise<void> => {
     if (this.error !== null) {
       throw this.error;
     }
 
-    this.consumed.push(phoneNumber);
+    this.consumed.push(subject);
+    this.masks.push(masked);
   };
 }
 
@@ -558,6 +588,10 @@ function seedUser(prisma: FakePrisma, overrides: Partial<FakeUser> = {}): FakeUs
     // The PIN a previous registration would have written. `null` is the honest default for a row
     // seeded directly, and it is what Step 34d's Google accounts look like.
     transactionPinHash: null,
+    // Step 34c: a seeded row holds no address until a test attaches one, and an address is only a
+    // credential once `emailVerifiedAt` is set.
+    email: null,
+    emailVerifiedAt: null,
     ...overrides,
   };
 
@@ -1533,5 +1567,235 @@ describe('AuthService.changePin / verifyPin (Step 34a)', () => {
 
     expect(message).not.toContain('9999');
     expect(message).not.toContain('1234');
+  });
+});
+
+/**
+ * The identifier half of the password sign-in (Steps 34b and 34c).
+ *
+ * The *flow* - set, change, reset, and the single 401 - is asserted over real HTTP in
+ * `test/password.e2e-spec.ts`, because it is mostly about rows and codes. What is asserted here is
+ * the decision this file exists for and that a running database would hide: *which* identifier the
+ * request was about. Every use of it has to agree - the column that is looked up, the subject the
+ * attempt is counted against, and the mask the log line carries - so these tests are largely about
+ * those three moving together, and about the refusals that must land before any of them is reached.
+ */
+describe('AuthService.loginWithPassword (Steps 34b and 34c)', () => {
+  /** An address the way `POST /auth/email` stores it, and another spelling of the same mailbox. */
+  const STORED_EMAIL = 'miriam@example.com';
+  const SUBMITTED_EMAIL = '  Miriam@Example.COM  ';
+  /** Masks, asserted exactly: they are the only spelling of an identifier a log line may carry. */
+  const EMAIL_MASK = 'm***@example.com';
+  const PHONE_MASK = '+233*****4567';
+
+  const PASSWORD = 'correct horse battery staple';
+
+  it('refuses a body with both identifiers, before anything is looked up, counted or written', async () => {
+    const { auth, prisma, limiter, audit, tokens } = createHarness();
+    seedUser(prisma, {
+      status: UserStatus.ACTIVE,
+      email: STORED_EMAIL,
+      emailVerifiedAt: new Date('2026-10-02T00:00:00.000Z'),
+    });
+
+    const { status, message } = await captureHttpError(() =>
+      auth.loginWithPassword({
+        phoneNumber: LOCAL_NUMBER,
+        email: STORED_EMAIL,
+        password: PASSWORD,
+      }),
+    );
+
+    expect(status).toBe(400);
+    // It names the pair rather than one field, because the body is wrong only as a whole.
+    expect(message).toContain('not both');
+    // Nothing was decided about an account, so there is nothing read, counted, minted or recorded -
+    // which is also why this 400 cannot be used to spend anyone's allowance.
+    expect(prisma.calls).toEqual([]);
+    expect(limiter.consumed).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+    expect(audit.entries).toEqual([]);
+  });
+
+  it('refuses a body with neither identifier, and says what to send', async () => {
+    const { auth, prisma, limiter } = createHarness();
+
+    const { status, message } = await captureHttpError(() =>
+      auth.loginWithPassword({ password: PASSWORD }),
+    );
+
+    expect(status).toBe(400);
+    expect(message).toContain('phone number or the email address');
+    expect(prisma.calls).toEqual([]);
+    expect(limiter.consumed).toEqual([]);
+  });
+
+  it('signs in the account a verified address belongs to, looked up by the address alone', async () => {
+    const { auth, prisma, limiter, tokens, audit, passwords } = createHarness();
+    const user = seedUser(prisma, {
+      status: UserStatus.ACTIVE,
+      phoneVerifiedAt: new Date('2026-10-01T00:00:00.000Z'),
+      email: STORED_EMAIL,
+      emailVerifiedAt: new Date('2026-10-02T00:00:00.000Z'),
+    });
+
+    const response = await auth.loginWithPassword({ email: SUBMITTED_EMAIL, password: PASSWORD });
+
+    expect(response.userId).toBe(user.id);
+    // One indexed read of the column the identifier names, then the entry recording the sign-in: no
+    // scan across both columns, no second lookup.
+    expect(prisma.calls).toEqual(['findUnique', 'audit:auth.password.login']);
+    // `  Miriam@Example.COM  ` found the row stored as `miriam@example.com`: the value looked up is
+    // the normalized one, which is the value `EmailService` wrote, so the unique index does the work.
+    expect(limiter.consumed).toEqual([STORED_EMAIL]);
+    // Counted against the *address*, and handed the mail mask rather than the address itself: this is
+    // the assertion that fails if the two halves of `SignInIdentifier` ever drift apart.
+    expect(limiter.masks).toEqual([EMAIL_MASK]);
+    expect(passwords.verified).toEqual([{ userId: user.id, password: PASSWORD }]);
+    expect(response.accessToken).toBe('access-token-1');
+    // The account's own number, not the submitted identifier: an address is a second way to present
+    // the credential, and the account still has exactly one number.
+    expect(response.phoneNumber).toBe(E164_NUMBER);
+    expect(response.status).toBe(UserStatus.ACTIVE);
+    expect(audit.entries).toEqual([
+      { action: 'auth.password.login', userId: user.id, outcome: 'ok' },
+    ]);
+    expect(tokens.issued).toEqual([user]);
+  });
+
+  it('answers one 401 for an address that is attached but never proved, without checking the password', async () => {
+    const { auth, prisma, passwords, tokens, audit } = createHarness();
+    const user = seedUser(prisma, {
+      status: UserStatus.ACTIVE,
+      phoneVerifiedAt: new Date('2026-10-01T00:00:00.000Z'),
+      email: STORED_EMAIL,
+      emailVerifiedAt: null,
+    });
+
+    const { status, message } = await captureHttpError(() =>
+      auth.loginWithPassword({ email: STORED_EMAIL, password: PASSWORD }),
+    );
+
+    expect(status).toBe(401);
+    // The same sentence an unknown address gets (below): this endpoint must not be a way of learning
+    // which addresses are claimed, or which claimed ones were never proved.
+    expect(message).toContain('do not match');
+    // scrypt never ran, and that is the decision rather than an optimization: an unproved address is
+    // not a credential, so whatever password hangs off it is not worth checking.
+    expect(passwords.verified).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+    // Which of the several reasons it was is recorded for the operator - and it is `denied`, like
+    // every other refusal here, because the client was not told.
+    expect(audit.entries).toEqual([
+      { action: 'auth.password.login', userId: user.id, outcome: 'denied' },
+    ]);
+  });
+
+  it('answers the same 401 for an address nothing holds, and records it against no account', async () => {
+    const { auth, limiter, audit, passwords, tokens } = createHarness();
+
+    const { status, message } = await captureHttpError(() =>
+      auth.loginWithPassword({ email: STORED_EMAIL, password: PASSWORD }),
+    );
+
+    expect(status).toBe(401);
+    expect(message).toContain('do not match');
+    // Counted anyway. A limiter that only counted addresses that exist would let an attacker probe
+    // for which ones do at full speed, which is the enumeration this step is trying to prevent.
+    expect(limiter.consumed).toEqual([STORED_EMAIL]);
+    expect(limiter.masks).toEqual([EMAIL_MASK]);
+    expect(passwords.verified).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+    // No account to attribute it to, so the row carries no `userId` rather than a guessed one.
+    expect(audit.entries).toEqual([
+      { action: 'auth.password.login', userId: undefined, outcome: 'denied' },
+    ]);
+  });
+
+  it('refuses a suspended account with a 403 before its allowance is touched', async () => {
+    const { auth, prisma, limiter, audit, tokens } = createHarness();
+    seedUser(prisma, {
+      status: UserStatus.SUSPENDED,
+      email: STORED_EMAIL,
+      emailVerifiedAt: new Date('2026-10-02T00:00:00.000Z'),
+    });
+
+    const { status } = await captureHttpError(() =>
+      auth.loginWithPassword({ email: STORED_EMAIL, password: PASSWORD }),
+    );
+
+    expect(status).toBe(403);
+    // The order matters and is the reason this test exists: the account is looked up first, so a
+    // suspended account cannot have its own counter spent by anyone else, and the refusal is final
+    // whatever the password was. Nothing was written, because nothing was refused *at* the caller.
+    expect(prisma.calls).toEqual(['findUnique']);
+    expect(limiter.consumed).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+    expect(audit.entries).toEqual([]);
+  });
+
+  it('counts the number and the address on one account separately, as two identifiers', async () => {
+    const { auth, prisma, limiter } = createHarness();
+    seedUser(prisma, {
+      status: UserStatus.ACTIVE,
+      phoneVerifiedAt: new Date('2026-10-01T00:00:00.000Z'),
+      email: STORED_EMAIL,
+      emailVerifiedAt: new Date('2026-10-02T00:00:00.000Z'),
+    });
+
+    await auth.loginWithPassword({ email: STORED_EMAIL, password: PASSWORD });
+    await auth.loginWithPassword({ phoneNumber: LOCAL_NUMBER, password: PASSWORD });
+
+    // The subject is the identifier as submitted - the address for the first call, the E.164 number
+    // for the second - and each carries its own mask. One counter for the pair would mean guesses at
+    // whichever identifier is cheaper to try could lock the other one out.
+    expect(limiter.consumed).toEqual([STORED_EMAIL, E164_NUMBER]);
+    expect(limiter.masks).toEqual([EMAIL_MASK, PHONE_MASK]);
+  });
+
+  it('maps an exhausted allowance on an address to a 429, and never reaches scrypt', async () => {
+    const { auth, prisma, limiter, audit, tokens, passwords } = createHarness();
+    seedUser(prisma, {
+      status: UserStatus.ACTIVE,
+      email: STORED_EMAIL,
+      emailVerifiedAt: new Date('2026-10-02T00:00:00.000Z'),
+    });
+    limiter.error = new OtpRateLimitExceededError(900);
+
+    const { status, message } = await captureHttpError(() =>
+      auth.loginWithPassword({ email: STORED_EMAIL, password: PASSWORD }),
+    );
+
+    expect(status).toBe(429);
+    // Wording for a *sign-in*, not for a code request: the counter is shared but the caller is not,
+    // and a person who has been guessing passwords is not told about verification codes.
+    expect(message).toContain('Too many sign-in attempts');
+    expect(message).toContain('15 minutes');
+    // The refusal happens before the credential is checked, so a blocked attempt costs no scrypt
+    // work, mints nothing, and is not recorded against the account as a failed sign-in.
+    expect(passwords.verified).toEqual([]);
+    expect(tokens.issued).toEqual([]);
+    expect(audit.entries).toEqual([]);
+  });
+
+  it('maps an unavailable limiter to a 503, rather than letting a sign-in through unchecked', async () => {
+    const { auth, prisma, limiter, passwords, tokens } = createHarness();
+    seedUser(prisma, {
+      status: UserStatus.ACTIVE,
+      email: STORED_EMAIL,
+      emailVerifiedAt: new Date('2026-10-02T00:00:00.000Z'),
+    });
+    limiter.error = new OtpRateLimitUnavailableError();
+
+    const { status, message } = await captureHttpError(() =>
+      auth.loginWithPassword({ email: STORED_EMAIL, password: PASSWORD }),
+    );
+
+    // Redis being down must not read as "no limit": refusing is the safe failure, and it is the same
+    // answer the OTP paths give, so nobody can take sign-in down to remove the cap.
+    expect(status).toBe(503);
+    expect(message).toContain('temporarily unavailable');
+    expect(passwords.verified).toEqual([]);
+    expect(tokens.issued).toEqual([]);
   });
 });

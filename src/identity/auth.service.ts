@@ -55,6 +55,7 @@ import { type VerifyEmailDto } from './dto/verify-email.dto.js';
 import {
   InvalidEmailAddressError,
   MAX_EMAIL_LENGTH,
+  maskEmailAddress,
   normalizeEmailAddress,
 } from './email/email-address.js';
 import {
@@ -87,6 +88,25 @@ import { TokenService, type IssuedTokens, type SessionUser } from './token/token
  * the `users` table ever gains.
  */
 type RegisteredUser = Pick<UserModel, 'id' | 'status' | 'handle'>;
+
+/**
+ * The identifier a password sign-in was submitted with, and the column it belongs to (Step 34c).
+ *
+ * The type is where the decision is recorded, because every use of an identifier - the lookup,
+ * the rate-limit subject, the log line - has to agree about which of the two it is holding. A
+ * bare `string` would let the one that logs call the phone mask on an address, and it would let
+ * the one that queries look in `phoneNumber` for an address. `masked` travels with the value
+ * rather than being computed at each use for the same reason: which mask is honest is a fact
+ * about the field, not about the caller.
+ */
+interface SignInIdentifier {
+  /** The unique column it came from, and therefore the lookup to run. */
+  readonly field: 'phoneNumber' | 'email';
+  /** The normalized value: strict E.164, or the trimmed, lower-cased address. */
+  readonly value: string;
+  /** The only spelling of it a log line may carry. */
+  readonly masked: string;
+}
 
 /**
  * The wallet half of a verification log line (Step 19).
@@ -869,34 +889,65 @@ export class AuthService {
   }
 
   /**
-   * Signs in with a password, and starts a session (Step 34b).
+   * Signs in with a password, and starts a session (Steps 34b and 34c).
+   *
+   * The identifier is the number the account registered with or the address it has *verified*
+   * (Step 34c) - exactly one of the two, read by `signInIdentifier`, which also normalizes it. The
+   * password is the same credential either way: there is one password column, not one per
+   * identifier, so an address is a second way to *present* the credential rather than a second
+   * credential.
    *
    * Outcomes, in the order they are decided:
+   *   - both identifiers, or neither -> 400, before anything is looked up;
    *   - `SUSPENDED`                -> 403, before the password is even looked at;
    *   - over the attempt allowance -> 429 (the counter is the OTP limiter's, so a password
    *                                   guess is priced exactly like a code guess);
-   *   - no account, no password set, wrong password, or not `ACTIVE` -> one 401;
+   *   - no account, no password set, wrong password, not `ACTIVE`, or an address that was never
+   *     proved                     -> one 401;
    *   - otherwise                  -> 200 with the same token pair `POST /auth/login` answers.
    *
-   * The single 401 is the point: "no such user", "no password set" and "wrong password" are the
-   * same answer, for the reason `TokenService`'s refresh failures share one message - the
-   * endpoint is otherwise an oracle that tells an anonymous caller which numbers are
-   * registered. The audit row records which of them it was, and it is `denied` for all three.
+   * The single 401 is the point: "no such user", "no password set", "wrong password" and "that
+   * address was never verified" are the same answer, for the reason `TokenService`'s refresh
+   * failures share one message - the endpoint is otherwise an oracle that tells an anonymous
+   * caller which numbers and addresses are registered, or which of them are claimed. The audit
+   * row records which of them it was, and it is `denied` for all of them.
+   *
+   * The 400 for an ambiguous body is the one refusal that is *not* hidden, because it is about the
+   * request rather than about an account: it names no account and cannot be used to probe one.
    */
   async loginWithPassword(dto: LoginPasswordDto): Promise<LoginResponseDto> {
-    const refused = 'That phone number and password do not match. Check both and try again.';
+    const refused =
+      'That phone number or email and password do not match. Check them and try again.';
 
-    const phoneNumber = this.normalize(dto.phoneNumber);
+    const identifier = this.signInIdentifier(dto);
 
-    const user = await this.prisma.user.findUnique({ where: { phoneNumber } });
+    const user = await this.findPasswordSignInUser(identifier);
 
     if (user !== null && user.status === UserStatus.SUSPENDED) {
       throw new ForbiddenException('This account is suspended. Contact support.');
     }
 
-    await this.assertWithinPasswordAttemptLimit(phoneNumber);
+    await this.assertWithinPasswordAttemptLimit(identifier);
 
-    if (user === null || user.status !== UserStatus.ACTIVE) {
+    /**
+     * An address has to have been *proved* before it can sign anyone in (Step 34c). A row whose
+     * `emailVerifiedAt` is null holds an address that was attached and never confirmed, and such a
+     * row is answered exactly as an address nothing holds - so this endpoint cannot be used to
+     * find out which addresses are claimed, in the way the one 401 below stops it being used to
+     * find out which numbers are registered. A number carries no such condition because
+     * registration does not finish without proving it: `phoneVerifiedAt` is what makes a row
+     * `ACTIVE`, whereas an address is attached to an account that is already active.
+     *
+     * `status` rules out `PENDING` and `SUSPENDED` too - the first has no password to check by
+     * construction (`POST /auth/password/change` requires an `ACTIVE` session), and the second was
+     * already refused above.
+     */
+    const signable =
+      user !== null &&
+      user.status === UserStatus.ACTIVE &&
+      (identifier.field === 'phoneNumber' || user.emailVerifiedAt !== null);
+
+    if (!signable) {
       await this.audit.log({ action: 'auth.password.login', userId: user?.id, outcome: 'denied' });
 
       throw new UnauthorizedException(refused);
@@ -912,12 +963,15 @@ export class AuthService {
 
     await this.audit.log({ action: 'auth.password.login', userId: user.id, outcome: 'ok' });
 
-    this.logger.log(`Password sign-in for ${maskPhoneNumber(phoneNumber)} (user ${user.id})`);
+    this.logger.log(`Password sign-in for ${identifier.masked} (user ${user.id})`);
 
     return {
       ...this.toTokenPair(issued),
       userId: user.id,
-      phoneNumber,
+      // The account's own number, not the submitted one. They are the same value when the number
+      // was the identifier, and when it was the address this is the only spelling the account has
+      // for it.
+      phoneNumber: user.phoneNumber,
       status: user.status,
       handle: user.handle,
     };
@@ -1356,22 +1410,84 @@ export class AuthService {
   }
 
   /**
-   * Counts one password sign-in against the number's allowance, or refuses (Step 34b).
+   * Reads the one identifier a password sign-in carries, or refuses an ambiguous body (Step 34c).
+   *
+   * `phoneNumber` and `email` are one decision with two spellings, so exactly one is read. A body
+   * with both is refused because *which* account it means would be ambiguous, and the rule this
+   * endpoint would have to invent - number wins? - is one no caller could predict; a body with
+   * neither is refused because there would be nothing to look up. Both messages name the fields,
+   * which is why the rule lives here rather than in a decorator: the validation pipe can only say
+   * "this field is wrong", and the answer here is about the pair.
+   *
+   * The value is normalized as it is read, so what is looked up is what the column holds:
+   * `Miriam@Example.com` finds the row `POST /auth/email` stored as `miriam@example.com`, and
+   * `024 123 4567` finds the row registration stored as `+233241234567`. A `PENDING` or otherwise
+   * unusable value throws the same `BadRequestException` it throws everywhere else, which is the
+   * point of routing through `normalizeEmail` and `normalize` rather than testing for an `@`.
+   *
+   * `masked` comes along because the identifier is about to be logged and counted, and *which*
+   * mask is honest is a fact about the field rather than about the caller.
+   */
+  private signInIdentifier(dto: LoginPasswordDto): SignInIdentifier {
+    if (dto.phoneNumber !== undefined && dto.email !== undefined) {
+      throw new BadRequestException('Send either phoneNumber or email, not both.');
+    }
+
+    if (dto.email !== undefined) {
+      const email = this.normalizeEmail(dto.email);
+
+      return { field: 'email', value: email, masked: maskEmailAddress(email) };
+    }
+
+    if (dto.phoneNumber === undefined) {
+      throw new BadRequestException(
+        'Send the phone number or the email address you sign in with, and the password.',
+      );
+    }
+
+    const phoneNumber = this.normalize(dto.phoneNumber);
+
+    return { field: 'phoneNumber', value: phoneNumber, masked: maskPhoneNumber(phoneNumber) };
+  }
+
+  /**
+   * The row a password sign-in is about, or `null` for an identifier nothing holds.
+   *
+   * One query against the column the identifier names, rather than one `OR` across both: each
+   * column is unique on its own and exactly one of them is present, so either way this is a single
+   * indexed read. The address is looked up by the normalized value, which is the value
+   * `EmailService` stored - the read the unique index on `users.email` exists for.
+   *
+   * `null` rather than an exception, because the several ways there is no signable account -
+   * nothing holds the identifier, the row is not `ACTIVE`, the address was never proved - are one
+   * answer by design, and only `loginWithPassword` knows what to say about them.
+   */
+  private findPasswordSignInUser(identifier: SignInIdentifier): Promise<UserModel | null> {
+    return identifier.field === 'phoneNumber'
+      ? this.prisma.user.findUnique({ where: { phoneNumber: identifier.value } })
+      : this.prisma.user.findUnique({ where: { email: identifier.value } });
+  }
+
+  /**
+   * Counts one password sign-in against the identifier's allowance, or refuses (Steps 34b, 34c).
    *
    * The counter is `OtpRateLimiterService`'s, deliberately: a password guess is then priced
    * exactly like a code guess, and there is one place - not two that could disagree - deciding
-   * how many tries a number gets in a window. What this adds is the wording: a caller who has
-   * been signing in, rather than requesting codes, is told about sign-in attempts.
+   * how many tries an identifier gets in a window. The subject is the identifier that was
+   * submitted, normalized, so an address and a number on the same account have an allowance each
+   * (as `register` counts them) rather than sharing one; the masked form travels with it because
+   * the limiter logs what it is counting. What this adds is the wording: a caller who has been
+   * signing in, rather than requesting codes, is told about sign-in attempts.
    */
-  private async assertWithinPasswordAttemptLimit(phoneNumber: string): Promise<void> {
+  private async assertWithinPasswordAttemptLimit(identifier: SignInIdentifier): Promise<void> {
     try {
-      await this.otpRateLimiter.consume(phoneNumber);
+      await this.otpRateLimiter.consume(identifier.value, identifier.masked);
     } catch (error) {
       if (error instanceof OtpRateLimitExceededError) {
         const minutes = Math.ceil(error.retryAfterSeconds / 60);
 
         throw new HttpException(
-          `Too many sign-in attempts for this number. Try again in ${minutes} minute${
+          `Too many sign-in attempts for this account. Try again in ${minutes} minute${
             minutes === 1 ? '' : 's'
           }.`,
           HttpStatus.TOO_MANY_REQUESTS,

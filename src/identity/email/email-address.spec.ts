@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   InvalidEmailAddressError,
   MAX_EMAIL_LENGTH,
+  maskEmailAddress,
   normalizeEmailAddress,
 } from './email-address.js';
 
@@ -66,5 +67,32 @@ describe('normalizeEmailAddress', () => {
     expect(() => normalizeEmailAddress(`${localAtCeiling}a${domain}`)).toThrow(
       InvalidEmailAddressError,
     );
+  });
+});
+
+/**
+ * What a log line is allowed to carry (Step 34c).
+ *
+ * Asserted next to the rule rather than where it is used, because it has two callers -
+ * `AuthService`'s password sign-in and `NotificationsService`'s delivery lines - and the one
+ * property that matters is that the value it returns cannot be read back into an address. A test
+ * that only checked the shape would pass for a function that appended a `*` to its input, so
+ * these assertions are mostly about what is *absent*.
+ */
+describe('maskEmailAddress', () => {
+  it('keeps the domain whole and the first character of the local part, and drops the rest', () => {
+    expect(maskEmailAddress('miriam@example.com')).toBe('m***@example.com');
+    // The domain is what a delivery problem is about and names no person; the local part is the
+    // part that identifies one.
+    expect(maskEmailAddress('miriam.owusu+tag@example.co.uk')).toBe('m***@example.co.uk');
+  });
+
+  it('shows nothing at all when there is nothing safe to show', () => {
+    // `a@example.com` would be echoed almost in full, and a value with no `@` is not an address
+    // this API ever stored - so neither gets an excerpt.
+    expect(maskEmailAddress('a@example.com')).toBe('***');
+    expect(maskEmailAddress('@example.com')).toBe('***');
+    expect(maskEmailAddress('nope')).toBe('***');
+    expect(maskEmailAddress('')).toBe('***');
   });
 });

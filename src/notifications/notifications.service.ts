@@ -1,6 +1,9 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { maskPhoneNumber } from '../common/phone/phone-number.js';
+// The address rule and its mask are stated once, in the value module that owns "what an address
+// is" - which imports nothing, so this is a value import rather than a module cycle.
+import { maskEmailAddress } from '../identity/email/email-address.js';
 import { EMAIL_SENDER, type EmailSender } from './email/email-sender.js';
 import { SMS_SENDER, type SmsSender } from './sms/sms-sender.js';
 
@@ -177,24 +180,6 @@ export class NotificationsService {
   private from(): string {
     return this.config.getOrThrow<string>('email.from');
   }
-}
-
-/**
- * `m***@example.com`: enough of the address for an operator to recognise the account, and not
- * the address itself.
- *
- * Local because this is the only file that logs one, and the rule it follows is the one
- * `maskPhoneNumber` exists for: a log line is a place an identifier can leak from, so the
- * value in front of a human is the masked form and only the masked form.
- */
-function maskEmailAddress(email: string): string {
-  const at = email.indexOf('@');
-
-  if (at <= 1) {
-    return '***';
-  }
-
-  return `${email[0]}***${email.slice(at)}`;
 }
 
 /**

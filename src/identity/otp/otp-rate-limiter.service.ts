@@ -34,7 +34,7 @@ export class OtpRateLimitUnavailableError extends Error {
 }
 
 /**
- * Caps how many codes one phone number can request (Step 13).
+ * Caps how many requests one identifier can make (Step 13; reused by Steps 34b and 34c).
  *
  * A counter in Redis, not `@nestjs/throttler`: the throttler's default store is
  * per-process memory, so two API instances would each allow the full allowance and
@@ -51,6 +51,11 @@ export class OtpRateLimitUnavailableError extends Error {
  * Read the ordering note in `AuthService.register`: this is called *after* the
  * cheap existence check, so probing an already-registered number cannot burn a
  * real user's allowance.
+ *
+ * Step 34b started counting password sign-in attempts here rather than in a limiter of its own,
+ * and Step 34c widened the subject from "a number" to "the identifier the sign-in was submitted
+ * with". One account's guesses are one attack whether the guesser is spending codes or
+ * passwords, and two counters could disagree about how many tries the account gets.
  */
 @Injectable()
 export class OtpRateLimiterService {
@@ -62,22 +67,25 @@ export class OtpRateLimiterService {
   ) {}
 
   /**
-   * Counts one request against the number's allowance, throwing when the
+   * Counts one request against the subject's allowance, throwing when the
    * allowance is already gone.
+   *
+   * The subject is the identifier the request was about: a phone number for the OTP endpoints,
+   * and the number *or* the verified address a password sign-in was submitted with (Step 34c).
+   * It is a plain string because the counter only ever hashes it into the key, while the
+   * *masked* form is a second parameter - which mask is honest is a fact about the identifier,
+   * and only the caller knows whether it is holding a number or an address.
    *
    * The blocked request still increments the counter (that is inherent to
    * `INCR`), but it does not extend the window: `EXPIRE ... NX` only sets the
    * TTL when the key is new, so a caller who keeps hammering cannot hold a
    * legitimate user's window open forever.
    */
-  async consume(phoneNumber: string): Promise<void> {
+  async consume(subject: string, masked = maskPhoneNumber(subject)): Promise<void> {
     const requestsPerWindow = this.config.getOrThrow<number>('otp.requestsPerWindow');
     const windowSeconds = this.config.getOrThrow<number>('otp.requestWindowMinutes') * 60;
 
-    const key = this.keyFor(phoneNumber);
-    // The only form of the number allowed in a log line. Computed once, so no
-    // path in this method can accidentally print the raw value.
-    const masked = maskPhoneNumber(phoneNumber);
+    const key = this.keyFor(subject);
 
     const results = await this.run(masked, () => {
       // One round trip: `INCR` and the TTL in a single transaction, so the window
@@ -112,15 +120,15 @@ export class OtpRateLimiterService {
   }
 
   /**
-   * The counter key: `otp:requests:<sha256(phoneNumber)>`.
+   * The counter key: `otp:requests:<sha256(subject)>`.
    *
-   * Hashed rather than the number itself, so a `KEYS otp:requests:*` on a shared
-   * Redis instance does not print a list of customers' phone numbers. Nothing ever
-   * needs to read the key back into a number - the log line below masks it - so
-   * the hash costs nothing.
+   * Hashed rather than the identifier itself, so a `KEYS otp:requests:*` on a shared
+   * Redis instance does not print a list of customers' phone numbers (or, since Step 34c,
+   * of their addresses). Nothing ever needs to read the key back into an identifier - the log
+   * lines take the masked form - so the hash costs nothing.
    */
-  private keyFor(phoneNumber: string): string {
-    const digest = createHash('sha256').update(phoneNumber).digest('hex');
+  private keyFor(subject: string): string {
+    const digest = createHash('sha256').update(subject).digest('hex');
 
     return `otp:requests:${digest}`;
   }
@@ -130,15 +138,15 @@ export class OtpRateLimiterService {
    *
    * Logged here rather than by the caller: the wait for an operator is the Redis
    * error itself, while the caller only needs to know the limit could not be
-   * evaluated. `maskedPhoneNumber` is passed in rather than the raw value so this
-   * line cannot be the one that logs a customer's number.
+   * evaluated. `maskedSubject` is passed in rather than the raw value so this
+   * line cannot be the one that logs a customer's number or address.
    */
-  private async run<T>(maskedPhoneNumber: string, operation: () => Promise<T>): Promise<T> {
+  private async run<T>(maskedSubject: string, operation: () => Promise<T>): Promise<T> {
     try {
       return await operation();
     } catch (cause) {
       this.logger.error(
-        `OTP rate limit could not be evaluated for ${maskedPhoneNumber} - refusing to send`,
+        `OTP rate limit could not be evaluated for ${maskedSubject} - refusing to send`,
         cause instanceof Error ? cause.stack : String(cause),
       );
       throw new OtpRateLimitUnavailableError({ cause });

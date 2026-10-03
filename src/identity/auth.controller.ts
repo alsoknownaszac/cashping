@@ -516,9 +516,11 @@ export class AuthController {
     description: [
       'The password sign-in, the counterpart to `POST /auth/login` (which uses a texted code). A correct password answers the same token pair and profile the code sign-in answers.',
       '',
-      'A wrong password is a 401 whose message is *identical* to the one for a number with no account: the two are not distinguishable from outside, so this endpoint is not an oracle that tells an attacker which numbers are registered.',
+      'Identify the account with either identifier it has: `phoneNumber` in any reasonable format, or `email` - the address `POST /auth/email/verify` proved. Send exactly one of the two; sending both, or neither, is a 400 that names the fields. An address that was attached but never verified is answered exactly as an address nothing holds, because this endpoint is not allowed to become a way of finding out which addresses are registered.',
       '',
-      'Sign-in attempts are counted against the same per-number allowance as OTP sends, so a password guess is priced exactly like a code guess; over the allowance is a 429.',
+      'A wrong password is a 401 whose message is *identical* to the one for an identifier with no account, no password set, or an unverified address: none of them are distinguishable from outside, so this endpoint is not an oracle that tells an attacker which numbers and addresses are registered.',
+      '',
+      'Sign-in attempts are counted against the same per-identifier allowance as OTP sends, so a password guess is priced exactly like a code guess; over the allowance is a 429.',
     ].join('\n'),
   })
   @ApiOkResponse({
@@ -526,16 +528,21 @@ export class AuthController {
     description: 'The password was accepted and a session started.',
   })
   @ApiErrorResponses([
-    { status: 400, description: 'The body is missing `phoneNumber` or `password`.' },
+    {
+      status: 400,
+      description:
+        'The body is missing `password`, or sends both `phoneNumber` and `email`, or neither, or the identifier is not usable.',
+    },
     {
       status: 401,
       description:
-        'The number and password did not match, or the number has no account or no password set. One message for all of them.',
+        'The identifier and password did not match, or the identifier has no account, no password set, or an address that was never verified. One message for all of them.',
     },
     { status: 403, description: 'The account is suspended.' },
     {
       status: 429,
-      description: 'Too many sign-in attempts for this number. The message says how long to wait.',
+      description:
+        'Too many sign-in attempts for this account. The message says how long to wait.',
     },
     {
       status: 503,

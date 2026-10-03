@@ -1,4 +1,4 @@
-import { randomInt } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { type INestApplication } from '@nestjs/common';
 import { Test, type TestingModule } from '@nestjs/testing';
 import request from 'supertest';
@@ -7,6 +7,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppModule } from './../src/app.module.js';
 import { GLOBAL_PREFIX } from './../src/common/http/prefix.js';
 import { createValidationPipe } from './../src/common/pipes/validation.pipe.js';
+import {
+  EMAIL_SENDER,
+  type EmailMessage,
+  type EmailSendResult,
+  type EmailSender,
+} from './../src/notifications/email/email-sender.js';
 import {
   SMS_SENDER,
   type SmsMessage,
@@ -20,7 +26,8 @@ import {
 } from './../src/wallet/provisioning/account-provisioning.service.js';
 
 /**
- * Step 34b, over real HTTP: the password as a second way *in*.
+ * Step 34b, over real HTTP: the password as a second way *in* - and, since Step 34c, a *verified
+ * email address* as a second identifier for it.
  *
  * The claims this file makes are the ones the checklist names:
  *
@@ -32,15 +39,25 @@ import {
  * 3. **The reset request answers identically for a known and an unknown number.** Both 202, same
  *    body - proven by calling it for both and comparing, and by checking that the SMS only
  *    actually goes to the registered one.
+ * 4. **A verified address signs in, an unproved one does not, and its allowance is its own.** The
+ *    address is attached and confirmed over the two Step 34c endpoints, then used as the identifier;
+ *    an address that was attached and never confirmed answers the same 401 as one nothing holds;
+ *    and a body carrying both identifiers (or neither) is refused before anything is looked up.
+ *    The attempt counter is per identifier, so the address's window can be spent while the number's
+ *    still lets a code sign-in through.
  *
  * Local-only, and it needs the compose stack (`docker compose up -d postgres redis`) plus a
- * `.env`, because it boots the real `AppModule`. Two providers are replaced, exactly as in
- * `pin.e2e-spec.ts`: the SMS sender, so codes are read from the captured message, and wallet
- * provisioning, so a verify reaches no KMS and no Horizon. Run it with `npm run test:e2e`.
+ * `.env`, because it boots the real `AppModule`. Three providers are replaced, exactly as in
+ * `email.e2e-spec.ts`: the SMS sender, so codes are read from the captured message; wallet
+ * provisioning, so a verify reaches no KMS and no Horizon; and the email sender, which is the only
+ * way a Step 34c verification code is readable without a mailbox. Run it with `npm run test:e2e`.
  */
 
 const REGISTER_PATH = `/${GLOBAL_PREFIX}/auth/register`;
 const OTP_VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/otp/verify`;
+const EMAIL_PATH = `/${GLOBAL_PREFIX}/auth/email`;
+const EMAIL_VERIFY_PATH = `/${GLOBAL_PREFIX}/auth/email/verify`;
+const LOGIN_OTP_PATH = `/${GLOBAL_PREFIX}/auth/login/otp`;
 const LOGIN_PASSWORD_PATH = `/${GLOBAL_PREFIX}/auth/login/password`;
 const PASSWORD_CHANGE_PATH = `/${GLOBAL_PREFIX}/auth/password/change`;
 const PASSWORD_RESET_PATH = `/${GLOBAL_PREFIX}/auth/password/reset`;
@@ -48,9 +65,15 @@ const PASSWORD_RESET_CONFIRM_PATH = `/${GLOBAL_PREFIX}/auth/password/reset/confi
 
 /** The PIN registration insists on (Step 34a); the password tests never use it. */
 const PIN = '1234';
+/**
+ * The OTP policy `configuration()` supplies, mirrored here rather than hard-coded per assertion:
+ * the password sign-in spends from the same per-identifier allowance as a code request (Step 34c).
+ */
+const OTP_REQUESTS_PER_WINDOW = 3;
 /** A password that satisfies the minimum, and one that does not. */
 const PASSWORD = 'correct horse battery staple';
 const NEW_PASSWORD = 'a completely different password';
+const WRONG_PASSWORD = 'not the password';
 const TOO_SHORT = 'short';
 
 /** Captures what would have been texted, so a code is readable without a phone. */
@@ -84,6 +107,40 @@ class CapturingSmsSender implements SmsSender {
 }
 
 const smsSender = new CapturingSmsSender();
+
+/**
+ * The substituted `EMAIL_SENDER`, which this file needs as of Step 34c: a verified address is now a
+ * sign-in identifier, so a test that signs in with one has to attach and confirm it first, and the
+ * verification code only ever travels through this seam. Same class as `email.e2e-spec.ts`'s, and
+ * for the same reason: the response deliberately does not echo the code.
+ */
+class CapturingEmailSender implements EmailSender {
+  readonly sent: EmailMessage[] = [];
+
+  async send(message: EmailMessage): Promise<EmailSendResult> {
+    this.sent.push({ ...message });
+
+    return { providerMessageId: `test-email-${this.sent.length}` };
+  }
+
+  /** The code in the newest message addressed to one address. */
+  latestCodeFor(address: string): string {
+    const messages = this.sent.filter((message) => message.to === address);
+    const message = messages[messages.length - 1];
+
+    if (message === undefined) {
+      throw new Error(`no email was captured for ${address}`);
+    }
+
+    const matches = message.body.match(/\d{6}/g) ?? [];
+
+    expect(matches).toHaveLength(1);
+
+    return matches[0] as string;
+  }
+}
+
+const emailSender = new CapturingEmailSender();
 
 /** `AccountProvisioningService`, replaced: no KMS, no Horizon, no Testnet account. */
 class RecordingProvisioning {
@@ -142,6 +199,8 @@ describe('Password sign-in, change and reset (e2e)', () => {
     })
       .overrideProvider(SMS_SENDER)
       .useValue(smsSender)
+      .overrideProvider(EMAIL_SENDER)
+      .useValue(emailSender)
       .overrideProvider(AccountProvisioningService)
       .useValue(provisioning)
       .compile();
@@ -195,6 +254,34 @@ describe('Password sign-in, change and reset (e2e)', () => {
   /** The bearer header the password-change route needs. */
   function as(account: Account): { authorization: string } {
     return { authorization: `Bearer ${account.accessToken}` };
+  }
+
+  /**
+   * Attaches an address to an account and proves it, the way Step 34c's two endpoints do it.
+   *
+   * Returns the address as the *row* holds it - lower-cased - because that is the spelling a
+   * sign-in is looked up by, and the raw spelling is not what any test should assert against.
+   */
+  async function attachVerifiedEmail(account: Account): Promise<string> {
+    const submitted = `signin-${randomUUID()}@example.com`;
+
+    const attached = await request(app.getHttpServer())
+      .post(EMAIL_PATH)
+      .set(as(account))
+      .send({ email: submitted })
+      .expect(200);
+
+    // The address is stored normalized, and the response says so: `POST /auth/email` is the write
+    // that defines the value every later lookup uses.
+    expect(attached.body.email).toBe(submitted);
+
+    await request(app.getHttpServer())
+      .post(EMAIL_VERIFY_PATH)
+      .set(as(account))
+      .send({ code: emailSender.latestCodeFor(submitted) })
+      .expect(200);
+
+    return submitted;
   }
 
   /** The password column, read straight out of the row the API wrote. */
@@ -365,6 +452,144 @@ describe('Password sign-in, change and reset (e2e)', () => {
       // `denied` for the refusal is Step 34a's outcome doing the job it was added for, and it is
       // what keeps `auth.login` meaning "a *code* sign-in succeeded".
       expect(rows.map((row) => row.outcome)).toEqual(['denied', 'ok']);
+    });
+
+    it('signs in with a verified address, and answers the session the number would', async () => {
+      const account = await registerAndVerify();
+
+      await request(app.getHttpServer())
+        .post(PASSWORD_CHANGE_PATH)
+        .set(as(account))
+        .send({ password: PASSWORD })
+        .expect(200);
+
+      const address = await attachVerifiedEmail(account);
+
+      const signedIn = await request(app.getHttpServer())
+        .post(LOGIN_PASSWORD_PATH)
+        // Submitted in another spelling on purpose: the address is normalized before it is looked
+        // up, exactly as the number is, so `SIGNIN-...@EXAMPLE.COM` finds the row the write stored.
+        .send({ email: address.toUpperCase(), password: PASSWORD })
+        .expect(200);
+
+      expect(signedIn.body.userId).toBe(account.userId);
+      // The account's own number. An address is a second way to present the credential, not a
+      // second identity, so the session is the same one the number would have produced.
+      expect(signedIn.body.phoneNumber).toBe(account.phoneNumber);
+      expect(signedIn.body.accessToken as string).toMatch(/^ey/);
+
+      // And the address itself is nowhere in the clear, in anything this run wrote about the
+      // account - audit rows included.
+      const rows = await prisma.auditLog.findMany({ where: { userId: account.userId } });
+
+      expect(JSON.stringify(rows)).not.toContain(address);
+    });
+
+    it('refuses an address that was attached but never proved, exactly as an address nothing holds', async () => {
+      const account = await registerAndVerify();
+
+      await request(app.getHttpServer())
+        .post(PASSWORD_CHANGE_PATH)
+        .set(as(account))
+        .send({ password: PASSWORD })
+        .expect(200);
+
+      const address = `unproved-${randomUUID()}@example.com`;
+
+      // Attached, and nothing else: the row holds the address from this moment, and
+      // `email_verified_at` stays null because no code has come back from that mailbox.
+      await request(app.getHttpServer())
+        .post(EMAIL_PATH)
+        .set(as(account))
+        .send({ email: address })
+        .expect(200);
+
+      const attached = await prisma.user.findUniqueOrThrow({
+        where: { id: account.userId },
+        select: { email: true, emailVerifiedAt: true },
+      });
+
+      expect(attached.email).toBe(address);
+      expect(attached.emailVerifiedAt).toBeNull();
+
+      const unproved = await request(app.getHttpServer())
+        .post(LOGIN_PASSWORD_PATH)
+        .send({ email: address, password: PASSWORD })
+        .expect(401);
+
+      // An address nothing registered: the same route, the same shape, and it must answer the same.
+      const unknown = await request(app.getHttpServer())
+        .post(LOGIN_PASSWORD_PATH)
+        .send({ email: `nobody-${randomUUID()}@example.com`, password: PASSWORD })
+        .expect(401);
+
+      // The right password was sent for the unproved one and it still refuses, which is the claim:
+      // an address that was never confirmed is not a credential, whatever else about it is right.
+      expect(unproved.body.message).toBe(unknown.body.message);
+      expect(String(unproved.body.message)).toMatch(/do not match/i);
+    });
+
+    it('refuses a body with both identifiers and a body with neither, naming what to send', async () => {
+      const account = await registerAndVerify();
+      const address = await attachVerifiedEmail(account);
+
+      const both = await request(app.getHttpServer())
+        .post(LOGIN_PASSWORD_PATH)
+        .send({ phoneNumber: account.phoneNumber, email: address, password: PASSWORD })
+        .expect(400);
+
+      // The ambiguity is about the *request* rather than about an account, so it is answered openly
+      // - and before anything is counted, which is why neither 400 below can spend an allowance.
+      expect(String(both.body.message)).toMatch(/not both/i);
+
+      const neither = await request(app.getHttpServer())
+        .post(LOGIN_PASSWORD_PATH)
+        .send({ password: PASSWORD })
+        .expect(400);
+
+      expect(String(neither.body.message)).toMatch(/phone number or the email address/i);
+    });
+
+    it('counts guesses on the address against the address, and the number keeps its own allowance', async () => {
+      const account = await registerAndVerify();
+
+      await request(app.getHttpServer())
+        .post(PASSWORD_CHANGE_PATH)
+        .set(as(account))
+        .send({ password: PASSWORD })
+        .expect(200);
+
+      const address = await attachVerifiedEmail(account);
+
+      // The same allowance a code request gets: the first `OTP_REQUESTS_PER_WINDOW` guesses are
+      // simply wrong, and the next one is refused for the rest of the window.
+      for (let attempt = 0; attempt < OTP_REQUESTS_PER_WINDOW; attempt += 1) {
+        await request(app.getHttpServer())
+          .post(LOGIN_PASSWORD_PATH)
+          .send({ email: address, password: WRONG_PASSWORD })
+          .expect(401);
+      }
+
+      const throttled = await request(app.getHttpServer())
+        .post(LOGIN_PASSWORD_PATH)
+        .send({ email: address, password: WRONG_PASSWORD })
+        .expect(429);
+
+      expect(String(throttled.body.message)).toMatch(/too many sign-in attempts/i);
+
+      // The number has a counter of its own - `register` spent one of its three, so this is the
+      // second - and the address's spent window does not touch it. Shown rather than asserted: a
+      // counter shared between the two identifiers would answer 429 here.
+      await request(app.getHttpServer())
+        .post(LOGIN_OTP_PATH)
+        .send({ phoneNumber: account.phoneNumber })
+        .expect(200);
+
+      // And the number still signs in with the password, on the account the address could not reach.
+      await request(app.getHttpServer())
+        .post(LOGIN_PASSWORD_PATH)
+        .send({ phoneNumber: account.phoneNumber, password: PASSWORD })
+        .expect(200);
     });
   });
 
