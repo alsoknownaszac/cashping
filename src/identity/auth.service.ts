@@ -266,15 +266,17 @@ export class AuthService {
 
     /**
      * The PIN is hashed *here*, before any write and outside the transaction (there is none
-     * yet), and it cannot be a source of failures: its shape was settled by `RegisterDto`
-     * (four digits, or a 400 before this method was reached), and scrypt does not care which
-     * four digits they are. It is computed before the request is counted because it is not a
-     * request the number's allowance should pay for - it touches no network and no row.
+     * yet), and it cannot be a source of failures: when one was supplied its shape was settled
+     * by `RegisterDto` (four digits, or a 400 before this method was reached), and scrypt does
+     * not care which four digits they are. It is computed before the request is counted because
+     * it is not a request the number's allowance should pay for - it touches no network and no row.
      *
      * The hash goes into `claimAccount` rather than being written afterwards, so the account
-     * never exists without the credential its first payment will require.
+     * never exists without the credential its first payment will require - *unless the client
+     * deferred it* (Step 34d): then there is nothing to hash, the account is created with a null
+     * PIN, and `POST /auth/pin/change` installs one later through its own `set` path.
      */
-    const transactionPinHash = await hashSecret(dto.pin);
+    const transactionPinHash = dto.pin === undefined ? undefined : await hashSecret(dto.pin);
 
     // Counted before the user row is created, so a blocked request leaves nothing
     // behind: an over-limit caller gets no row, no code and no SMS.
@@ -300,22 +302,27 @@ export class AuthService {
     });
 
     /**
-     * Step 34a: `auth.pin.set`, written beside the handle entry and for the same reason -
-     * the fact is already true by this line, because the hash was written with the row
-     * above. `metadata.source` carries the same split the handle entry records, so "a PIN
-     * was chosen at registration" and "a PIN was chosen on a resend" are distinguishable in
-     * the trail without a second literal.
+     * Step 34a: `auth.pin.set`, written beside the handle entry - but only when a PIN was
+     * actually supplied at this step (the PIN is optional here). `metadata.source` carries the
+     * same split the handle entry records, so "a PIN was chosen at registration" and "a PIN was
+     * chosen on a resend" are distinguishable in the trail without a second literal.
+     *
+     * A deferred PIN is deliberately not logged here: no PIN was set, and an entry claiming one
+     * was would be a lie in the trail. The `set` entry for a PIN installed later comes from
+     * `PinService.change`, where that write really happens.
      *
      * What is deliberately absent: the PIN, and its hash. A row that recorded either would
      * make the audit table a place secrets live, which is the one thing `AuditService`
      * forbids in as many words.
      */
-    await this.audit.log({
-      action: 'auth.pin.set',
-      userId: user.id,
-      outcome: 'ok',
-      metadata: { source: existing === null ? 'registration' : 'resend' },
-    });
+    if (transactionPinHash !== undefined) {
+      await this.audit.log({
+        action: 'auth.pin.set',
+        userId: user.id,
+        outcome: 'ok',
+        metadata: { source: existing === null ? 'registration' : 'resend' },
+      });
+    }
 
     const { code, expiresAt } = await this.otp.issue(user.id);
     await this.sendOtp(phoneNumber, code);
@@ -353,13 +360,18 @@ export class AuthService {
     phoneNumber: string,
     handle: string | undefined,
     existing: RegisteredUser | null,
-    transactionPinHash: string,
+    transactionPinHash: string | undefined,
   ): Promise<RegisteredUser> {
     /**
-     * The PIN travels with the row on both paths (Step 34a), which is why it is one object
-     * rather than four fields spelled out twice: "an account exists" and "it holds the PIN
-     * it was registered with" are one fact, and a create path that wrote only one of them
-     * would produce an account whose first payment fails for a reason the user cannot see.
+     * The PIN travels with the row when one was supplied (Step 34a), which is why it is one object
+     * rather than four fields spelled out twice: "an account exists" and "it holds the PIN it was
+     * registered with" are one fact, and a create path that wrote only one of them would produce
+     * an account whose first payment fails for a reason the user cannot see.
+     *
+     * The PIN is optional at registration, so an account registered without one writes none of
+     * these columns: the empty object spreads to nothing, the create path leaves the new row's
+     * PIN columns at their defaults (null), and the resend path leaves a PIN the row already
+     * holds untouched.
      *
      * `attempts` and `lockedUntil` are written explicitly rather than left to the column
      * defaults, because this is a *new* credential: a hash written over a row that somehow
@@ -367,12 +379,15 @@ export class AuthService {
      * freshly created row and wrong for a reused one, and one statement that is right on
      * both paths is worth more than two that differ.
      */
-    const pin = {
-      transactionPinHash,
-      transactionPinSetAt: new Date(),
-      transactionPinAttempts: 0,
-      transactionPinLockedUntil: null,
-    };
+    const pin =
+      transactionPinHash === undefined
+        ? {}
+        : {
+            transactionPinHash,
+            transactionPinSetAt: new Date(),
+            transactionPinAttempts: 0,
+            transactionPinLockedUntil: null,
+          };
 
     try {
       if (existing === null) {
@@ -389,16 +404,17 @@ export class AuthService {
       }
 
       /**
-       * The pending row is reused (the resend path), and the PIN is written with it. That is
-       * safe for exactly the reason reusing the row is safe at all: the account is still
-       * unproven, and the code about to be sent is the proof that this is the same person -
-       * so replacing a PIN here is the same act as registering one, and it gives a
-       * half-finished signup nothing that a fresh one would not have.
+       * The pending row is reused (the resend path), and a PIN resubmitted with it is written
+       * again. That is safe for exactly the reason reusing the row is safe at all: the account is
+       * still unproven, and the code about to be sent is the proof that this is the same person -
+       * so replacing a PIN here is the same act as registering one, and it gives a half-finished
+       * signup nothing that a fresh one would not have. A resend that submits no PIN (Step 34d)
+       * leaves whatever the row already holds in place.
        *
        * A handle that was not resubmitted, or resubmitted unchanged, is left alone:
        * `handle: undefined` means "column not provided" to Prisma. The previous early return
-       * for that case is gone because the PIN now has to be written on every path, and a
-       * second, PIN-less return is precisely the state this step exists to prevent.
+       * for that case is gone because a resubmitted PIN still has to be written here, and a
+       * second branch that skipped the row would be one more path to keep in step.
        */
       return await this.prisma.user.update({
         where: { id: existing.id },

@@ -900,6 +900,37 @@ describe('Registration, verification and sessions (e2e)', () => {
     expect(JSON.stringify(session)).not.toContain('wallet');
   });
 
+  it('registers, verifies and provisions without collecting a PIN (Step 34d)', async () => {
+    const { local, e164 } = freshNumber();
+    const before = provisioning.provisioned.length;
+
+    // No `pin` in the body: the account is created without one, and everything else about the
+    // flow is unchanged - that is the claim this test exists to make.
+    await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
+
+    const pending = await prisma.user.findUnique({ where: { phoneNumber: e164 } });
+
+    expect(pending?.status).toBe(UserStatus.PENDING_VERIFICATION);
+    expect(pending?.transactionPinHash).toBeNull();
+
+    const code = latestCodeFor(e164);
+
+    const response = await request(app.getHttpServer())
+      .post(VERIFY_PATH)
+      .send({ phoneNumber: local, code })
+      .expect(200);
+
+    expect(response.body).toMatchObject({ phoneNumber: e164, status: UserStatus.ACTIVE });
+
+    const active = await prisma.user.findUnique({ where: { phoneNumber: e164 } });
+
+    expect(active?.status).toBe(UserStatus.ACTIVE);
+    // Still no PIN, and it stopped nothing: the account activated and asked for a wallet just
+    // like one registered with a PIN, because nothing in this flow reads the PIN.
+    expect(active?.transactionPinHash).toBeNull();
+    expect(provisioning.provisioned.slice(before)).toEqual([active?.id as string]);
+  });
+
   it('adds a second session when a code is used to sign in, without touching the first', async () => {
     const { local, e164 } = freshNumber();
 

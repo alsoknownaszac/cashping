@@ -80,7 +80,7 @@ export class AuthController {
       '',
       'The number is accepted in any reasonable format - `024 123 4567`, `+233241234567`, `+2330241234567`, `00233241234567` - and stored as E.164.',
       '',
-      '`pin` is required, and it is the account\'s transaction PIN: exactly four numeric digits, stored hashed, never returned by any endpoint. Every payment is refused until it is proved again at `POST /auth/pin/verify`, so it is collected here rather than behind a screen the user can skip. A PIN that is not four numeric digits is a 400, and no account is created.',
+      '`pin` is optional, and when supplied it is the account\'s transaction PIN: exactly four numeric digits, stored hashed, never returned by any endpoint. Every payment is refused until it is proved again at `POST /auth/pin/verify`, so it can be collected here, at the moment the account is created. It can equally be deferred to `POST /auth/pin/change`, which installs one on a PIN-less account with no `currentPin`; an account created without a PIN is otherwise complete and activates on verification as usual. A `pin` that is *sent* but is not four numeric digits is a 400, and no account is created.',
       '',
       'The response never contains the code: the SMS is its only route to the user. Calling this again for an unverified number is the resend path and invalidates the previous code.',
     ].join('\n'),
@@ -93,7 +93,7 @@ export class AuthController {
     {
       status: 400,
       description:
-        'The body is missing `phoneNumber` or `pin`, the number is not a valid phone number, or the PIN is not exactly four numeric digits.',
+        'The body is missing `phoneNumber`, the number is not a valid phone number, or a supplied `pin` is not exactly four numeric digits.',
     },
     {
       status: 403,

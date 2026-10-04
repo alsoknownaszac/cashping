@@ -82,11 +82,11 @@ describe('RegisterDto', () => {
     });
   }
 
-  it('requires a PIN at all, which is the point of collecting it here', async () => {
-    const messages = await messagesFor(RegisterDto, { phoneNumber: PHONE }, 'pin');
-
-    // Both decorators fire on an absent value: it is not a string, and it does not match.
-    expect(messages.length).toBeGreaterThan(0);
+  it('accepts a body with no PIN at all, which is the deferred path (Step 34d)', async () => {
+    // `@IsOptional()` is what makes this pass: an account can be registered without a PIN and
+    // have one installed later at `POST /auth/pin/change`. The malformed-PIN cases above still
+    // fire, because a value that *is* sent is still checked.
+    await expect(messagesFor(RegisterDto, { phoneNumber: PHONE }, 'pin')).resolves.toEqual([]);
   });
 });
 

@@ -270,20 +270,65 @@ describe('Transaction PIN and step-up (e2e)', () => {
   }
 
   describe('registration', () => {
-    it('refuses a registration with no PIN, and creates nothing', async () => {
+    it('registers without a PIN, then installs one through the set branch', async () => {
       const local = freshLocalNumber();
       const e164 = toE164(local);
 
-      const response = await request(app.getHttpServer())
-        .post(REGISTER_PATH)
-        .send({ phoneNumber: local })
-        .expect(400);
+      registered.push(e164);
 
-      expect(String(response.body.message)).toMatch(/pin/i);
+      // No `pin` in the body (Step 34d): the account is created without one rather than refused.
+      // Before this step the same call answered 400.
+      await request(app.getHttpServer()).post(REGISTER_PATH).send({ phoneNumber: local }).expect(201);
 
-      // The number is deliberately *not* recorded for cleanup: nothing was created, and the
-      // `afterAll` count is a claim about every number this run really registered.
-      expect(await prisma.user.findUnique({ where: { phoneNumber: e164 } })).toBeNull();
+      const message = smsSender.latestFor(e164);
+
+      if (message === undefined) {
+        throw new Error(`no verification code was texted to ${e164}`);
+      }
+
+      const verified = await request(app.getHttpServer())
+        .post(OTP_VERIFY_PATH)
+        .send({ phoneNumber: local, code: codeFrom(message.body) })
+        .expect(200);
+
+      const account: Account = {
+        userId: verified.body.userId as string,
+        accessToken: verified.body.accessToken as string,
+        phoneNumber: e164,
+      };
+
+      // It activates like any other account, and its PIN columns are empty - the state Step
+      // 34d's SSO accounts start in, reached here through the front door.
+      const created = await pinRow(account.userId);
+
+      expect(created.transactionPinHash).toBeNull();
+      expect(created.transactionPinSetAt).toBeNull();
+      expect(created.transactionPinAttempts).toBe(0);
+
+      // Registration wrote no `auth.pin.set`, because no PIN was set - a phantom entry here
+      // would be worse than none.
+      expect((await auditRows(account.userId)).map((row) => row.action)).not.toContain(
+        'auth.pin.set',
+      );
+
+      // The set branch installs one: `{ pin }` with no `currentPin` on an account that has none.
+      // This is the endpoint a deferred account uses, and it appends its own `set`.
+      await request(app.getHttpServer())
+        .post(PIN_CHANGE_PATH)
+        .set(as(account))
+        .send({ pin: '4321' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post(PIN_VERIFY_PATH)
+        .set(as(account))
+        .send({ pin: '4321' })
+        .expect(200);
+
+      const set = (await auditRows(account.userId)).filter((row) => row.action === 'auth.pin.set');
+
+      expect(set).toHaveLength(1);
+      expect(set[0]?.metadata).toMatchObject({ source: 'set' });
     });
 
     it('refuses a PIN that is not exactly four digits, at the door', async () => {

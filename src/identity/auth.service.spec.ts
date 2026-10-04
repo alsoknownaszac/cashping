@@ -176,11 +176,13 @@ class FakePrisma {
       return user;
     },
     /**
-     * The resend path, which Step 34a made unconditional: the PIN is written with the row
-     * every time, so the update happens even when the handle is not resubmitted.
+     * The resend path. A PIN submitted with the resend is written again (Step 34a), so the
+     * update happens even when the handle is not resubmitted; a registration that omits the
+     * PIN too (Step 34d) still issues the update, with nothing to change.
      *
      * `undefined` means "column not provided" here exactly as it does in Prisma, which is what
-     * the service relies on when it sends a handle that was not resubmitted.
+     * the service relies on when it sends a handle that was not resubmitted - and what leaves an
+     * existing PIN in place when the resend does not carry one.
      */
     update: async (args: {
       where: { id: string };
@@ -738,8 +740,8 @@ describe('AuthService.register', () => {
     // And a resend that submits nothing: the row's own handle is what the entry carries.
     await auth.register({ pin: PIN, phoneNumber: number });
     // The updates are Prisma's own, so the spec asserts what the entry says rather than what the
-    // fake's map holds. Two of them now (Step 34a): the handle change, and the third registration -
-    // which submits no handle at all - because the PIN is written with the row on every path.
+    // fake's map holds. Two of them (Step 34a): the handle change, and the third registration -
+    // which submits no handle at all but does resubmit the PIN, so the row is written again.
     expect(prisma.calls.filter((call) => call === 'update')).toHaveLength(2);
 
     expect(audit.entries).toEqual([
@@ -1455,6 +1457,31 @@ describe('AuthService.register and the transaction PIN (Step 34a)', () => {
     expect(prisma.users.size).toBe(1);
     expect(prisma.calls).toContain('update');
     expect(prisma.users.get(E164_NUMBER)?.transactionPinHash).not.toBeNull();
+  });
+
+  it('creates a PIN-less account when none is submitted, and logs no set', async () => {
+    const { auth, prisma, audit } = createHarness();
+
+    await auth.register({ phoneNumber: LOCAL_NUMBER });
+
+    // The state Step 34d's SSO account starts in, reached through the front door: a complete
+    // account with no second credential yet. The handle entry is still written - the account *was*
+    // created - but `auth.pin.set` is not, because no PIN was set. An entry claiming one was would
+    // be a lie in the trail; the real one comes from `PinService.change`, where the write happens.
+    expect(prisma.users.get(E164_NUMBER)?.transactionPinHash).toBeNull();
+    expect(audit.entries.map((entry) => entry.action)).toEqual(['user.handle.set']);
+  });
+
+  it('leaves a PIN already on the row alone when a resend omits it', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, { transactionPinHash: 'scrypt$seeded' });
+
+    await auth.register({ phoneNumber: LOCAL_NUMBER });
+
+    // A resend that carries no PIN writes no PIN columns (Step 34d), so it neither wipes nor
+    // invents one: the columns the row already had are the columns it keeps.
+    expect(prisma.users.size).toBe(1);
+    expect(prisma.users.get(E164_NUMBER)?.transactionPinHash).toBe('scrypt$seeded');
   });
 });
 
