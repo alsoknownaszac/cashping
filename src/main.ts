@@ -6,6 +6,7 @@ import { AppModule } from './app.module.js';
 import { describeError, markBootStage, reportFatal } from './common/boot/boot-log.js';
 import { configureCors } from './common/http/cors.js';
 import { GLOBAL_PREFIX } from './common/http/prefix.js';
+import { configureSecurityHeaders } from './common/http/security-headers.js';
 import { createValidationPipe } from './common/pipes/validation.pipe.js';
 import { SWAGGER_PATH, setupSwagger } from './common/http/swagger.js';
 import configuration, { type AppConfig } from './config/configuration.js';
@@ -201,13 +202,19 @@ async function bootstrap(): Promise<void> {
   // forgetting a decorator, and so the failure shape is one shape.
   app.useGlobalPipes(createValidationPipe());
 
+  // Step 34 (Section 5 "API hardening"): a baseline of security headers on every
+  // response - nosniff, frame-deny, no-referrer, HSTS - and the removal of Express's
+  // `X-Powered-By`. Registered before CORS so it covers every route, including the
+  // ones CORS is not about (curl, healthchecks, server-to-server).
+  configureSecurityHeaders(app);
+
   // Frontend hand-off: let the dev servers call the API from a browser (explicit
   // origin list, never a wildcard - see `configureCors`) and serve the interactive
   // docs unless they have been switched off. Both read the same validated config
   // as everything else.
   configureCors(app, config.cors.allowedOrigins);
   const docsMounted = setupSwagger(app, config.swagger.enabled);
-  markBootStage('HTTP layer configured (global prefix, pipes, CORS, Swagger)');
+  markBootStage('HTTP layer configured (global prefix, pipes, security headers, CORS, Swagger)');
 
   await verifyDependencies(app, config);
   markBootStage('dependencies verified (Postgres, Redis)');
