@@ -302,17 +302,23 @@ the policy is:
 }
 ```
 
-Three things worth knowing about it:
+Four things worth knowing about it:
 
-- **`kms:DescribeKey` is not part of Step 18's original design, and leaving it out breaks a
-  production boot.** Step 18 (`docs/build-sequence.md:164`) describes the two cryptographic
-  actions - a per-account data key, wrapped by the master key - and those are the first two rows
-  above, exactly. The boot probe was added later, and it is what turns "the key is in another
-  region", "the key was deleted" and "the key is disabled" from a per-account failure at the first
-  registration into one startup line. `DescribeKey` is the only call that can tell those apart from
-  an unreachable KMS - and in production a key reference that *cannot* work refuses to start
-  (`reportUnusableKey`), so a policy that is correct about the two cryptographic actions and missing
-  this one produces a service that will not boot.
+- **`kms:DescribeKey` is not part of Step 18's original design, and leaving it out removes the boot
+  probe without removing the need for it.** Step 18 (`docs/build-sequence.md:164`) describes the two
+  cryptographic actions - a per-account data key, wrapped by the master key - and those are the first
+  two rows above, exactly. The probe came later, and it is what turns "the key is in another region",
+  "the key was deleted" and "the key is disabled" from a per-account failure at the first registration
+  into one startup line - the three cases that do refuse to start a *production* deployment
+  (`reportUnusableKey`; pinned by the boot-probe cases in `kms-key-wrapper.spec.ts`).
+- **A denied `DescribeKey` does not stop the boot, and that is the trap.** An IAM denial arrives as
+  `AccessDeniedException`, and this code classifies it as *unavailable* rather than as a broken key
+  reference - deliberately, because sending somebody to inspect key material during an outage is worse
+  than one extra log line (`kms-key-wrapper.spec.ts` pins `AccessDenied`, `Throttling`,
+  `ExpiredToken` and unrecognised failures to that same bucket). So the deployment starts, custody
+  works, and every boot still prints a line that reads like a dead key — while the three failures the
+  probe exists to catch have quietly gone back to being found one account at a time, later. Granting
+  it costs one action on one ARN and is what makes those three checks reachable at all.
 - **There is no role to assume and no session token to pass.** Both credentials are read with
   `getOrThrow`, and `AWS_SESSION_TOKEN`, a shared-config profile or an instance-metadata provider
   appears nowhere in `src`. The principal therefore has to be one that can hold a long-lived access

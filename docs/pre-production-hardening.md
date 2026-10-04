@@ -109,7 +109,7 @@ the values no file can carry — and they are the only part a person supplies:
 | `AFRICASTALKING_USERNAME` | Their username — `sandbox` for the sandbox host, anything else for the live host. These two have to agree: the username picks the host, and a sandbox key is refused by the live host with a 401. |
 | `SENTRY_DSN` | The Sentry DSN. Staging is tagged `SENTRY_ENVIRONMENT=staging`, so its noise is separable on sight. |
 | `AWS_REGION` | The region the KMS key lives in. |
-| `AWS_ACCESS_KEY_ID` | Credentials for the custody principal — exactly the three actions the code calls (`kms:GenerateDataKey`, `kms:Decrypt`, `kms:DescribeKey`), on that one key ARN and nothing broader. `README.md` → *What the KMS credentials are allowed to do* has the policy and says why leaving `DescribeKey` out is a boot failure, not a downgrade. |
+| `AWS_ACCESS_KEY_ID` | Credentials for the custody principal — exactly the three actions the code calls (`kms:GenerateDataKey`, `kms:Decrypt`, `kms:DescribeKey`), on that one key ARN and nothing broader. `README.md` → *What the KMS credentials are allowed to do* has the policy, and says why leaving `DescribeKey` out loses the boot probe rather than narrowing the policy. |
 | `AWS_SECRET_ACCESS_KEY` | The secret half of that pair. |
 | `AWS_KMS_KEY_ID` | The key's ARN, bare id, or `alias/…`. **It has to be a key in `AWS_REGION`**: KMS keys are regional, and a key from another region answers `NotFoundException`, which reads like a deleted key. |
 
