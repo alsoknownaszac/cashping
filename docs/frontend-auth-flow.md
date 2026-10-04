@@ -416,15 +416,15 @@ Things a frontend engineer will otherwise rediscover, each with the honest state
 
 ## 9. Running the proofs
 
-Everything above is asserted by tests that can be run again. Counts carry the step they were
+Everything above is asserted by tests that can be run again. Counts carry the change they were
 measured at.
 
 ```bash
 # The service's own decisions, including the sign-in identifier rule (Steps 34b, 34c).
-npx vitest run src/identity/auth.service.spec.ts      # 61 tests passed as of Step 34c
+npx vitest run src/identity/auth.service.spec.ts      # 63 tests passed as of the PIN-optional change
 
 # The whole unit suite.
-npx vitest run                                        # 59 files, 981 tests passed as of Step 34c
+npx vitest run                                        # 60 files, 987 tests passed as of the PIN-optional change
 
 # The credential flows over HTTP. Needs the compose stack and a .env:
 #   docker compose up -d postgres redis
@@ -432,7 +432,7 @@ npm run test:e2e test/password.e2e-spec.ts            # 13 tests passed as of St
 npm run test:e2e test/auth.e2e-spec.ts                # registration, verification, sign-in, session
 
 # The repository's lint gates (oxlint, money discipline, status discipline).
-npm run lint                                          # 216 files scanned, 0 violations as of Step 34c
+npm run lint                                          # 218 files scanned, 0 violations as of the PIN-optional change
 ```
 
 `test/password.e2e-spec.ts` is the file that covers this document's Flow 3 and Flow 4 end to
