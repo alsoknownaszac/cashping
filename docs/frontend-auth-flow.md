@@ -11,11 +11,12 @@ at Step 34c, and every path the frontend will hit has an e2e test behind it
 `test/audit.e2e-spec.ts`).
 
 **One thing this file deliberately does not describe: registering *with* an email.** There is
-no such endpoint at Step 34c — `POST /v1/auth/register` takes `phoneNumber`, `pin` and an
-optional `handle`, and nothing else. What exists is an email as a *sign-in identifier on an
-account that already signed up with a number*. Section 7 drafts the email-first signup as a
-proposal and says plainly what has to be built before a screen can rely on it; do not code
-against it in the meantime.
+no such endpoint at Step 34c — `POST /v1/auth/register` takes `phoneNumber`, an optional `pin`
+and an optional `handle`, and nothing else. (`pin` was required at Step 34c and is optional
+now; section 1's table and Flow 1 below state the contract as it is today.) What exists is an
+email as a *sign-in identifier on an account that already signed up with a number*. Section 7
+drafts the email-first signup as a proposal and says plainly what has to be built before a
+screen can rely on it; do not code against it in the meantime.
 
 ---
 
@@ -27,7 +28,7 @@ calls are `…/v1/auth/...`. The interactive docs carry the same prefixed paths 
 
 | Method & path | Body | Auth | Answer |
 | --- | --- | --- | --- |
-| `POST /v1/auth/register` | `{ phoneNumber, pin, handle? }` | — | `201` `{ userId, phoneNumber, status: PENDING_VERIFICATION, expiresAt, codeLength, handle }` |
+| `POST /v1/auth/register` | `{ phoneNumber, pin?, handle? }` | — | `201` `{ userId, phoneNumber, status: PENDING_VERIFICATION, expiresAt, codeLength, handle }` |
 | `POST /v1/auth/otp/verify` | `{ phoneNumber, code }` | — | `200` `{ accessToken, accessTokenExpiresAt, refreshToken, refreshExpiresAt, userId, phoneNumber, status: ACTIVE, phoneVerifiedAt }` |
 | `POST /v1/auth/login/otp` | `{ phoneNumber }` | — | `200` `{ phoneNumber, expiresAt, codeLength }` |
 | `POST /v1/auth/login` | `{ phoneNumber, code }` | — | `200` token pair + `{ userId, phoneNumber, status, handle }` |
@@ -107,17 +108,19 @@ Four screens, of which three call the API. This is the only account-creation pat
 today; section 7 is the draft of the other one.
 
 ```
-[Number + PIN]  --register-->  [Code sent]  --otp/verify-->  signed in  -->  [Add email]  -->  [Set a password]
+[Number + PIN?]  --register-->  [Code sent]  --otp/verify-->  signed in  -->  [Add email]  -->  [Set a password]
 ```
 
-**Step 1 — `POST /v1/auth/register` `{ phoneNumber, pin, handle? }`**
+**Step 1 — `POST /v1/auth/register` `{ phoneNumber, pin?, handle? }`**
 
 - `phoneNumber` is the *raw* submission (`024 123 4567`), not E.164: the server normalizes it
   against `PHONE_DEFAULT_REGION` (default `GH`) and stores strict E.164. So the field accepts
   what the user types, and the response's `phoneNumber` is what to display afterwards.
-- `pin` is exactly four digits — `^\d{4}$`. This is the credential every payment is proved
-  against, so it is collected at signup, and no screen may skip it. Collect it with a confirm
-  field and send it once.
+- `pin` is optional. When it is sent it is exactly four digits — `^\d{4}$`. It is the credential
+  every payment is proved against, so collecting it here is what spares the user a later screen —
+  but an account can be created without one: it is then simply not payable until a PIN is set,
+  and `POST /v1/auth/pin/change` installs one with no `currentPin`. When it is sent, collect it
+  with a confirm field and send it once.
 - `handle` is optional, `a-z0-9_`, 3–32 characters, `@` accepted on input, stored lower-cased.
 - `201` comes back with `status: 'PENDING_VERIFICATION'`, `expiresAt` (10 minutes,
   `OTP_TTL_MINUTES`) and `codeLength` (6, `OTP_CODE_LENGTH`). **The code is not in the
@@ -143,7 +146,8 @@ The same raw-format `phoneNumber` as step 1, and the code the user typed.
 - Success is `200` **with a token pair already attached** plus `phoneVerifiedAt`. Verification
   *is* the sign-in: there is no second code to enter on a fresh account, which is the whole
   point of returning the session here. Store the tokens and go to whatever the account still
-  needs (Flow 2 is optional; the PIN was already set in step 1).
+  needs (Flow 2 is optional; the PIN was set in step 1, or was skipped there and is still owed
+  before the account can pay).
 - `400` — wrong code (`message` says how many attempts are left; 5 per code, `OTP_MAX_ATTEMPTS`)
   or expired (the code is consumed, so "resend" is the only move). Same status on purpose:
   render `message`, do not discriminate on the wording.
@@ -315,7 +319,7 @@ lost both the password and access to the SIM has no self-service route today —
 ## 7. Draft — registering *with* an email (not implemented)
 
 **Status: proposal. Nothing below exists at Step 34c.** `POST /v1/auth/register` accepts
-`phoneNumber`, `pin` and an optional `handle`; `POST /v1/auth/otp/verify` accepts
+`phoneNumber`, an optional `pin` and an optional `handle`; `POST /v1/auth/otp/verify` accepts
 `{ phoneNumber, code }`; the account's activation is about the number, and `emailVerifiedAt` is
 set only by Flow 2 or (when 34d lands) by Google. A client built against this section before the
 server changes will fail at its first call, so build Flow 1 + Flow 2 + Flow 3 now and treat this
