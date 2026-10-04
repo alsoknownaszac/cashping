@@ -109,28 +109,71 @@ the values no file can carry — and they are the only part a person supplies:
 | `AFRICASTALKING_USERNAME` | Their username — `sandbox` for the sandbox host, anything else for the live host. These two have to agree: the username picks the host, and a sandbox key is refused by the live host with a 401. |
 | `SENTRY_DSN` | The Sentry DSN. Staging is tagged `SENTRY_ENVIRONMENT=staging`, so its noise is separable on sight. |
 | `AWS_REGION` | The region the KMS key lives in. |
-| `AWS_ACCESS_KEY_ID` | Credentials that may `kms:DescribeKey` **and** encrypt/decrypt with that key. |
+| `AWS_ACCESS_KEY_ID` | Credentials for the custody principal — exactly the three actions the code calls (`kms:GenerateDataKey`, `kms:Decrypt`, `kms:DescribeKey`), on that one key ARN and nothing broader. `README.md` → *What the KMS credentials are allowed to do* has the policy and says why leaving `DescribeKey` out is a boot failure, not a downgrade. |
 | `AWS_SECRET_ACCESS_KEY` | The secret half of that pair. |
 | `AWS_KMS_KEY_ID` | The key's ARN, bare id, or `alias/…`. **It has to be a key in `AWS_REGION`**: KMS keys are regional, and a key from another region answers `NotFoundException`, which reads like a deleted key. |
 
-Two things are deliberately *not* on that list, and both are decisions rather than omissions:
-`JWT_SECRET` is `generateValue: true`, so Render generates it on the first sync and keeps it from
-then on; and `AWS_ENDPOINT_URL` is absent and must stay absent, because `NODE_ENV=production` makes
-the validator refuse to boot when it is set — custody aimed at a non-AWS endpoint while
-`AWS_KMS_KEY_ID` still names an AWS key is a different trust boundary, and the guard firing on a
-misconfigured staging is the guard working.
+Three things are deliberately *not* on that list, and each is a decision rather than an omission:
 
-**(c) The sender needs USDC, and the smoke test cannot conjure it.** A freshly provisioned Testnet
-account is funded with XLM by the friendbot and given a USDC trustline, so `GET /v1/wallet/balance`
-answers `balance: "0.0000000"` with `trustline: "active"` — an empty wallet, not a broken one. A
-payment of a positive amount from an empty wallet is a **409**, which is correct behaviour and not a
-deployment finding. So before step 7, send Testnet USDC to the sender's `publicKey` from an account
-that already holds Circle's Testnet USDC (`GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`),
-or reverse the direction and pay the smoke-test account instead. **Record which of the two you
-did** — "the payment failed on balance" and "the payment failed" are easy to confuse in a report.
+`JWT_SECRET` is `generateValue: true`, so Render generates it on the first sync and keeps it from
+then on. `AWS_ENDPOINT_URL` is absent and must stay absent, because `NODE_ENV=production` makes the
+validator refuse to boot when it is set — custody aimed at a non-AWS endpoint while `AWS_KMS_KEY_ID`
+still names an AWS key is a different trust boundary, and the guard firing on a misconfigured staging
+is the guard working. And `STELLAR_USDC_ISSUER` is a literal in the file (`render.yaml:372`) rather
+than one of the prompts: it is Circle's Testnet issuer, which is why (c) can fund a wallet from the
+public faucet without changing anything in the deployment.
+
+**Two cautions that come with the `AWS_*` values.** The principal should hold exactly the three
+actions the custody code calls, and no key administration — the policy is in `README.md` → *What the
+KMS credentials are allowed to do*. And the master key **cannot be rotated by this application**:
+nothing re-wraps an existing row, so disabling or rotating the old key strands every account sealed
+under it. If credentials are what leaked, rotate the access key instead — a new principal can unwrap
+the same rows.
+
+**(c) The sender needs USDC, and the faucet that supplies it is public — start there.** A freshly
+provisioned Testnet account is funded with XLM by the friendbot and given a USDC trustline, so
+`GET /v1/wallet/balance` answers `balance: "0.0000000"` with `trustline: "active"` — an empty wallet,
+not a broken one. A payment of a positive amount from an empty wallet is a **409**, which is correct
+behaviour and not a deployment finding.
+
+Circle's own faucet dispenses exactly the asset this deployment is already configured for, so the
+baseline needs no change to `render.yaml` at all. It is the one step in this section that a person
+must do in a browser, because it sits behind reCAPTCHA:
+
+1. Read the sender's address off the API — `GET $BASE/v1/wallet/account` → `publicKey` (a `G…`).
+2. Open <https://faucet.circle.com/>, leave the asset on **USDC**, and choose **Stellar Testnet** from
+   the network dropdown. Paste the `publicKey` and send. There is no account and no login; the limit
+   is 20 USDC per address per network every 2 hours, and §3.2 moves 1.25 USDC.
+3. Confirm it arrived with a **fresh** `GET $BASE/v1/wallet/balance`. The balance is read from Horizon
+   on every call rather than cached, so a number that has changed cannot be a stale one.
+
+That sends from `GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`, the issuer already
+committed at `render.yaml:372`. Two things to watch, both of which look like other failures:
+
+- **Fund after provisioning, never before.** The faucet pays USDC *to* the address, and a Stellar
+  payment to an account that has not trusted the issuer fails on the *sender's* transaction
+  (`op_no_trust`). The trustline is created by provisioning, inside the `verify-otp` request, so the
+  order is register → verify → fund.
+- **If the balance stays at zero, check the issuer before doubting the faucet.**
+  `UsdcTrustlineService` matches a balance line on code *and* issuer, so USDC arriving from a
+  different issuer is not the asset this deployment looks for. `trustline: "active"` with
+  `balance: "0.0000000"` immediately after a faucet send means exactly that, and Horizon's raw
+  account answer names the issuer that actually paid.
+
+If the faucet is rate-limited or unavailable, the fallback is a **self-issued** asset: create a
+keypair, fund it from the friendbot, point `STELLAR_USDC_ISSUER` at that public key, re-sync, and mint
+to the sender with a payment *from* the issuer. It runs the same code path — the asset code is a
+constant and only the issuer is configuration (`usdc-trustline.ts`) — with two costs worth naming: it
+stops proving that the real Circle asset is what lands, and the issuer has to be changed **before the
+first registration**, because a trustline is on-chain and a wallet provisioned against the old issuer
+has a line the new configuration will not match (reconciliation compares that identity back).
+
+**Record which of the two you used.** "The payment failed on balance" and "the payment failed" are
+easy to confuse in a report.
 
 **(d) What this run needs in hand:** a phone that can receive a real SMS (the code exists only in
-the message — nothing echoes it), a mailbox for the email step, and `curl` with `jq`.
+the message — nothing echoes it, for the email code either), a mailbox for the email step, a browser
+for the one reCAPTCHA-gated faucet send in (c), and `curl` with `jq`.
 
 ### 3.1 The boot, before any flow
 
@@ -276,10 +319,31 @@ code — an echoed code is a code anyone who can read one log line has. Attached
 for a receipt. A wrong code is a `400` counting down, the fifth is a `429`, and a `409` means another
 account has already verified that address.
 
-**9. Find somebody to pay.**
+**9. Find somebody to pay — which takes a second account.**
+
+`recipients/search` never returns the caller, deliberately ("offering yourself in it would be noise"),
+and `PaymentsService` refuses a self-payment outright (`assertNotSelf`). So this step needs a **second
+registered and verified account** — steps 5 and 6 again, on a different phone that can receive an SMS
+(this run registered `024 123 4567` as the sender, so `024 122 2333` here):
 
 ```bash
-curl -sS "$BASE/v1/recipients/search?q=0241234567" -H "Authorization: Bearer $TOKEN" | jq
+curl -sS -X POST "$BASE/v1/auth/register" -H 'Content-Type: application/json' \
+  -d '{"phoneNumber":"024 122 2333","pin":"4321"}' | jq
+curl -sS -X POST "$BASE/v1/auth/otp/verify" -H 'Content-Type: application/json' \
+  -d '{"phoneNumber":"+233241222333","code":"<the 6 digits from the SMS>"}' | jq
+```
+
+Its token pair is discarded on purpose: `$TOKEN` stays the sender's for every step that follows.
+
+That second verification is also what makes the recipient payable, and it is worth seeing why: it runs
+provisioning, so the account gets funded and trusted exactly as the sender's did — and a trustline is
+the right to *receive* the asset, so **nothing has to be funded on that side**. The sender is the only
+wallet that needs USDC (3.0(c)).
+
+Then search, from the sender's token:
+
+```bash
+curl -sS "$BASE/v1/recipients/search?q=0241222333" -H "Authorization: Bearer $TOKEN" | jq
 curl -sS "$BASE/v1/recipients/<id from the search>" -H "Authorization: Bearer $TOKEN" | jq
 ```
 
@@ -317,14 +381,14 @@ mandatory at registration — which is one of the things 3.4 flags as about to c
 curl -sS -X POST "$BASE/v1/payments" \
   -H "Authorization: Bearer $TOKEN" -H "x-step-up-token: $STEP_UP" \
   -H "Idempotency-Key: $(uuidgen)" -H 'Content-Type: application/json' \
-  -d '{"recipientId":"<id confirmed in step 9>","amount":"25.5"}' | jq
+  -d '{"recipientId":"<id confirmed in step 9>","amount":"1.25"}' | jq
 ```
 
-→ `202` `{ id, status: "PENDING", amount: "25.5", recipientId, createdAt }`
+→ `202` `{ id, status: "PENDING", amount: "1.25", recipientId, createdAt }`
 
 Three things in this one call are worth checking deliberately rather than incidentally:
 
-- **`amount` is a string.** Sending `25.5` as a JSON number is a `400` naming the field, because the
+- **`amount` is a string.** Sending `1.25` as a JSON number is a `400` naming the field, because the
   alternative is accepting whatever the client's formatter produced — which is how a seventh decimal
   disappears. A body carrying a `total` (or any undeclared field) is refused rather than ignored.
 - **The `amount` in the answer is re-read from the row**, not echoed from the request, so the response
@@ -333,7 +397,9 @@ Three things in this one call are worth checking deliberately rather than incide
 
 `202` is the honest split: a `PENDING` row exists and the amount is reserved against the sender, and
 nothing has been offered to Stellar yet. A `409` whose message carries an available figure means the
-sender's balance — see 3.0(c).
+sender's balance — see 3.0(c). The amount here is **1.25 against the faucet's 20**, so a `409` on this
+step is a funding problem and never a ceiling problem; raising the amount past what the wallet holds
+produces the same `409`, and a second faucet request is two hours away.
 
 **12. Poll to a verdict.**
 
@@ -391,7 +457,7 @@ these answers exist.
 | 6 verify | `200`, token pair | | did provisioning succeed here? |
 | 7 wallet | `funded: true`, `trustline: "active"` | | record `publicKey` |
 | 8 email | `200`, then `200` | | did the real email arrive? |
-| 9 search | `200`, `matchedBy` | | |
+| 9 second account + search | `200`; `matchedBy: "phone"`, one result | | the recipient's id, and that its `verify` provisioned a wallet too |
 | 10 step-up | `200` | | |
 | 11 payment | `202`, `PENDING` | | and the same-key replay |
 | 12 poll | `SUCCESSFUL` | | `stellarTxHash`, and how long it took |

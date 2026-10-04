@@ -264,6 +264,74 @@ Two things worth knowing before relying on one: the key has to be created *in* t
 `NotFoundException`, and the vendor's free tier is licensed for non-commercial use - check their
 terms before pointing this product's development at it.
 
+### What the KMS credentials are allowed to do
+
+The two values behind `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` are the only thing standing
+between a database dump and every seed in it, so they should be able to do as little as the code
+requires - and the code is the specification. `src/wallet/custody/kms-key-wrapper.ts` is the only
+file in the repository that imports `@aws-sdk/client-kms`, and it makes exactly three calls:
+
+| Call | Made from | Why |
+| --- | --- | --- |
+| `kms:GenerateDataKey` | `wrapDataKey`, once per account, at provisioning | mints that account's AES-256 data key (`KeySpec: 'AES_256'`, the account id as `EncryptionContext`) and returns it wrapped by the master key |
+| `kms:Decrypt` | `unwrapDataKey`, once per signature | opens that wrapped data key so the seed can be decrypted locally; the ARN recorded on the row is passed as `KeyId` so a blob/wrap disagreement is an error rather than a silent read |
+| `kms:DescribeKey` | `onModuleInit`, once at boot | the boot probe: that the ARN resolves, and that it resolves in `AWS_REGION` |
+
+There is no fourth. **`kms:Encrypt` is not needed and should not be granted** - the seed is sealed
+locally with the data key (`secret-envelope.ts`), so KMS only ever wraps and unwraps the data key
+itself. Nothing here creates, schedules, tags, grants or deletes a key. And KMS is the only AWS
+service this application talks to at all: `@aws-sdk/client-kms` is the only `@aws-sdk` package in
+`package.json`, so no other service belongs in the policy either.
+
+All three actions are against the one key named by `AWS_KMS_KEY_ID`, including `Decrypt`: the ARN
+recorded on a row *is* that key's resolved ARN - the SDK returns `KeyId` as a full ARN even when the
+config named an alias or a bare key id - so there is no second resource to allow. Scoped to the key,
+the policy is:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CashpingSeedCustody",
+      "Effect": "Allow",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
+      "Resource": "arn:aws:kms:<AWS_REGION>:<account-id>:key/<key-id>"
+    }
+  ]
+}
+```
+
+Three things worth knowing about it:
+
+- **`kms:DescribeKey` is not part of Step 18's original design, and leaving it out breaks a
+  production boot.** Step 18 (`docs/build-sequence.md:164`) describes the two cryptographic
+  actions - a per-account data key, wrapped by the master key - and those are the first two rows
+  above, exactly. The boot probe was added later, and it is what turns "the key is in another
+  region", "the key was deleted" and "the key is disabled" from a per-account failure at the first
+  registration into one startup line. `DescribeKey` is the only call that can tell those apart from
+  an unreachable KMS - and in production a key reference that *cannot* work refuses to start
+  (`reportUnusableKey`), so a policy that is correct about the two cryptographic actions and missing
+  this one produces a service that will not boot.
+- **There is no role to assume and no session token to pass.** Both credentials are read with
+  `getOrThrow`, and `AWS_SESSION_TOKEN`, a shared-config profile or an instance-metadata provider
+  appears nowhere in `src`. The principal therefore has to be one that can hold a long-lived access
+  key - a dedicated IAM **user**, one per environment, with the policy above and nothing else. That
+  includes no key-administration rights: a principal that can disable or delete the key it depends
+  on is a principal that can strand every wallet at once, and `kms:*` on this key is the whole
+  custody boundary handed to whoever steals the key next.
+- **The master key cannot be rotated by this application yet.** The envelope is rotation-*aware* -
+  every row records which ARN wrapped it, `unwrapDataKey` asserts that ARN with `KeyId`, and
+  `IncorrectKeyException` is classified as `SecretEnvelopeError` ("tampering, a botched rotation")
+  rather than as an outage, so a rotation mistake is *detected* rather than misread as a bricked
+  row - but nothing re-wraps an existing row under a new key, and no `kms:ReEncrypt*` permission is
+  used anywhere. Disabling the old key, or rotating the master key material, therefore strands every
+  account sealed under it until a re-wrap migration exists; recovering today means a re-wrap step
+  that has not been written. Rotate the *access key* if that is what leaked - that is a policy and
+  credential change, and a new principal can unwrap the same rows - and treat the master key as
+  fixed until then. `docs/pre-production-hardening.md` records the same limit from the deployment
+  side.
+
 ### Tests
 
 `npm test` covers the envelope (round trips, tampering, truncation, account and version
@@ -1061,7 +1129,9 @@ live in a repository: `CORS_ALLOWED_ORIGINS`, `AFRICASTALKING_API_KEY`, `AFRICAS
 is not on that list because Render generates it (`generateValue: true`), and `PORT` is not either because
 Render supplies it and `main.ts` listens on the validated `PORT` rather than a hardcoded 3000.
 `AFRICASTALKING_USERNAME` is prompted for next to the key on purpose: the username is what picks the API
-host, so a sandbox key under a live username is a 401 that reads like an outage.
+host, so a sandbox key under a live username is a 401 that reads like an outage. The three `AWS_*` values
+are the custody principal, and what that principal may do is enumerated above in *What the KMS credentials
+are allowed to do*: three actions, on one key, and no more.
 
 `STELLAR_FRIENDBOT_URL` is left unset deliberately: on Testnet the default is Stellar's own faucet, so new
 accounts are funded with nothing to configure.
