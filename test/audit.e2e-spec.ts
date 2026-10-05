@@ -67,7 +67,7 @@ import { StellarService } from './../src/wallet/stellar/stellar.service.js';
  * - `SMS_SENDER`, because the code has to be read from somewhere.
  * - `EMAIL_SENDER`, for the same reason since Step 34c: the *other* code is only ever in the email,
  *   so an address cannot be confirmed without reading what was sent. The real binding is
- *   `UnconfiguredEmailSender`, which refuses rather than pretending to deliver.
+ *   `ResendEmailSender`, so without this the attach below would try to send through Resend.
  * - `AccountProvisioningService`, so verification reaches no KMS, no friendbot and no Horizon - the
  *   wallet rows below are written directly, with keys the fake below recognises.
  * - `StellarService`, as the Horizon seam: the balance read the payment needs, and the transaction

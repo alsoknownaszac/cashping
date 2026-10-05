@@ -317,9 +317,14 @@ curl -sS -X POST "$BASE/v1/auth/email/verify" -H "Authorization: Bearer $TOKEN" 
 
 → `200` `{ email, codeLength: 6, expiresAt }` then `200` `{ email, emailVerifiedAt }`
 
-This is the first time the email seam carries a real message: locally the binding is
-`UnconfiguredEmailSender`, which refuses rather than pretending to deliver. Neither answer echoes the
-code — an echoed code is a code anyone who can read one log line has. Attached is not verified:
+This is the first time the email seam carries a real message: the binding is `ResendEmailSender`, so this
+step sends through Resend rather than through a sender that refuses. That matters to the run: until a
+sending domain is verified in the Resend dashboard the sender is Resend's shared test address
+(`onboarding@resend.dev`, the `DEFAULT_EMAIL_FROM`), which **delivers only to the mailbox the Resend
+account itself is registered under** — put that address in place of `smoke@example.com` above, or the
+attach is answered with Resend's own `403` ("you can only send testing emails to your own address")
+rather than a code. Neither answer echoes the code — an echoed code is a code anyone who can read one log
+line has. Attached is not verified:
 `emailVerifiedAt` is null until the code comes back, and only a verified address is a delivery target
 for a receipt. A wrong code is a `400` counting down, the fifth is a `429`, and a `409` means another
 account has already verified that address.

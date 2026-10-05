@@ -201,8 +201,9 @@ describe('Email attach and verify (e2e)', () => {
     })
       .overrideProvider(SMS_SENDER)
       .useValue(smsSender)
-      // Step 34c's seam. The default binding refuses to send, so without this the attach below would
-      // be a 503 - which is itself the sign the seam is real rather than a shortcut in the service.
+      // Step 34c's seam. The default binding sends through Resend, so this replaces it rather than
+      // putting a real message on the wire - which is the sign the seam is real rather than a shortcut
+      // in the service.
       .overrideProvider(EMAIL_SENDER)
       .useValue(emailSender)
       .overrideProvider(AccountProvisioningService)
