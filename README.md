@@ -196,6 +196,11 @@ a KMS call. There is no plaintext seed anywhere in the database, no seed in any 
 no code path that stores one "temporarily" - the audit for this step exists precisely to prove
 that, by reading the table directly rather than through the API.
 
+If you have no AWS background — or you are the person who has to explain this section to somebody
+who does not — [`docs/kms-credentials-explained.md`](docs/kms-credentials-explained.md) says the
+same thing in plain language: what a seed is, why AWS KMS rather than a scheme of our own, what the
+IAM user is, what each of the three permissions buys, and how to check the policy has not widened.
+
 **The stored form** (`src/wallet/custody/secret-envelope.ts`):
 
 ```text

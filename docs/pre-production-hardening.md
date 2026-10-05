@@ -130,6 +130,11 @@ nothing re-wraps an existing row, so disabling or rotating the old key strands e
 under it. If credentials are what leaked, rotate the access key instead — a new principal can unwrap
 the same rows.
 
+A reader who has not worked with AWS before, or who wants the reason each of the three actions is
+there rather than a list of them, has a plain-language companion to this section:
+[`docs/kms-credentials-explained.md`](kms-credentials-explained.md). It also carries the sweep that
+checks the live policy is still three actions on one key ARN, and what a bad result looks like.
+
 **(c) The sender needs USDC, and the faucet that supplies it is public — start there.** A freshly
 provisioned Testnet account is funded with XLM by the friendbot and given a USDC trustline, so
 `GET /v1/wallet/balance` answers `balance: "0.0000000"` with `trustline: "active"` — an empty wallet,

@@ -48,6 +48,13 @@ There is **no** `POST /v1/auth/google` yet (Step 34d, not built), and **no** ema
 codes are only ever texted to a number. `POST /v1/auth/login/password` is the only route that
 accepts an email.
 
+**Hand-off, if you are on the frontend and have landed here from a money question.** Nothing on this
+page signs or pays anything: the client's whole part in custody is holding an `Authorization`
+header (and, for a payment, a fresh `X-Step-Up-Token` from `POST /v1/auth/pin/verify`). The
+server-side machinery behind those — how a wallet's secret key is stored, and what the credential
+that opens it is allowed to do — is written for a non-AWS reader in
+[`kms-credentials-explained.md`](kms-credentials-explained.md).
+
 ## 2. Conventions every screen inherits
 
 **Base URL.** `{API_URL}/v1`. The OpenAPI document is at `{API_URL}/api/docs-json` if the
