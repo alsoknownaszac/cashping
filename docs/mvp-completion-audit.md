@@ -62,7 +62,7 @@ carries the commit it landed in, and neither is allowed to pass for the other.
 | --- | --- | --- |
 | **SIM swap / phone takeover protection** — a PIN independent of the phone before any payment, plus step-up friction after any auth event from a new device/context | **Partially Done** | The PIN half is built: `src/identity/pin/` (scrypt hash, `PIN_MAX_ATTEMPTS = 5`, `PIN_LOCKOUT_MINUTES = 15`, both in `src/config/configuration.ts`), and `src/common/guards/step-up-auth.guard.ts` refuses `POST /v1/payments` without a fresh `X-Step-Up-Token` from `POST /v1/auth/pin/verify`, writing `auth.pin.failed` with outcome `denied` for every refusal. Pinned by `test/pin.e2e-spec.ts`. **The device half does not exist**: nothing in `src/` records a device, a user agent, or a sign-in context, so "an auth event from a new device" is not a thing this system can notice. See finding **F1**. |
 | **Decimal precision handling, end to end** — `Decimal` not `Float`, amounts as strings on the wire, all arithmetic through a decimal-safe library | **Done** | `prisma/schema.prisma`: `amount Decimal @db.Decimal(20, 7)`. Amounts travel as strings (DTO members typed `string`, asserted by `test/money.e2e-spec.ts` — README records 14 tests there). `decimal.js` is confined to `src/common/money/` and the discipline check *fails the build* on four shapes: a money-named column typed `Float`/`Real`/`DoublePrecision`, a money member typed `number` in a `*.dto.ts`, a money-named local/parameter/property typed `number` anywhere else, and a `decimal.js` import from outside `src/common/money/` (`src/common/money/money-discipline.ts`, `RULES` ×4). Wired into `npm run lint`, therefore into every CI run. Re-measured for this audit: **219 files scanned, 0 violations**. |
-| **Key backup / disaster recovery procedure** — what happens on KMS master-key loss or outage, who may invoke recovery, where the material lives | **Not Done** | No procedure exists in any form: no runbook document (the `docs/` tree is three files, none about recovery), nothing in `README.md` → *Known gaps*, and no `kms:ReEncrypt*` permission or re-wrap code anywhere. The *limitation* is documented in two places — `README.md`'s custody section ("the master key cannot be rotated by this application yet … recovering today means a re-wrap step that has not been written") and `docs/pre-production-hardening.md` §3.0(b) — so this is a known-and-named gap, not a surprise. It is still not the deliverable the plan asked for. See finding **F2**. |
+| **Key backup / disaster recovery procedure** — what happens on KMS master-key loss or outage, who may invoke recovery, where the material lives | **Not Done** | No procedure exists in any form: no runbook document (the `docs/` tree is five files, none about recovery), nothing in `README.md` → *Known gaps*, and no `kms:ReEncrypt*` permission or re-wrap code anywhere. The *limitation* is documented in two places — `README.md`'s custody section ("the master key cannot be rotated by this application yet … recovering today means a re-wrap step that has not been written") and `docs/pre-production-hardening.md` §3.0(b) — so this is a known-and-named gap, not a surprise. It is still not the deliverable the plan asked for. See finding **F2**. |
 | **Transaction irreversibility — defined process** — user-facing "no refund guarantee" language, a support/dispute path, and an audit trail structured for dispute investigation | **Partially Done** | The audit-trail third is built and is the strongest of the three: an append-only `audit_log` table (migration `20261001120000_add_audit_log`, with a trigger that refuses `UPDATE`/`DELETE` even from the table owner), `payment.initiated`/`payment.completed`/`payment.failed` rows, and a failure vocabulary that separates *landed and unsuccessful* from *never landed* (`landed-unsuccessful:` vs `submission-rejected:` prefixes, `src/payments/services/submission-triage.ts`). **The other two thirds are missing**: no user-facing refund/irreversibility language exists in any DTO, doc, or message template, and there is no support or dispute route — a grep for `refund\|dispute\|irreversib` across the repository returns only prose about signatures being irreversible. See finding **F3**. |
 | **Basic AML/velocity controls** — per-transaction and rolling daily/weekly limits, plus a hook point for sanctions/watchlist screening | **Not Done** | No velocity, threshold, or limit code exists (`src/config/configuration.ts` holds `OTP_REQUESTS_PER_WINDOW`, `RECIPIENT_LOOKUP_REQUESTS_PER_WINDOW`, `IDEMPOTENCY_TTL_SECONDS` — cost and abuse caps — and no amount ceiling of any kind), and a grep for `sanction\|watchlist\|AML` across `src/` finds nothing. `README.md` → *Known gaps* states the position deliberately: "there is no *product* limit — no per-transaction maximum, no daily ceiling, no velocity rule … A real limit belongs with the product owner, applied as its own check in `PaymentsService`." That is an honest record of an open product decision, and it is still an MVP-blocking item from the plan's own list. See finding **F4**. |
 
@@ -145,6 +145,186 @@ Route surface as it exists: `src/identity/auth.controller.ts` (`auth`), `src/wal
 | E2E tests with `@nestjs/testing` + supertest for API contract coverage | **Done** | **16** `*.e2e-spec.ts` files in `test/`, booting the real `AppModule` through supertest under `vitest.config.e2e.ts` (15s test timeout, 90s hooks — each file validates config, connects Prisma and Redis). They run against the compose Postgres and Redis, and **not in CI**: `README.md` states plainly that CI runs lint, the unit tests and the build, and no e2e suite at all. So the contract coverage exists and is exercised by hand, and nothing re-runs it on a pull request. |
 | Load/concurrency tests targeting balance locking and double-spend | **Partially Done — the concurrency proof is stronger than the plan asked for; the load test does not exist** | Concurrency is proven by deliberate, deterministic races rather than by generated load: `src/wallet/stellar/account-lock.spec.ts` (sequence conflicts forced at the port), and the overdraft race in `README.md` — "five proofs", *mutation tested*, with the `202`/`409` split and `SUM = 9` read from the database rather than asserted from a mock. **No load-generating harness exists** (no k6, artillery or wrk anywhere in the repository), so "holds under real concurrent load" is unmeasured while "cannot double-spend" is measured. |
 
+## Findings — what the rows above point at, and which of it is still open
+
+Every *See finding* above lands here, and the numbers agree with the rows: they run in document
+order, A → B → C → D → E, which is the shape a list written as the rows were written would have.
+**This section is a reconstruction, and it says so on purpose.** There is no version of it to
+restore. `78a697d` added this document and `a5be3b1` annotated it; a pickaxe for `F13` across every
+ref matches only `78a697d`, so the string has never left this file and was never deleted from it.
+The object store agrees: no reachable *or* unreachable blob, no branch, tag, stash or reflog entry,
+no editor local history, and nothing else on disk under this project holds a `Findings` heading or a
+second draft of this document. The pointers above were written without the list they point at, and
+this is that list built back from them.
+
+Each entry says what it was built from, because that is the first thing a reader would want to
+check:
+
+- **stated** — the row's evidence column states the gap in full. The entry restates it and names the
+  consequence, which is the part that goes past the row.
+- **named** — the row names the gap in a clause, and cites the artefacts around it. The substance is
+  still the row's; the wording is this section's.
+- **inferred** — the row's pointer is the only evidence. Read it as a question to confirm, not a
+  measurement.
+
+*Open* below means the finding is still true of the tree as it stands. A finding whose row says
+*Partially Done* is usually only partly open, and its entry names the half that is missing.
+
+**F1 — the device half of SIM-swap protection, and every device-aware feature with it.** *[stated ·
+rows A and B]* The friction the plan asked for exists: `src/identity/pin/` (scrypt,
+`PIN_MAX_ATTEMPTS = 5`, `PIN_LOCKOUT_MINUTES = 15`), `src/common/guards/step-up-auth.guard.ts`
+refusing `POST /v1/payments` without a fresh `X-Step-Up-Token` from `POST /v1/auth/pin/verify`,
+every refusal written as `auth.pin.failed` with outcome `denied`, pinned by `test/pin.e2e-spec.ts`.
+What does not exist is the *input* that friction would need in order to fire on the plan's own
+condition: nothing in `src/` records a device, a user agent, or a sign-in context, so "an auth event
+from a new device" is not a thing this system can notice, and a replayed refresh token is
+indistinguishable from a legitimate one on a new phone. Row B's three features are missing for the
+same reason — no fingerprint to bind to, no active-session list to show, no sign-out-everywhere
+route — and `docs/frontend-auth-flow.md` §6 says so in as many words: "'sign out everywhere' is a
+separate feature with a separate route, and it does not exist yet". **Still open**, still on the
+plan's Critical list, and the only finding two rows point at.
+
+**F2 — key backup / disaster recovery.** *[stated · row A]* No procedure exists in any form: no
+runbook document, nothing in `README.md` → *Known gaps*, no `kms:ReEncrypt*` permission and no
+re-wrap code anywhere — so the day the KMS master key is lost or unavailable there is no written
+answer to who may invoke recovery or where the material lives. What exists is a *named limitation*,
+in `README.md`'s custody section ("the master key cannot be rotated by this application yet …
+recovering today means a re-wrap step that has not been written") and in
+`docs/pre-production-hardening.md` §3.0(b), which makes this a known-and-named gap rather than a
+surprise — and still not the deliverable the plan asked for. **Still open**, Not Done, on the plan's
+Critical list.
+
+**F3 — transaction irreversibility: the user-facing and support halves.** *[stated · row A]* Three
+things were asked for: irreversibility language a user sees, a support or dispute path, and an audit
+trail structured for dispute investigation. The third is built and is the strongest artefact in this
+audit — an append-only `audit_log` (migration `20261001120000_add_audit_log`, with a trigger that
+refuses `UPDATE`/`DELETE` even from the table owner),
+`payment.initiated`/`payment.completed`/`payment.failed` rows, and a failure vocabulary that
+separates *landed and unsuccessful* from *never landed* (`landed-unsuccessful:` versus
+`submission-rejected:`, `src/payments/services/submission-triage.ts`). The other two do not exist:
+no DTO, doc or message template carries irreversibility language, and there is no support or dispute
+route — a grep for `refund\|dispute\|irreversib` across the repository returns only prose about
+signatures being irreversible. **Partly open**: the record a dispute would be conducted from exists;
+the sentence that tells a user there is no way back, and the door they knock on afterwards, do not.
+
+**F4 — AML/velocity controls, including the screening hook.** *[stated · row A]* No amount ceiling
+of any kind exists: `src/config/configuration.ts` holds the cost-and-abuse caps
+(`OTP_REQUESTS_PER_WINDOW`, `RECIPIENT_LOOKUP_REQUESTS_PER_WINDOW`, `IDEMPOTENCY_TTL_SECONDS`) and
+nothing per-transaction, per-day or per-week, and a grep for `sanction\|watchlist\|AML` across
+`src/` finds nothing — so the hook point the plan asked for, for sanctions or watchlist screening,
+has nowhere to attach either. `README.md` → *Known gaps* records the position deliberately ("there
+is no *product* limit — no per-transaction maximum, no daily ceiling, no velocity rule … A real
+limit belongs with the product owner, applied as its own check in `PaymentsService`"), which is an
+honest record of an open product decision. It is the plan's own Critical list that makes it a
+finding: the decision itself is the gap. **Still open**, Not Done.
+
+**F5 — the jurisdiction-specific Ghana DPA artefact.** *[stated · row B]* The controls a checklist
+would audit mostly exist, and they are generic rather than Ghanaian: phone numbers masked before any
+log line (`maskPhoneNumber`, `src/common/phone/phone-number.ts`), a recipient search that never
+returns a phone number (`RecipientSearchResponseDto`), `AuditEntry.metadata` forbidden from carrying
+a secret or an identifier, seeds confined to the custody envelope. What the plan asked for is the
+artefact itself, and it does not exist: a grep for `Data Protection`, `Ghana` and `privacy` across
+`src/` and `docs/` finds no checklist, no retention policy and no data-subject-process note —
+nothing a regulator, a partner's due diligence or an engineer joining later could read. **Partly
+open**: the practice passes, the paperwork is missing.
+
+**F6 — the profanity half of handle filtering.** *[named · row B — and the reading that follows is
+inferred, which makes this the entry to check first]* The row's clause is the whole of the evidence
+— "**Reserved-word filtering is built; there is no profanity list** — see the note in finding
+**F6**" — and the note it points at does not exist, so this is a reading rather than a restatement.
+Reserved words are built carefully (`src/identity/handle/handle.ts`: 3–20 characters,
+`/^[a-z0-9_]+$/` after normalization, an explicit `RESERVED_HANDLES` set covering `admin`,
+`administrator`, `root`, `moderator`, `support`, `help`, `cashping` and underscore variants,
+case-insensitive uniqueness with a `CHECK` backstop, proven over HTTP at `2993aa1` and in
+`test/auth.e2e-spec.ts`). The plan asked for a "profanity/reserved-word filter"; nothing in `src/`
+or `prisma/schema.prisma` matches `profan\|slur`, so the second list was never written, and no
+decision to leave it out is recorded either. **What is certain** is the absence — that much is the
+row's. **What is inferred** is the judgement that would go with it: whether the missing note argued
+the omission acceptable (reserved names are the impersonation risk, and a profanity list is a
+content-policy question rather than a security one) or left it open. Read the status as *open,
+unjudged* until that call is confirmed.
+
+**F7 — the fallback Horizon URL: a slot, not a second host.** *[stated · row B]* The classification
+half is built and is well argued: `src/payments/services/submission-triage.ts` returns five answers
+(`accepted`, `retry`, `rebuild`, `superseded`, `failed`) so that "no verdict" travels out as
+retryable while a definitive no becomes `FAILED`; `horizon-transaction-lookup.ts` treats a 404 as a
+plain not-found and a 5xx as unavailable; `transaction-submitter.ts` separates "Horizon said no"
+from "Horizon never answered" at the port. What is missing is the destination:
+`STELLAR_HORIZON_FALLBACK_URL` is validated and resolved (`DEFAULT_FALLBACK_HORIZON_URL`,
+`configuration.ts:290`) and the file says what it is — "Nothing queries it yet: it is a slot, so
+pointing the fallback at a real second host stays a deliberate future" — and no code reads it in
+order to retry against it. The consequence is exact: an outage this system is now correct about
+calling *retryable* still has one place to retry, and that place is the one that is down. **Partly
+open** — the state exists, the second host does not.
+
+**F8 — OTP/SMS pumping: the friction and the daily ceiling.** *[stated · row B — and the finding the
+note below leans on]* The cap half is built and fails closed: `OTP_REQUESTS_PER_WINDOW = 3` per
+`OTP_REQUEST_WINDOW_MINUTES = 15`, counted per *number* rather than per caller ("the number is what
+is being pumped"), in Redis, with `otp-rate-limiter.service.ts` refusing to send when the counter
+cannot be read. The two other halves the plan named are missing, exactly as the row says: no CAPTCHA
+or equivalent friction before a send (`CAPTCHA` appears in this repository only in
+`docs/pre-production-hardening.md`, about Circle's faucet), and no hard *daily* ceiling — the window
+simply resets, and `configuration.ts` has no daily counter. Consequence: a script can drive sends to
+the cap on a number and keep doing it every fifteen minutes, indefinitely, with every one of those
+messages paid for on a live account. **Partly open**, and this is the finding the note below does
+*not* close: `377ea5c` put `POST /v1/auth/email` under this same limiter and the same window, which
+closes the *reach* of this class of cost — a paid message to a third party, one identifier over —
+while the friction and the daily ceiling stand as written.
+
+**F9 — Ghana SMS Sender ID registration.** *[stated · row B]* No sender-ID work exists anywhere: no
+`from` parameter, no NCA reference, no operational note. The code states the prerequisite and leaves
+it out deliberately — `src/notifications/sms/africas-talking-sms.sender.ts` records that Africa's
+Talking falls back to the account's default sender, and that "a live account needs one registered
+before launch — that is the one piece of configuration a switch to live will want, and it does not
+belong in a Day-1 diff". **Still open**, and unlike every other entry here its fix is not in this
+repository: it is a launch blocker that lives entirely outside the codebase, so no test, lint gate
+or audit number can catch it, and it belongs on a launch checklist rather than in a backlog of code.
+
+**F10 — a machine-readable error code.** *[stated · row C]* One shape for every failure is built and
+published: `src/common/dto/error-response.dto.ts` (`statusCode`, `error`, `message`, `path`,
+`timestamp`) implementing the global filter's own interface, so a field added in one place fails to
+compile in the other, and declared on every route's Swagger. What does not exist is a per-condition
+code: a client telling "insufficient balance" (409) apart from "recipient not payable" (404) from
+"PIN lockout" (429) does it by status plus a human sentence, which is what makes the taxonomy a
+convention rather than a contract. Consequence: client branching on a specific failure matches on
+wording, so a reworded message is a silent behaviour change in the frontend rather than a
+compile-time one in the backend. **Partly open** — the envelope is done, the vocabulary inside it is
+not machine-readable.
+
+**F11 — the escalation path behind the signals.** *[stated · row C]* No runbook exists. The signals
+do, scattered where they were written: reconciliation drift logs a line naming the public key
+**and** calls `Sentry.captureMessage` with the account id, the user id, both balances and the drift
+(`src/ledger/services/reconciliation.service.ts` — the app's only non-exception Sentry report); boot
+failures write a named cause to stderr before exiting (`main.ts`); and `render.yaml` records that a
+free instance has no shell and no one-off jobs, "so an incident is diagnosed from the log and the
+API rather than from a shell on the instance". Who is paged, in what order, who may touch balances
+to correct a drift, and what a finished incident looks like are all undefined — "A signal without an
+escalation path is half of the item". **Still open**, Not Done.
+
+**F12 — `GET /v1/health/stellar`.** *[stated · row D]* No such route exists in any controller, so
+the endpoint the plan specified for the chain's own liveness is absent. The nearest substitutes are
+read-only and indirect: `GET /v1/wallet/balance` and `GET /v1/wallet/account` (both live Horizon
+reads), the KMS boot probe, and the reconciliation sweep's per-account Horizon read. Consequence:
+`GET /v1/health` answers `{ status, uptimeSeconds, timestamp }` with no database call and no chain
+call, so it tells an operator the process is up and nothing about whether the accounts this app
+serves can reach Horizon — and the substitutes prove that one account at a time, and only when
+something asks. **Still open**, Not Done.
+
+**F13 — structured JSON logging and request IDs.** *[stated · row E]* Sentry is wired in and does
+real work: `@sentry/nestjs` (`6be9d80`), environment-aware sampling in `main.ts`, 5xx reported by
+the global exception filter with no stack in the response body, and reconciliation drift as the one
+deliberate non-exception report. The other half of the same decision does not exist: `nestjs-pino`
+is not a dependency, no logger is configured for JSON output, and a grep for
+`requestId`/`correlationId` across `src/` finds nothing. Consequence: log lines are unstructured
+text, and one request cannot be followed across the log, Sentry and the audit table by a shared
+identifier — which is the join an incident (F11) or a dispute (F3) would be worked with. **Partly
+open** — tracking exists, correlation does not.
+
+**Not one of the thirteen is closed by the change below.** What `377ea5c` closed was a gap this
+audit never got as far as listing — a send that consulted no counter — and the convention set out in
+*The numbers in this document* is why that is recorded there with its commit rather than written
+into these entries.
+
 ## After this audit — the send that counted nothing, closed
 
 The rows above are this audit *as it was taken*, and none of them is rewritten here: their numbers are
@@ -193,6 +373,17 @@ build` is green, and the four e2e suites that exercise this endpoint are **41** 
 **What this does not close.** Finding **F8** stands as written: there is still no CAPTCHA or equivalent
 friction, and the cap is still a 15-minute window rather than a hard daily ceiling. The change above
 closes the distance between *this endpoint* and the cap every other send already consults.
+
+**One number in the rows was wrong rather than overtaken.** Section A's key-recovery row said the
+`docs/` tree was three files; it held five when this audit was taken and it holds five now —
+`build-sequence.md`, `frontend-auth-flow.md`, `kms-credentials-explained.md`,
+`pre-production-hardening.md` and this document — so the row has been corrected in place, from three
+to five. *Documentation conventions* is the reason that is not an edit to leave alone: a count that
+is *re-measured* later is appended with its own label rather than corrected, because the older
+number is evidence about a smaller tree — and five files is not a smaller tree or a bigger one, it
+is the same tree mis-counted, which that rule does not cover. The correction is named here rather
+than made quietly because *the rows above are not rewritten* is otherwise a promise this document
+makes, and the rest of it argues against edits nobody can see. The rest of that row is untouched.
 
 
 
