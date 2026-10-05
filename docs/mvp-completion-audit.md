@@ -84,7 +84,7 @@ carries the commit it landed in, and neither is allowed to pass for the other.
 | --- | --- | --- |
 | **API versioning policy** — how `/v2/` gets introduced without breaking the frontend | **Done** | Every route is mounted under `/v1` through one definition (`src/common/http/prefix.ts`, applied by `app.setGlobalPrefix` in `main.ts`), so a breaking change can ship as `/v2` while `/v1` keeps answering the clients already in the field. The docs are served *outside* the prefix (`/api/docs`), so the address handed to the frontend does not move when the API version does. `README.md` → *API docs and CORS* records both halves, and `src/common/http/prefix.ts`'s docblock states the intent. |
 | **Standardized error-code taxonomy** across all endpoints, not just HTTP status codes | **Partially Done** | One shape for every failure, produced by one global filter and published for the frontend: `src/common/dto/error-response.dto.ts` (`statusCode`, `error`, `message`, `path`, `timestamp`) implementing the filter's own interface, so a field added in one place fails to compile in the other; declared on every route's Swagger. **There is no machine-readable per-condition code.** A client telling "insufficient balance" (409) apart from "recipient not payable" (404) from "PIN lockout" (429) does it by status plus a human sentence, so the taxonomy is a convention rather than a contract. See finding **F10**. |
-| **Push notifications** as a supplement to SMS for transaction confirmations | **Not Done** | `src/notifications/` contains `sms/` and `email/` and nothing else — no push provider, no device-token table or column, no dependency for one. A resolved payment notifies by SMS, plus an email receipt when a *verified* address exists (`PaymentsConfirmationService.notify` → `NotificationsService.sendPaymentResult`). The plan itself places this in the post-MVP bucket ("Push notifications as a supplement to SMS … reduces polling load and SMS cost"), so it is a deliberate deferral — see *Deliberately deferred* below. |
+| **Push notifications** as a supplement to SMS for transaction confirmations | **Not Done** | `src/notifications/` contains `sms/` and `email/` and nothing else — no push provider, no device-token table or column, no dependency for one. A resolved payment notifies by SMS, plus an email receipt when a *verified* address exists (`PaymentsConfirmationService.notify` → `NotificationsService.sendPaymentResult`). The plan itself places this in the post-MVP bucket ("Push notifications as a supplement to SMS … reduces polling load and SMS cost"), so it is a deliberate deferral rather than an unmet MVP requirement — Section 11 files it under *Worth tracking*, the bucket after *Critical (MVP-blocking)* and *Important*, which is the section this row sits in. |
 | **Formal incident response runbook** — escalation path for reconciliation drift and other production incidents | **Not Done** | No runbook exists; what exists is the *signal*, scattered where it was written: reconciliation drift logs a line naming the public key **and** calls `Sentry.captureMessage` with account id, user id, both balances and the drift (`src/ledger/services/reconciliation.service.ts` — the only non-exception Sentry report in the app), boot failures write a named cause to stderr before exiting (`main.ts`), and `render.yaml` records that a free instance has no shell or one-off jobs, "so an incident is diagnosed from the log and the API rather than from a shell on the instance". A signal without an escalation path is half of the item. See finding **F11**. |
 
 ## D. Section 6 — API design, endpoint by endpoint
@@ -384,6 +384,16 @@ number is evidence about a smaller tree — and five files is not a smaller tree
 is the same tree mis-counted, which that rule does not cover. The correction is named here rather
 than made quietly because *the rows above are not rewritten* is otherwise a promise this document
 makes, and the rest of it argues against edits nobody can see. The rest of that row is untouched.
+**A second pointer pointed at nothing, and was re-aimed rather than followed.** The
+push-notifications row ended by sending the reader to a *Deliberately deferred* section, and no such
+section was ever written — the search that cleared the *Findings* list clears this one too: the
+phrase appears in this document only in the sentence that pointed at it. Writing that section was
+the other way to go, and the weaker one, because the plan already keeps the bucket and this document
+already reproduces it: section C is the plan's *Worth tracking* list, and section F quotes the
+plan's own *explicitly deferred to post-MVP* line about WebSocket updates. A deferral list kept in
+two documents is two lists that can drift apart, so the row now names the bucket the plan files the
+item under — which is what "the plan itself places this in the post-MVP bucket" was asserting all
+along, and is the only evidence the deferral has.
 
 
 
