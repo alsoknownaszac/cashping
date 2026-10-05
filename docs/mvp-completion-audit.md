@@ -39,6 +39,12 @@ they were measured at, and this tree is larger), and they are not evidence that 
 `npm test` is the unit suite; the e2e suites need the compose Postgres and Redis and are run by
 hand — `README.md` records that CI runs lint, the unit tests and the build, and no e2e suite at all.
 
+A change that lands after this audit cannot appear in the rows below, so the one such change — the
+fix to Step 34c's email endpoint, which was the single send in `AuthService` with no cap on it — is
+recorded at the end of this file, under *After this audit*, carrying the commit it landed in. That
+is the convention read the other way: a measurement carries the step it was taken at, so a change
+carries the commit it landed in, and neither is allowed to pass for the other.
+
 ### How to read the statuses
 
 | Status | Means |
@@ -138,6 +144,56 @@ Route surface as it exists: `src/identity/auth.controller.ts` (`auth`), `src/wal
 | Integration tests against a local Stellar network (`docker stellar/quickstart`) | **Superseded — integration runs against real Testnet instead** | No `stellar/quickstart` container exists in `docker-compose.yml`; the string survives only as the default value of the fallback Horizon URL slot. What exists instead is stronger: opt-in integration specs against **real Testnet** behind `RUN_STELLAR_IT=1` (`test/wallet.e2e-spec.ts`, `test/provisioning.e2e-spec.ts`, `test/submission.e2e-spec.ts` — `README.md` records a real `changeTrust` and a real submission accepted on Testnet, with the account id), and against **LocalStack KMS** behind `RUN_KMS_IT=1` (`test/custody.e2e-spec.ts`). The trade is explicit: real network behaviour, at the cost of needing a socket, credentials and a faucet, which is why they are skipped by default. |
 | E2E tests with `@nestjs/testing` + supertest for API contract coverage | **Done** | **16** `*.e2e-spec.ts` files in `test/`, booting the real `AppModule` through supertest under `vitest.config.e2e.ts` (15s test timeout, 90s hooks — each file validates config, connects Prisma and Redis). They run against the compose Postgres and Redis, and **not in CI**: `README.md` states plainly that CI runs lint, the unit tests and the build, and no e2e suite at all. So the contract coverage exists and is exercised by hand, and nothing re-runs it on a pull request. |
 | Load/concurrency tests targeting balance locking and double-spend | **Partially Done — the concurrency proof is stronger than the plan asked for; the load test does not exist** | Concurrency is proven by deliberate, deterministic races rather than by generated load: `src/wallet/stellar/account-lock.spec.ts` (sequence conflicts forced at the port), and the overdraft race in `README.md` — "five proofs", *mutation tested*, with the `202`/`409` split and `SUM = 9` read from the database rather than asserted from a mock. **No load-generating harness exists** (no k6, artillery or wrk anywhere in the repository), so "holds under real concurrent load" is unmeasured while "cannot double-spend" is measured. |
+
+## After this audit — the send that counted nothing, closed
+
+The rows above are this audit *as it was taken*, and none of them is rewritten here: their numbers are
+the ones measured for the tree in `78a697d` (*The numbers in this document*), and a row that said
+**Not Done** or **Partially Done** still says it. This section is that convention read the other way.
+If a measurement has to carry the step it was taken at, then a change that lands after an audit has to
+carry the commit it landed in, or the document quietly turns into a description of a tree it was never
+checked against.
+
+**The gap, and why no row above covers it.** `POST /v1/auth/email` was the one *send* in `AuthService`
+that consulted no counter. Everything else that service sends is a text to a number, and each of those
+spends the number's allowance through `OtpRateLimiterService` at the endpoint that sends it —
+`register`, `requestLoginCode`, `requestPasswordReset` — while the endpoint that mails a verification
+code (`setEmail` → `EmailService.set` → `NotificationsService.sendEmailVerification`) spent nothing at
+all. That is the same class of cost as section B's OTP/SMS pumping row (finding **F8**): a message to a
+third party that is paid for on every call, one identifier over — the mailbox rather than the handset —
+and reachable by any authenticated caller. No row above names it because the plan lists no email
+endpoint at all; the route is one of Step 34c's additions beyond the plan, so the gap surfaced from
+reading the code, which is this document's first method, rather than from a plan row.
+
+**What closed it** — `377ea5c`, *fix(auth): count the address's send allowance on POST /v1/auth/email
+(Step 34c)*. `AuthService.setEmail` now spends the address's allowance through the same limiter, the
+same counter and the same window as the SMS sends (`OTP_REQUESTS_PER_WINDOW` = 3 per
+`OTP_REQUEST_WINDOW_MINUTES` = 15, counted in Redis), refusing the fourth attempt with **429** and the
+minutes to wait, and answering **503** when the limit cannot be evaluated — the fail-closed answer the
+other paths already give, since a cap whose purpose is to price messages must send none rather than
+guess and send. The subject is the address rather than the account, because a mailbox is what a caller
+can pump; the count sits after every refusal and before the delivery, so a 409 or a 400 mails nothing
+and spends nothing.
+
+**Two consequences, neither of them a defect.** An address's 15-minute window is now shared between
+sends and password guesses, exactly as a number's already was: one identifier, one allowance, spent by
+whatever is spent on it. And an address the limit refuses stays attached but unproved, which is not a
+delivery target — the receipts path mails only a *verified* address (`verifiedEmail` in
+`src/payments/services/payments-confirmation.service.ts`).
+
+**How it is proven**, as measured at `377ea5c`: `src/identity/auth.service.spec.ts` gained an
+`AuthService.setEmail (Step 34c)` block (the normalized subject and its mail mask, the 429 with its
+wait, the 503, a conflict that costs no allowance, and a malformed address that short-circuits);
+`test/email.e2e-spec.ts` makes four real calls against the compose stack and reads the fourth as a 429
+naming the wait, with the row left attached and unproved; `test/password.e2e-spec.ts`'s arithmetic
+moved with it, because the attach now spends one of the address's three. The unit suite is **61 files
+/ 998 tests** (993 at `78a697d`), `npm run lint` is 0 warnings and 0 errors on 219 files, `npm run
+build` is green, and the four e2e suites that exercise this endpoint are **41** tests.
+
+**What this does not close.** Finding **F8** stands as written: there is still no CAPTCHA or equivalent
+friction, and the cap is still a 15-minute window rather than a hard daily ceiling. The change above
+closes the distance between *this endpoint* and the cap every other send already consults.
+
 
 
 
