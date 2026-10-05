@@ -324,6 +324,14 @@ services:
       - key: AFRICASTALKING_USERNAME
         sync: false
 
+      # Resend's API key, for the verification and receipt email (Step 34c).
+      # Required: no email is sent without it. Until `cashping.app` is verified in
+      # Resend's dashboard the sender uses Resend's shared test address
+      # (`onboarding@resend.dev`), which only delivers to the Resend account's own
+      # address - so a test send here reaches the account owner and nobody else.
+      - key: RESEND_API_KEY
+        sync: false
+
       # --- Error reporting ---------------------------------------------------
       - key: SENTRY_DSN
         sync: false

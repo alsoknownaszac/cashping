@@ -155,8 +155,14 @@ export const PASSWORD_MAX_LENGTH = 128;
  * `EMAIL_SENDER` (see `NotificationsModule`), and the from-address is part of the wording
  * that lives beside the sender rather than a provider credential. `EMAIL_FROM` overrides
  * it for a deployment whose provider requires a verified sender domain.
+ *
+ * The default is Resend's shared test address rather than a `@cashping.app` one, because that
+ * domain is not verified in Resend yet and Resend refuses an unverified sender. It only delivers
+ * to the address the Resend account itself is registered under, so this is a development default
+ * rather than a shipping one: set `EMAIL_FROM` to a verified `@cashping.app` address once the
+ * domain is set up in the Resend dashboard.
  */
-export const DEFAULT_EMAIL_FROM = 'Cashping <no-reply@cashping.app>';
+export const DEFAULT_EMAIL_FROM = 'Cashping <onboarding@resend.dev>';
 
 /**
  * Recipient directory policy (Step 21).
@@ -558,7 +564,7 @@ export default function configuration() {
       ttlSeconds: IDEMPOTENCY_TTL_SECONDS,
     },
 
-    /** Outbound SMS via Africa's Talking. */
+    /** Outbound providers: SMS via Africa's Talking and email via Resend. */
     notifications: {
       africasTalking: {
         apiKey: process.env.AFRICASTALKING_API_KEY as string,
@@ -573,6 +579,16 @@ export default function configuration() {
           process.env.AFRICASTALKING_USERNAME ?? 'sandbox',
           process.env.AFRICASTALKING_BASE_URL,
         ),
+      },
+      /**
+       * Outbound email via Resend (Step 34c), behind `EMAIL_SENDER`.
+       *
+       * Required and without a default: it is the key Resend identifies the account by, so there
+       * is nothing safe to fall back to and a missing value has to fail at boot rather than at the
+       * first verification email. See `ResendEmailSender`.
+       */
+      resend: {
+        apiKey: process.env.RESEND_API_KEY as string,
       },
     },
 

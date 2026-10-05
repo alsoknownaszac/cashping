@@ -274,6 +274,17 @@ export class EnvironmentVariables {
   @IsUrl({ require_protocol: true })
   AFRICASTALKING_BASE_URL?: string;
 
+  // --- Notifications (Resend, email) ---------------------------------------
+  /**
+   * API key from the Resend dashboard (Step 34c), behind `EMAIL_SENDER`.
+   *
+   * Required and without a default, for the same reason `AFRICASTALKING_API_KEY` is: it is the
+   * secret the provider identifies the account by, so a missing value is a boot-time error rather
+   * than a verification email that quietly cannot be sent.
+   */
+  @IsNotEmpty()
+  RESEND_API_KEY!: string;
+
   // --- Error reporting (Sentry) --------------------------------------------
   @IsUrl({ require_tld: false })
   @IsNotEmpty()
