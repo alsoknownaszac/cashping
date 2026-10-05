@@ -360,7 +360,7 @@ Done when: every item in Section 5 of the architecture plan has a concrete answe
 **Step 34c — Email: a verified address and a second delivery channel**
 
 **Contract.**
-- `POST /v1/auth/email` (JWT) `{ email }` — attaches or replaces the account email and sends a verification code to it. 200; 400 for a malformed address; 409 when another account has already verified it.
+- `POST /v1/auth/email` (JWT) `{ email }` — attaches or replaces the account email and sends a verification code to it. 200; 400 for a malformed address; 409 when another account has already verified it; 429 once the address's send allowance is spent (3 per 15 minutes, the OTP limiter's counter, keyed on the address); 503 when the email was not sent.
 - `POST /v1/auth/email/verify` (JWT) `{ code }` — confirms the address. 200; 400 for a wrong or expired code; 429 when the attempts are spent.
 - Payment receipts — the settlement path that already texts the sender (`NotificationsService.sendPaymentResult`) now also sends to a verified email when one exists.
 
@@ -370,7 +370,7 @@ Done when: every item in Section 5 of the architecture plan has a concrete answe
 
 **Audit.** `auth.email.set` (ok) and `auth.email.verified` (ok). The address is a personal identifier: `metadata` carries the `userId`, not the address, matching the rule that no phone number appears in the clear either.
 
-**Tests.** Unit — `email.service.spec.ts`, an address normalisation/validation spec, and `notifications.service.spec.ts` for the email text and the from/to. e2e — `test/email.e2e-spec.ts`: set, verify, a wrong code, expiry, a duplicate address, and a payment whose settlement produces both an SMS and an email through the substituted sender. `test/audit.e2e-spec.ts` gains the `auth.email.*` rows.
+**Tests.** Unit — `auth.service.spec.ts` for the send allowance and its refusals, `email.service.spec.ts`, an address normalisation/validation spec, and `notifications.service.spec.ts` for the email text and the from/to. e2e — `test/email.e2e-spec.ts`: set, verify, a wrong code, expiry, a duplicate address, the send allowance running out, and a payment whose settlement produces both an SMS and an email through the substituted sender. `test/audit.e2e-spec.ts` gains the `auth.email.*` rows.
 
 **Done when:** a user can attach and verify an email, and a settled payment reaches it, with both events in the audit log.
 

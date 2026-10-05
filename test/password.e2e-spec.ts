@@ -561,9 +561,13 @@ describe('Password sign-in, change and reset (e2e)', () => {
 
       const address = await attachVerifiedEmail(account);
 
-      // The same allowance a code request gets: the first `OTP_REQUESTS_PER_WINDOW` guesses are
-      // simply wrong, and the next one is refused for the rest of the window.
-      for (let attempt = 0; attempt < OTP_REQUESTS_PER_WINDOW; attempt += 1) {
+      // The address has *one* allowance and the attach has spent one of it: an email send is counted
+      // against the same identifier a guess is, which is the phone number's arithmetic since Step 34b
+      // (`register` spends one of the number's three - the code request further down is that number's
+      // second). So `OTP_REQUESTS_PER_WINDOW - 1` guesses are simply wrong and the next one is refused
+      // for the rest of the window. Counting the attach is what makes this assertion arithmetic rather
+      // than a coincidence: an attach that cost nothing would let a third guess through.
+      for (let attempt = 0; attempt < OTP_REQUESTS_PER_WINDOW - 1; attempt += 1) {
         await request(app.getHttpServer())
           .post(LOGIN_PASSWORD_PATH)
           .send({ email: address, password: WRONG_PASSWORD })

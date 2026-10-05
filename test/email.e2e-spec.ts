@@ -386,6 +386,58 @@ describe('Email attach and verify (e2e)', () => {
       // address - there was nothing to send to.
       expect(emailSender.to('not-an-address')).toHaveLength(0);
     }, 60_000);
+
+    it("stops emailing once the address's allowance is spent, and says how long to wait", async () => {
+      const account = await registerAndVerify();
+      const address = freshAddress();
+
+      addresses.push(address);
+
+      // The policy read off the running app rather than restated, so loosening the cap fails this
+      // test instead of passing it with a number of the test's own.
+      const allowance = app.get(ConfigService).getOrThrow<number>('otp.requestsPerWindow');
+      const windowMinutes = app.get(ConfigService).getOrThrow<number>('otp.requestWindowMinutes');
+
+      // Four real calls: real HTTP, the real Redis counter behind `OtpRateLimiterService`, a real code
+      // issued each time and really handed to the email seam. This is the check this endpoint was
+      // missing - it mailed a third party on every call, with no ceiling at all.
+      for (let attempt = 1; attempt <= allowance; attempt += 1) {
+        await request(app.getHttpServer())
+          .post(EMAIL_PATH)
+          .set(as(account))
+          .send({ email: address })
+          .expect(200);
+      }
+
+      expect(emailSender.to(address)).toHaveLength(allowance);
+
+      const refused = await request(app.getHttpServer())
+        .post(EMAIL_PATH)
+        .set(as(account))
+        .send({ email: address })
+        .expect(429);
+
+      // The wait is the window itself, because the key was fresh: the TTL is set on the first count and
+      // never extended, so what the message promises is what the limiter will honour. The plural in the
+      // message is the service's, mirrored here rather than composed a second way.
+      expect(refused.body.message).toBe(
+        `Too many verification emails requested for this address. Try again in ${windowMinutes} minute${
+          windowMinutes === 1 ? '' : 's'
+        }.`,
+      );
+
+      // The reason the cap exists: the fourth call sent nothing, so Resend and the mailbox see three
+      // messages rather than four - and the counter is the only thing that decided that.
+      expect(emailSender.to(address)).toHaveLength(allowance);
+
+      // What the refusal leaves behind, asserted because it is the cost of counting this late (see
+      // `assertWithinEmailSendLimit`): the address is attached, still unproved, and an unproved address
+      // is not a delivery target - so no receipt can reach a mailbox the code never came back from.
+      const row = await emailRow(account.userId);
+
+      expect(row.email).toBe(address);
+      expect(row.emailVerifiedAt).toBeNull();
+    }, 60_000);
   });
 
   describe('POST /v1/auth/email/verify', () => {

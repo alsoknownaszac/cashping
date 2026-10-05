@@ -1826,3 +1826,107 @@ describe('AuthService.loginWithPassword (Steps 34b and 34c)', () => {
     expect(tokens.issued).toEqual([]);
   });
 });
+
+describe('AuthService.setEmail (Step 34c)', () => {
+  /** The signed-in caller the endpoint receives, as `JwtStrategy` would have left it. */
+  const session: SessionUser = {
+    id: 'user-1',
+    phoneNumber: E164_NUMBER,
+    status: UserStatus.ACTIVE,
+    handle: 'ama_1',
+  };
+
+  /** The address `EmailService` reports it attached, and the code it issued for it. */
+  const STORED_EMAIL = 'miriam@example.com';
+  /** The same mailbox, typed the way a keyboard does it. */
+  const SUBMITTED_EMAIL = '  Miriam@Example.COM  ';
+  /** The only spelling of an address a log line may carry. */
+  const EMAIL_MASK = 'm***@example.com';
+  const CODE = '123456';
+
+  it('counts the normalized address with the mail mask, then emails the code it issued', async () => {
+    const { auth, limiter, notifications, emails } = createHarness();
+
+    const response = await auth.setEmail(session, { email: SUBMITTED_EMAIL });
+
+    // Normalized before it is attached or counted: the counter's subject has to be the value the
+    // column holds, or `Miriam@Example.com` and `miriam@example.com` would get an allowance each.
+    expect(emails.setCalls).toEqual([{ userId: session.id, email: STORED_EMAIL }]);
+    expect(limiter.consumed).toEqual([STORED_EMAIL]);
+    // The mail mask travels with it, because the identifier here is an address rather than a number.
+    expect(limiter.masks).toEqual([EMAIL_MASK]);
+    // And the code the response promises is the one that went out, over the email seam.
+    expect(notifications.emails).toEqual([{ email: STORED_EMAIL, code: CODE }]);
+    expect(response.email).toBe(STORED_EMAIL);
+    expect(response.codeLength).toBe(6);
+  });
+
+  it('answers 429 once the address has spent its allowance, and sends nothing', async () => {
+    const { auth, limiter, notifications, emails } = createHarness();
+    limiter.error = new OtpRateLimitExceededError(900);
+
+    const { status, message } = await captureHttpError(() =>
+      auth.setEmail(session, { email: STORED_EMAIL }),
+    );
+
+    expect(status).toBe(429);
+    // The wording is about *emails*, and it carries the wait - the shape every other 429 here has.
+    expect(message).toContain('Too many verification emails requested for this address');
+    expect(message).toContain('15 minutes');
+    // The cap is on sending, which is the act it exists to price: the refusal lands before the
+    // delivery, so a spent allowance costs no third-party message.
+    expect(notifications.emails).toEqual([]);
+    // The attach has already happened by then, which is the price of counting this late and is
+    // asserted so that moving the count earlier is a decision rather than a drift. What is left
+    // behind is an address with a null `emailVerifiedAt`, which is not a delivery target.
+    expect(emails.setCalls).toHaveLength(1);
+  });
+
+  it('maps a limiter that cannot be evaluated to a 503, rather than sending unchecked', async () => {
+    const { auth, limiter, notifications } = createHarness();
+    limiter.error = new OtpRateLimitUnavailableError();
+
+    const { status, message } = await captureHttpError(() =>
+      auth.setEmail(session, { email: STORED_EMAIL }),
+    );
+
+    // Redis being down must not read as "no limit": refusing to send is the safe failure, and it is
+    // the same answer the OTP paths give, so the cap cannot be removed by taking Redis down.
+    expect(status).toBe(503);
+    expect(message).toContain('temporarily unavailable');
+    expect(notifications.emails).toEqual([]);
+  });
+
+  it('refuses an address another account holds without spending the allowance', async () => {
+    const { auth, limiter, notifications, emails } = createHarness();
+    emails.setOutcome = { ok: false, reason: 'address_taken' };
+
+    const { status, message } = await captureHttpError(() =>
+      auth.setEmail(session, { email: STORED_EMAIL }),
+    );
+
+    expect(status).toBe(409);
+    expect(message).toContain('already in use');
+    // `register`'s ordering rule, unchanged: a request that mails nothing must not spend the
+    // allowance, or anyone could burn a real mailbox's window by aiming conflicts at it.
+    expect(limiter.consumed).toEqual([]);
+    expect(notifications.emails).toEqual([]);
+  });
+
+  it('refuses an address that is not one, before it is attached, counted or sent', async () => {
+    const { auth, limiter, notifications, emails } = createHarness();
+
+    const { status, message } = await captureHttpError(() =>
+      auth.setEmail(session, { email: 'not-an-address' }),
+    );
+
+    expect(status).toBe(400);
+    // It names the value rather than saying "invalid email", because the user has to see the typo.
+    expect(message).toBe('"not-an-address" is not a valid email address.');
+    // The shape rule runs before any write, count or send: there was nothing to attach, nothing
+    // worth an allowance and nothing to address a message to.
+    expect(emails.setCalls).toEqual([]);
+    expect(limiter.consumed).toEqual([]);
+    expect(notifications.emails).toEqual([]);
+  });
+});

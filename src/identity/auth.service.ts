@@ -1092,6 +1092,13 @@ export class AuthService {
    * than an anonymous "invalid email". The write and the code belong to `EmailService`; what
    * belongs *here* is turning the code into a delivery - through `NotificationsService`, so
    * the wording and the transport stay behind the notification seam.
+   *
+   * The delivery is counted against the address's allowance first (`assertWithinEmailSendLimit`),
+   * which makes this the one endpoint whose *send* is capped rather than its *lookup*: every other
+   * send in this service is a text to a number, counted on that number by the endpoint that sends it
+   * (`register`, `requestLoginCode`, `requestPasswordReset`). The ordering of that count is the one
+   * decision worth stating - after every refusal, before the delivery - and it is argued where it is
+   * made.
    */
   async setEmail(user: SessionUser, dto: SetEmailDto): Promise<EmailSetResponseDto> {
     const email = this.normalizeEmail(dto.email);
@@ -1101,6 +1108,20 @@ export class AuthService {
     if (!outcome.ok) {
       throw this.toEmailSetRejection(outcome);
     }
+
+    /**
+     * Counted here, which is `register`'s ordering rule read as far as this endpoint allows: a
+     * request that mails nothing must not spend the address's allowance, or anyone could lock a
+     * real mailbox out of ever receiving a code by asking about it four times.
+     *
+     * `emails.set` decides its refusals *before* it writes, so by this line every refusal has
+     * happened and a code exists that is about to be delivered - which is the moment a send
+     * becomes real and therefore the moment it may be charged for. The cost of sitting this late
+     * is that a request the limit refuses has already had its address attached; that is the same
+     * state a failed `sendOtp` leaves, and it is harmless because an unproved address is not a
+     * delivery target (see `EmailService.set`), so no receipt can reach a mailbox through it.
+     */
+    await this.assertWithinEmailSendLimit(outcome.email);
 
     await this.sendEmailVerification(outcome.email, outcome.code);
 
@@ -1399,6 +1420,53 @@ export class AuthService {
 
       case 'code':
         return this.toHttpException(outcome.failure);
+    }
+  }
+
+  /**
+   * Counts one verification email against the address's allowance, or refuses (Step 34c).
+   *
+   * The counter is `OtpRateLimiterService`'s deliberately, and the shape is `register`'s: one
+   * subject, three sends per window (`OTP_REQUESTS_PER_WINDOW` / `OTP_REQUEST_WINDOW_MINUTES`). The
+   * resource being spent is the same one the SMS endpoints spend - a message to a third party that
+   * costs money on every call - so a limiter of its own would be a second place deciding how many
+   * messages an identifier may cause, and the two could disagree (Step 34b's reason, unchanged).
+   * This is the endpoint that made the gap obvious: it was the one send in this service that
+   * consulted no counter at all.
+   *
+   * The subject is *the address*, which is the honest analogue of `register` counting the number the
+   * text goes to: what a caller can pump is a mailbox, so the cap sits on the mailbox. Counting the
+   * account instead would cap how much one account sends while leaving "many accounts, one inbox"
+   * unaddressed, and it would spend a legitimate user's allowance on addresses they never attached -
+   * a first typo, then a second, and the third attempt at the address they *do* own is refused.
+   * Passing the mask with the subject keeps the limiter's own log line honest, and the mask is the
+   * mail one because the identifier here is an address rather than a number.
+   */
+  private async assertWithinEmailSendLimit(email: string): Promise<void> {
+    try {
+      await this.otpRateLimiter.consume(email, maskEmailAddress(email));
+    } catch (error) {
+      if (error instanceof OtpRateLimitExceededError) {
+        const minutes = Math.ceil(error.retryAfterSeconds / 60);
+
+        throw new HttpException(
+          `Too many verification emails requested for this address. Try again in ${minutes} minute${
+            minutes === 1 ? '' : 's'
+          }.`,
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+
+      if (error instanceof OtpRateLimitUnavailableError) {
+        // 5xx by design, and the same answer the OTP paths give: the limit could not be evaluated, so
+        // nothing was sent. The safe failure for a cap whose purpose is to price messages is to send
+        // none, and the client can act on it exactly as it acts on a failed send.
+        throw new ServiceUnavailableException(
+          'Verification is temporarily unavailable. Please try again in a moment.',
+        );
+      }
+
+      throw error;
     }
   }
 

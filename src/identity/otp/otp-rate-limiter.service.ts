@@ -70,8 +70,9 @@ export class OtpRateLimiterService {
    * Counts one request against the subject's allowance, throwing when the
    * allowance is already gone.
    *
-   * The subject is the identifier the request was about: a phone number for the OTP endpoints,
-   * and the number *or* the verified address a password sign-in was submitted with (Step 34c).
+   * The subject is the identifier the request was about: a phone number for the OTP endpoints, the
+   * number *or* the verified address a password sign-in was submitted with, and the address a
+   * verification email is about to go to (the last two are Step 34c).
    * It is a plain string because the counter only ever hashes it into the key, while the
    * *masked* form is a second parameter - which mask is honest is a fact about the identifier,
    * and only the caller knows whether it is holding a number or an address.

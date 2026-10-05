@@ -186,6 +186,9 @@ session being created.
   mistyped mailbox can never keep receiving receipts.
 - `codeLength` and `expiresAt` drive the code screen — the same 6 digits and 10 minutes as the
   SMS code, because it *is* the same OTP machinery with a different destination.
+- The send is capped **per address** — 3 verification emails per 15 minutes, the same limiter and
+  window the SMS codes count against, and attaching again counts because it sends again. So the
+  resend button must handle a `429`, not just a `503`.
 
 | Answer | Screen's move |
 | --- | --- |
@@ -194,6 +197,7 @@ session being created.
 | `401` | Refresh, retry once, then sign in again. |
 | `403` | Account suspended: end the session. |
 | `409` | Another account holds that address. Offer "use a different address", or better, "sign in with that email instead". |
+| `429` | The address's send allowance is spent (3 per 15 minutes per address; the counter follows the address, not the account, so a different address is a fresh budget). Disable resend and show the wait from `message`. The address stays attached and unconfirmed, so nothing is delivered to it until a code comes back. |
 | `503` | The email was not sent. Stay on the form; retrying is safe and costs nothing. |
 
 **Step 2 — `POST /v1/auth/email/verify` `{ code }` → `200 { email, emailVerifiedAt }`**
@@ -250,7 +254,7 @@ your details and try again".
 | `400` | Both identifiers, neither, or a malformed one. `message` names it. |
 | `401` | Any of the five cases above. Clear the password field; never branch on the message. |
 | `403` | The account is suspended. Checked *before* the password is read, so this answer does not depend on the password being right. |
-| `429` | The identifier's attempt allowance is spent. The counter is the OTP limiter's, keyed on the normalized identifier — a number and an address on one account have an allowance **each**, 3 per 15 minutes. `message` carries the wait. |
+| `429` | The identifier's attempt allowance is spent. The counter is the OTP limiter's, keyed on the normalized identifier — a number and an address on one account have an allowance **each**, 3 per 15 minutes, and an identifier's window is shared by everything spent on it: on a number that is code requests and guesses, on an address that is `POST /auth/email`'s sends and guesses. `message` carries the wait. |
 | `503` | The counter itself was unreachable. Nothing was checked; retry shortly. |
 
 A refused password login also writes an audit row (`auth.password.login`, outcome `denied`), so
