@@ -685,8 +685,10 @@ answered", not "this one did".
 ## Submission (Step 27)
 
 This is the step where the application signs a real key and moves real money, so it was proposed and
-approved before it was written: `docs/step-27-proposal.md` is the design, and this section is what
-shipped. Scope is submission only - `PENDING` → `PROCESSING`, and `PROCESSING` → `FAILED` for a
+approved before it was written. The proposal document itself is gone — `docs/step-27-proposal.md` was
+deleted in `1417d06`, the commit that landed the Days 6 credentials work — so the decisions it recorded
+are restated in `docs/build-sequence.md`'s **Step 27** entry, and this section is what shipped. Scope is
+submission only - `PENDING` → `PROCESSING`, and `PROCESSING` → `FAILED` for a
 definitive no. Resolving to `SUCCESSFUL` is Step 28's polling, and the guard around every write is
 Step 29's.
 
@@ -742,7 +744,9 @@ ledger ever saw (`tx_bad_seq`, `tx_too_late`, `tx_malformed`, `tx_insufficient_f
 evidence of neither story, and guessing is the mistake with a money-shaped consequence. A submit-time refusal
 and a poll that reads the same code back therefore write the same name: as the gated run measured, Horizon's
 `submitTransaction` blocks until the ledger closes the transaction, so the 400 is the *outcome* of a
-transaction the ledger has, not the absence of one. See `docs/step-28-29-proposal.md` §6.
+transaction the ledger has, not the absence of one. The classification is
+`src/payments/services/submission-triage.ts`; the proposal that argued it (`docs/step-28-29-proposal.md`)
+was deleted in `1417d06` along with Step 27's, so this section is where the argument survives.
 
 ### The bound on Redis
 
@@ -1187,7 +1191,8 @@ blocks a step in `docs/build-sequence.md`.
   and with custody, so a poller taking any of them would be a second path to a signature. The sweep counts
   such rows (`stuckWithoutHash`, `updatedAt` older than five minutes) and logs a warning naming them, and
   that is the whole of its handling: deciding what to do with one needs an operator or a later re-drive
-  step. `docs/step-28-29-proposal.md` §5 is where the case is argued.
+  step. `docs/build-sequence.md`'s **Step 28–29** entry is where the case is argued now — the proposal it
+  used to cite by its §5 (`docs/step-28-29-proposal.md`) was deleted in `1417d06`.
 
 - **The money rule matches names, so it can only see money that is named like money.** A value of
   an amount called `total` or `x` typed `number` is invisible to it, and so is a `Float` column
