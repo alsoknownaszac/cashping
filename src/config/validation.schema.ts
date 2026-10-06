@@ -36,13 +36,20 @@ export enum StellarNetwork {
 /**
  * Providers the `EMAIL_SENDER` binding can choose between (Step 34c follow-up).
  *
- * `Resend` is the real sender every deployment uses; `Mailtrap` is the local Email-Testing
- * sandbox. The pair is an enum rather than a free string so a typo (`Mailtrap`, `mailtrap `)
- * is a boot error naming `EMAIL_SENDER`, not a silent fall-through to Resend.
+ * `Resend` is the real sender a deployment uses by default; `Mailtrap` is the local
+ * Email-Testing sandbox; `Smtp` is any real SMTP relay (Gmail, a corporate server) for an
+ * environment that has to reach arbitrary external inboxes without a verified Resend domain.
+ * The three are an enum rather than a free string so a typo (`Mailtrap`, `mailtrap `) is a
+ * boot error naming `EMAIL_SENDER`, not a silent fall-through to Resend.
+ *
+ * `Mailtrap` and `Smtp` are deliberately separate values rather than one "SMTP" name: the
+ * guard below refuses the *sandbox* in production while allowing a real relay, and that
+ * distinction is only expressible if the sandbox keeps its own name.
  */
 export enum EmailProvider {
   Resend = 'resend',
   Mailtrap = 'mailtrap',
+  Smtp = 'smtp',
 }
 
 /**
@@ -63,6 +70,7 @@ const NUMERIC_KEYS = [
   'PAYMENTS_CONFIRMATION_INTERVAL_MS',
   'RECONCILIATION_INTERVAL_MS',
   'MAILTRAP_PORT',
+  'SMTP_PORT',
 ] as const;
 
 /**
@@ -304,9 +312,11 @@ export class EnvironmentVariables {
    *
    * Optional; `configuration()` defaults it to `resend`, so production needs no value and gets
    * the real provider. `mailtrap` routes mail to the Mailtrap Email-Testing sandbox for local
-   * development - see `assertEmailSenderIsUsable` for why it is refused in production. Missing
-   * credentials are not checked here; the sender reports them at send time (see
-   * `MailtrapEmailSender`).
+   * development - see `assertEmailSenderIsUsable` for why it is refused in production. `smtp`
+   * sends through a real SMTP relay (Gmail, a corporate server), which a staging environment
+   * uses to reach arbitrary inboxes without verifying a domain in Resend; it is a real sender,
+   * so the guard leaves it alone. Missing credentials are not checked here; the sender reports
+   * them at send time (see `MailtrapEmailSender`, `SmtpEmailSender`).
    */
   @IsOptional()
   @IsEnum(EmailProvider)
@@ -333,6 +343,29 @@ export class EnvironmentVariables {
 
   @IsOptional()
   MAILTRAP_PASSWORD?: string;
+
+  /**
+   * Generic SMTP relay settings, read only when `EMAIL_SENDER=smtp` (see `SmtpEmailSender`).
+   *
+   * Unlike Mailtrap's, none of the four has a default in `configuration()`: there is no such
+   * thing as "the" SMTP server, so a half-filled group is a send-time `EmailDeliveryError`
+   * naming what is missing rather than a connection to a host nobody chose. `SMTP_PORT` is
+   * coerced from its string form by `NUMERIC_KEYS`, like `MAILTRAP_PORT`.
+   */
+  @IsOptional()
+  SMTP_HOST?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(65_535)
+  SMTP_PORT?: number;
+
+  @IsOptional()
+  SMTP_USERNAME?: string;
+
+  @IsOptional()
+  SMTP_PASSWORD?: string;
 
   // --- Error reporting (Sentry) --------------------------------------------
   @IsUrl({ require_tld: false })
@@ -602,6 +635,10 @@ function assertEndpointIsNotSelectedForProduction(candidate: Record<string, unkn
  * The same shape as `assertEndpointIsNotSelectedForProduction`, and a cross-variable rule for the
  * same reason: `EMAIL_SENDER=mailtrap` alone is fine (it is what local development wants), and
  * `NODE_ENV=production` alone is fine; it is the pair that cannot stand.
+ *
+ * Only the Mailtrap *sandbox* is refused, and deliberately so: `resend` (the default) and `smtp`
+ * are both real senders that actually deliver, so both are production-legal. The guard names
+ * exactly one value because exactly one value loses mail.
  *
  * `NODE_ENV` is compared as the raw string rather than the validated enum, because this runs
  * before validation: it has to fire on exactly the value the operator wrote.

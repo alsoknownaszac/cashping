@@ -544,8 +544,9 @@ export default function configuration() {
        *
        * `'resend'` (the default) sends real mail through Resend; `'mailtrap'` hands every message
        * to a Mailtrap Email-Testing sandbox and is refused when `NODE_ENV=production` by the
-       * validation schema. Read in `createEmailSender`, the one place the two senders are chosen
-       * between.
+       * validation schema; `'smtp'` sends through a real SMTP relay (see `notifications.smtp`),
+       * which staging uses to reach arbitrary inboxes. Read in `createEmailSender`, the one place
+       * the senders are chosen between.
        */
       sender: process.env.EMAIL_SENDER ?? 'resend',
     },
@@ -573,7 +574,7 @@ export default function configuration() {
       ttlSeconds: IDEMPOTENCY_TTL_SECONDS,
     },
 
-    /** Outbound providers: SMS via Africa's Talking and email via Resend. */
+    /** Outbound providers: SMS via Africa's Talking and email via Resend, Mailtrap or SMTP. */
     notifications: {
       africasTalking: {
         apiKey: process.env.AFRICASTALKING_API_KEY as string,
@@ -614,6 +615,24 @@ export default function configuration() {
         port: Number(process.env.MAILTRAP_PORT ?? 2525),
         username: process.env.MAILTRAP_USERNAME,
         password: process.env.MAILTRAP_PASSWORD,
+      },
+      /**
+       * Outbound email via a real SMTP relay, behind `EMAIL_SENDER` (Step 34c follow-up).
+       * Selected with `EMAIL_SENDER=smtp` wherever mail has to reach arbitrary external inboxes
+       * without a verified Resend domain - a staging environment, typically.
+       *
+       * Unlike `mailtrap`, none of the four has a default: there is no such thing as "the" SMTP
+       * server, so an unset value stays `undefined` and `SmtpEmailSender` reports exactly what is
+       * missing at send time. All four are read only when the sender is selected; Resend and
+       * Mailtrap need none of them.
+       */
+      smtp: {
+        host: process.env.SMTP_HOST,
+        // `SMTP_PORT` arrives as a string via `process.env`; `undefined` when unset so the sender
+        // can tell "not configured" from a real port rather than reading `Number('')` as 0.
+        port: process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined,
+        username: process.env.SMTP_USERNAME,
+        password: process.env.SMTP_PASSWORD,
       },
     },
 

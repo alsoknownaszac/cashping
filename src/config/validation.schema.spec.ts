@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  EmailProvider,
   EnvironmentVariables,
   NodeEnvironment,
   StellarNetwork,
@@ -408,5 +409,46 @@ describe('environment validation', () => {
     expect(validate({ ...VALID_ENV, NODE_ENV: 'production' }).NODE_ENV).toBe(
       NodeEnvironment.Production,
     );
+  });
+
+  // The email-sender guard (Step 34c follow-up). Only the Mailtrap *sandbox* is refused in
+  // production, because it accepts mail and delivers none of it; `smtp` is a real relay and
+  // `resend` is the real default, so both are fine there. These pin that boundary from both
+  // sides, so widening it by accident (letting the sandbox through) or narrowing it by accident
+  // (refusing a real relay) fails here rather than in a deployment.
+  it('refuses the Mailtrap sandbox in production', () => {
+    expect(() =>
+      validate({ ...VALID_ENV, NODE_ENV: 'production', EMAIL_SENDER: 'mailtrap' }),
+    ).toThrowError(/EMAIL_SENDER=mailtrap is set while NODE_ENV=production/);
+  });
+
+  it('accepts the Mailtrap sandbox outside production', () => {
+    expect(validate({ ...VALID_ENV, EMAIL_SENDER: 'mailtrap' }).EMAIL_SENDER).toBe(
+      EmailProvider.Mailtrap,
+    );
+  });
+
+  it('accepts the generic SMTP relay in production, because it delivers real mail', () => {
+    const result = validate({ ...VALID_ENV, NODE_ENV: 'production', EMAIL_SENDER: 'smtp' });
+
+    expect(result.EMAIL_SENDER).toBe(EmailProvider.Smtp);
+    expect(result.NODE_ENV).toBe(NodeEnvironment.Production);
+  });
+
+  it('accepts Resend in production', () => {
+    expect(
+      validate({ ...VALID_ENV, NODE_ENV: 'production', EMAIL_SENDER: 'resend' }).EMAIL_SENDER,
+    ).toBe(EmailProvider.Resend);
+  });
+
+  it('coerces SMTP_PORT to a number, like MAILTRAP_PORT', () => {
+    const result = validate({ ...VALID_ENV, SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '465' });
+
+    expect(result.SMTP_PORT).toBe(465);
+    expect(typeof result.SMTP_PORT).toBe('number');
+  });
+
+  it('rejects an out-of-range SMTP_PORT, naming it', () => {
+    expect(() => validate({ ...VALID_ENV, SMTP_PORT: '70000' })).toThrowError(/SMTP_PORT/);
   });
 });

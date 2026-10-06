@@ -332,6 +332,30 @@ services:
       - key: RESEND_API_KEY
         sync: false
 
+      # --- Email provider (staging) ------------------------------------------
+      # Staging sends verification and receipt email through a real SMTP relay (Gmail
+      # over an app password) instead of Resend's shared test address, so a code
+      # reaches an arbitrary external inbox without a domain verified in Resend.
+      # `smtp` is a real sender, so - unlike `mailtrap` - the boot-time guard allows it
+      # with `NODE_ENV=production` above. Production leaves `EMAIL_SENDER` unset and
+      # therefore keeps Resend; this value lives only in staging.
+      #
+      # Unlike `mailtrap`, none of the SMTP settings has a default: there is no "the"
+      # SMTP server, so an incomplete group fails the send with a reason naming what is
+      # missing rather than connecting somewhere nobody chose. Host and port are not
+      # secrets; the account and its app password are, so they are prompted for on the
+      # first sync.
+      - key: EMAIL_SENDER
+        value: smtp
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: '465'
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+
       # --- Error reporting ---------------------------------------------------
       - key: SENTRY_DSN
         sync: false
