@@ -539,6 +539,15 @@ export default function configuration() {
      */
     email: {
       from: process.env.EMAIL_FROM ?? DEFAULT_EMAIL_FROM,
+      /**
+       * Which `EmailSender` the app binds (Step 34c follow-up).
+       *
+       * `'resend'` (the default) sends real mail through Resend; `'mailtrap'` hands every message
+       * to a Mailtrap Email-Testing sandbox and is refused when `NODE_ENV=production` by the
+       * validation schema. Read in `createEmailSender`, the one place the two senders are chosen
+       * between.
+       */
+      sender: process.env.EMAIL_SENDER ?? 'resend',
     },
 
     /**
@@ -589,6 +598,22 @@ export default function configuration() {
        */
       resend: {
         apiKey: process.env.RESEND_API_KEY as string,
+      },
+      /**
+       * Outbound email via Mailtrap's Email-Testing sandbox, behind `EMAIL_SENDER` (Step 34c
+       * follow-up). Selected only in local development - `EMAIL_SENDER=mailtrap` - and refused in
+       * production by the validation schema, so a real verification code cannot end up in a
+       * sandbox inbox.
+       *
+       * Host and port default to Mailtrap's own; the username and the password are the per-inbox
+       * SMTP credentials and are read only when the sender is selected (see `MailtrapEmailSender`).
+       * Left unset for Resend, which needs none of them.
+       */
+      mailtrap: {
+        host: process.env.MAILTRAP_HOST ?? 'sandbox.smtp.mailtrap.io',
+        port: Number(process.env.MAILTRAP_PORT ?? 2525),
+        username: process.env.MAILTRAP_USERNAME,
+        password: process.env.MAILTRAP_PASSWORD,
       },
     },
 

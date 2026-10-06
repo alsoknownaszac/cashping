@@ -1,5 +1,6 @@
 import { ConflictException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { AuditService } from '../../audit/audit.service.js';
+import { Prisma } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
 import { OtpService, type OtpCheckOutcome } from '../otp/otp.service.js';
 
@@ -77,8 +78,9 @@ export class EmailService {
    *
    * The uniqueness check reads before it writes for the ordinary case (a clean 409 with a
    * message), and the column's unique index is the guarantee: two requests can pass this
-   * check in the same instant, and the loser gets `address_taken` from the caller's own
-   * uniqueness-violation handling rather than from here.
+   * check in the same instant, and the second one to commit is refused by the index itself -
+   * the `P2002` caught below becomes the same `address_taken` the read returns, so the caller
+   * maps both paths with one table.
    */
   async set(userId: string, email: string): Promise<EmailSetOutcome> {
     const holder = await this.prisma.user.findFirst({
@@ -90,10 +92,26 @@ export class EmailService {
       return { ok: false, reason: 'address_taken' };
     }
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { email, emailVerifiedAt: null },
-    });
+    /**
+     * The write is what actually enforces uniqueness; the read above is only the ordinary path
+     * to the message. Two requests for the same address can pass that read together, and the
+     * second one to commit then trips the unique index and raises `P2002` - a lost race, not a
+     * failure, so it has to read as the same conflict the read returns rather than reach the
+     * global filter as a 500. Every other error keeps travelling, because a genuine database
+     * failure belongs in a 500 and in Sentry.
+     */
+    try {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { email, emailVerifiedAt: null },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        return { ok: false, reason: 'address_taken' };
+      }
+
+      throw error;
+    }
 
     /**
      * Step 33-ish vocabulary: `auth.email.set`, written before the code is sent and for the

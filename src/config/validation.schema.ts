@@ -34,6 +34,18 @@ export enum StellarNetwork {
 }
 
 /**
+ * Providers the `EMAIL_SENDER` binding can choose between (Step 34c follow-up).
+ *
+ * `Resend` is the real sender every deployment uses; `Mailtrap` is the local Email-Testing
+ * sandbox. The pair is an enum rather than a free string so a typo (`Mailtrap`, `mailtrap `)
+ * is a boot error naming `EMAIL_SENDER`, not a silent fall-through to Resend.
+ */
+export enum EmailProvider {
+  Resend = 'resend',
+  Mailtrap = 'mailtrap',
+}
+
+/**
  * Environment variables that hold a number but arrive as strings via
  * `process.env`, and therefore need coercing before validation.
  */
@@ -50,6 +62,7 @@ const NUMERIC_KEYS = [
   'STELLAR_PROVISIONING_TIMEOUT_MS',
   'PAYMENTS_CONFIRMATION_INTERVAL_MS',
   'RECONCILIATION_INTERVAL_MS',
+  'MAILTRAP_PORT',
 ] as const;
 
 /**
@@ -284,6 +297,42 @@ export class EnvironmentVariables {
    */
   @IsNotEmpty()
   RESEND_API_KEY!: string;
+
+  // --- Notifications (email provider selection) ----------------------------
+  /**
+   * Which `EmailSender` the app binds (Step 34c follow-up).
+   *
+   * Optional; `configuration()` defaults it to `resend`, so production needs no value and gets
+   * the real provider. `mailtrap` routes mail to the Mailtrap Email-Testing sandbox for local
+   * development - see `assertEmailSenderIsUsable` for why it is refused in production. Missing
+   * credentials are not checked here; the sender reports them at send time (see
+   * `MailtrapEmailSender`).
+   */
+  @IsOptional()
+  @IsEnum(EmailProvider)
+  EMAIL_SENDER?: EmailProvider;
+
+  /**
+   * Mailtrap Email-Testing SMTP settings (Mailtrap -> Email Testing -> Inbox -> SMTP settings).
+   *
+   * Optional as a group, because they are read only when `EMAIL_SENDER=mailtrap`. Host and port
+   * have defaults in `configuration()`; the credentials do not, and their absence is a send-time
+   * `EmailDeliveryError` rather than a boot error.
+   */
+  @IsOptional()
+  MAILTRAP_HOST?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(65_535)
+  MAILTRAP_PORT?: number;
+
+  @IsOptional()
+  MAILTRAP_USERNAME?: string;
+
+  @IsOptional()
+  MAILTRAP_PASSWORD?: string;
 
   // --- Error reporting (Sentry) --------------------------------------------
   @IsUrl({ require_tld: false })
@@ -542,6 +591,44 @@ function assertEndpointIsNotSelectedForProduction(candidate: Record<string, unkn
 }
 
 /**
+ * Refuses the Mailtrap sandbox in production (Step 34c follow-up).
+ *
+ * `EMAIL_SENDER` defaults to `resend`, so a deployment is real mail unless someone deliberately
+ * opts out - but "unless someone" is exactly the failure this guards: a forgotten variable, or a
+ * staging `.env` copied to production, would route every verification code and payment receipt
+ * into a sandbox inbox nobody reads, while the API answered 2xx and looked healthy. Refusing at
+ * boot makes that a deploy-time error rather than silent mail loss.
+ *
+ * The same shape as `assertEndpointIsNotSelectedForProduction`, and a cross-variable rule for the
+ * same reason: `EMAIL_SENDER=mailtrap` alone is fine (it is what local development wants), and
+ * `NODE_ENV=production` alone is fine; it is the pair that cannot stand.
+ *
+ * `NODE_ENV` is compared as the raw string rather than the validated enum, because this runs
+ * before validation: it has to fire on exactly the value the operator wrote.
+ */
+function assertEmailSenderIsUsable(candidate: Record<string, unknown>): void {
+  if (candidate['EMAIL_SENDER'] !== EmailProvider.Mailtrap) {
+    return;
+  }
+
+  if (candidate['NODE_ENV'] !== NodeEnvironment.Production) {
+    return;
+  }
+
+  throw new Error(
+    [
+      'Invalid environment configuration - the API refused to start.',
+      'Fix the following in your .env (see .env.example):',
+      '  - EMAIL_SENDER=mailtrap is set while NODE_ENV=production.',
+      "    Mailtrap is a local Email-Testing sandbox: it accepts mail and delivers none of it.",
+      '    In production it would swallow every verification code and payment receipt.',
+      '    Unset EMAIL_SENDER (the default is resend) - or fix NODE_ENV, if this is not',
+      '    production.',
+    ].join('\n'),
+  );
+}
+
+/**
  * `ConfigModule.forRoot({ validate })` hook.
  *
  * Runs before the app boots: coerces numeric values, then enforces the schema.
@@ -567,9 +654,10 @@ export function validate(config: Record<string, unknown>): EnvironmentVariables 
     }
   }
 
-  // Before the schema runs, so this reports its own, more specific message rather than
-  // whatever `@IsUrl()` would say about the same value.
+  // Before the schema runs, so these report their own, more specific messages rather than
+  // whatever the per-property decorators would say about the same values.
   assertEndpointIsNotSelectedForProduction(candidate);
+  assertEmailSenderIsUsable(candidate);
 
   const validated = plainToInstance(EnvironmentVariables, candidate);
   const errors = validateSync(validated, {

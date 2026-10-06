@@ -395,10 +395,48 @@ two documents is two lists that can drift apart, so the row now names the bucket
 item under — which is what "the plan itself places this in the post-MVP bucket" was asserting all
 along, and is the only evidence the deferral has.
 
+### The open findings, on one line each
 
+Thirteen, and not one of them is a plan row's status restated: **seven are still open in full** —
+F1, F2, F4, F6, F9, F11, F12 — and **six are half-built**, F3, F5, F7, F8, F10 and F13. The email
+send cap that `377ea5c` closed is not among them; it was never a plan row, which is why it is
+recorded in *After this audit* with its commit instead of here.
 
+- **F1 · SIM-swap, the device half** — the PIN and the step-up gate are built and proven; nothing in `src/` records a device, so "an auth event from a new device" cannot fire, and row B's active-session list and sign-out-everywhere route go with it. *Still open.*
+- **F2 · KMS key recovery / break-glass** — nothing exists in any form: no runbook, no re-wrap, no recovery permission. It is on the plan's own Critical list, and the limitation is *named* in `README.md` and `docs/pre-production-hardening.md` §3.0(b) — named and unbuilt is still unbuilt. *Still open.*
+- **F3 · Irreversibility, two thirds of three** — the append-only trail a dispute would be conducted from exists; the sentence telling a user there is no way back, and the support door they knock on after, do not. *Partly open.*
+- **F4 · AML/velocity, and the screening hook with it** — no amount ceiling of any kind, so there is nowhere for a sanctions or watchlist check to attach. `README.md` → *Known gaps* records it as an open product decision, honestly and deliberately, which makes the decision itself the gap. *Still open.*
+- **F5 · Ghana DPA artefact** — the practice passes (numbers masked before any log line, a recipient search that returns none, no identifier in audit metadata); the checklist, the retention policy and the data-subject note a regulator or a new engineer would read do not exist. *Partly open.*
+- **F6 · The handle profanity list** — reserved words are built, pinned as a vocabulary and proven over HTTP; nothing in `src/` or the schema matches `profan\|slur`, and no decision to leave it out is recorded anywhere. *Still open.*
+- **F7 · The Horizon fallback host** — the retryable-versus-failed classification it would serve is built and tested; the second host is a validated configuration slot that nothing queries. *Partly open.*
+- **F8 · OTP pumping, friction and the daily ceiling** — the cap fails closed at 3 per 15 minutes per number; there is no CAPTCHA and no daily ceiling, so a script can spend a number's allowance every window, indefinitely, on a live account. *Partly open.*
+- **F9 · Ghana SMS Sender ID registration** — no `from`, no NCA reference, no note. This is the one finding whose fix is not in this repository, so no test, lint gate or number in this audit can catch it: it belongs on a launch checklist. *Still open.*
+- **F10 · A machine-readable error code** — one envelope for every failure, declared on every route; no per-condition code inside it, so a client telling 409 from 404 from 429 branches on wording, and a reworded message is a silent frontend change. *Partly open.*
+- **F11 · The escalation path behind the signals** — the signals exist (the drift log line *and* its Sentry message, named boot causes on stderr, log-only diagnosis on a shell-less Render instance); who is paged, who may touch a balance to correct a drift, and what a finished incident looks like are undefined. *Still open.*
+- **F12 · `GET /v1/health/stellar`** — no such route, so health answers without touching the database or the chain, and the substitutes prove one account's reachability at a time and only when something asks. *Still open.*
+- **F13 · Log correlation** — Sentry is wired in and does real work; JSON logging and a request id are not, so nothing joins the log, Sentry and the audit table for a single request — the join an incident (F11) or a dispute (F3) would be worked with. *Partly open.*
 
+## Where this lands, in one paragraph
 
-
-
-
+The build is solid where the plan was most specific, and the solidity is mechanical rather than
+claimed: amounts are `Decimal(20, 7)` strings through `decimal.js`, every payment status change goes
+through one state machine, and both are lint gates that fail the build, so a tree grown to 219 files
+reports 0 violations in each and carries 993 unit tests (998 after `377ea5c`) that CI runs on every
+push — while the Section 6 surface is complete except `GET /v1/health/stellar` (F12), and differs
+from the plan in the three places a frontend would meet on its first call: the handle is a field on
+register rather than a route of its own, the recipient search takes `?q=` rather than `?query=`, and
+the idempotency key arrives as a header rather than in the body. What is *not* built is mostly
+out-of-scope by decision rather than missed: ECS/Fargate became Render (and Render was the plan's own
+fallback), the local `stellar/quickstart` network became real Testnet, the polling-only confirmation
+path is what the plan itself files under post-MVP, and the two capabilities this repository records
+as deliberately absent — registering with an email, and Google SSO (Step 34d) — sit outside the
+sections audited here rather than inside them as gaps. The real surprise is the thirteen findings,
+and the sharpest of them are not the ones the plan's own lists would have predicted: the KMS master
+key has no recovery procedure of any kind (F2), there is no amount ceiling for an AML rule or a
+screening hook to attach to (F4), a user is never told that a payment cannot be reversed and has
+nowhere to take a dispute (F3), the SIM-swap friction is built with no device to fire on (F1), and
+the SMS Sender ID is a launch blocker that lives entirely outside this repository, where no test,
+lint gate or number in this document can catch it (F9). And the one gap nothing planned for at all
+was found by reading the code rather than a row: a paid send on `POST /v1/auth/email` that consulted
+no counter — recorded at the end of this file with the commit that closed it, `377ea5c`, because a
+change that lands after an audit has to carry the commit it landed in.

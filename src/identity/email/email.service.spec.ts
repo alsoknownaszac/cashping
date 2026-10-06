@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { type AuditEntry, type AuditService } from '../../audit/audit.service.js';
+import { Prisma } from '../../generated/prisma/client.js';
 import { type PrismaService } from '../../prisma/prisma.service.js';
 import { type OtpCheckOutcome, type OtpService } from '../otp/otp.service.js';
 import { EmailService } from './email.service.js';
@@ -30,6 +31,11 @@ class FakePrisma {
   missing = false;
   /** What the in-transaction code consume reports; 0 simulates losing the race. */
   consumeCount = 1;
+  /**
+   * When set, the next `user.update` throws this instead of writing - how a test reaches the
+   * one failure the fake cannot otherwise produce: the write losing to the unique index.
+   */
+  setUpdateError: unknown = null;
 
   readonly setWrites: Array<Record<string, unknown>> = [];
   readonly verifyWrites: Array<Record<string, unknown>> = [];
@@ -39,6 +45,10 @@ class FakePrisma {
     findUnique: async (): Promise<{ email: string | null; emailVerifiedAt: Date | null } | null> =>
       this.missing ? null : { email: this.email, emailVerifiedAt: this.emailVerifiedAt },
     update: async ({ data }: { data: Record<string, unknown> }): Promise<unknown> => {
+      if (this.setUpdateError !== null) {
+        throw this.setUpdateError;
+      }
+
       this.setWrites.push(data);
       this.email = data['email'] as string;
       this.emailVerifiedAt = data['emailVerifiedAt'] as Date | null;
@@ -143,6 +153,34 @@ describe('EmailService.set', () => {
     expect(outcome).toEqual({ ok: false, reason: 'address_taken' });
     expect(prisma.setWrites).toEqual([]);
     expect(audit.entries).toEqual([]);
+  });
+
+  it('refuses a lost write race as the same conflict, not a 500', async () => {
+    const { prisma, otp, audit, service } = createHarness();
+
+    // The read found no holder, so it passed - but another request committed the same address
+    // between the read and this write, and the unique index is what refuses the loser.
+    prisma.setUpdateError = new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+      code: 'P2002',
+      clientVersion: '7.10.0',
+    });
+
+    const outcome = await service.set('user-1', 'raced@example.com');
+
+    expect(outcome).toEqual({ ok: false, reason: 'address_taken' });
+    // A refused write recorded nothing, and a refused attach issues no code and logs nothing.
+    expect(prisma.setWrites).toEqual([]);
+    expect(otp.issued).toEqual([]);
+    expect(audit.entries).toEqual([]);
+  });
+
+  it('lets a genuine database failure through, rather than reading it as a lost race', async () => {
+    const { prisma, service } = createHarness();
+
+    const failure = new Error('connection terminated unexpectedly');
+    prisma.setUpdateError = failure;
+
+    await expect(service.set('user-1', 'raced@example.com')).rejects.toBe(failure);
   });
 });
 
