@@ -3,6 +3,7 @@ import configuration, {
   DEFAULT_CORS_ALLOWED_ORIGINS,
   DEFAULT_FALLBACK_HORIZON_URL,
   DEFAULT_FRIENDBOT_URL,
+  DEFAULT_JSON_BODY_LIMIT,
   DEFAULT_PROVISIONING_TIMEOUT_MS,
   DEFAULT_SWAGGER_ENABLED,
 } from './configuration.js';
@@ -212,6 +213,36 @@ describe('configuration', () => {
       process.env['AWS_ENDPOINT_URL'] = 'http://localhost:4566';
 
       expect(configuration().aws.endpointUrl).toBe('http://localhost:4566');
+    });
+  });
+
+  describe('http.jsonBodyLimit', () => {
+    const originalBodyLimit = process.env['BODY_LIMIT_JSON'];
+
+    afterEach(() => {
+      restore('BODY_LIMIT_JSON', originalBodyLimit);
+    });
+
+    it('defaults to the 16kb ceiling when the variable is unset', () => {
+      delete process.env['BODY_LIMIT_JSON'];
+
+      expect(DEFAULT_JSON_BODY_LIMIT).toBe('16kb');
+      expect(configuration().http.jsonBodyLimit).toBe(DEFAULT_JSON_BODY_LIMIT);
+    });
+
+    it('takes a supplied size verbatim, because body-parser parses the unit itself', () => {
+      process.env['BODY_LIMIT_JSON'] = '1mb';
+
+      expect(configuration().http.jsonBodyLimit).toBe('1mb');
+    });
+
+    // A blank value is what `BODY_LIMIT_JSON=` in an `.env` file produces - the same
+    // belt-and-braces split as the other resolvers above: the factory always yields something
+    // usable, and `validation.schema.ts` is the half that stops the boot.
+    it('reads an empty value as unset', () => {
+      process.env['BODY_LIMIT_JSON'] = '   ';
+
+      expect(configuration().http.jsonBodyLimit).toBe(DEFAULT_JSON_BODY_LIMIT);
     });
   });
 });

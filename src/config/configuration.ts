@@ -34,6 +34,24 @@ export const DEFAULT_CORS_ALLOWED_ORIGINS = [
 export const DEFAULT_SWAGGER_ENABLED = true;
 
 /**
+ * Largest JSON request body the API will parse, when `BODY_LIMIT_JSON` is unset.
+ *
+ * Implicit before this (Step 34 follow-up): with no `limit`, Express's `json()` default of `100kb`
+ * applied silently - looser than this API needs, and invisible, since nothing in the code said what
+ * the ceiling was or why. `16kb` is the explicit answer, derived from the bodies the API actually
+ * accepts rather than picked round: the largest legitimate request across every endpoint is
+ * `POST /v1/auth/login/password` at ~408 bytes (a 254-character email plus a 128-character
+ * password), so 16 KiB is ~40x the biggest real body while still being 6.25x smaller than the
+ * `100kb` default it replaces. That leaves room for a client to pretty-print, to add fields, or to
+ * grow an email address without leaving room for the request to be a payload.
+ *
+ * The unit-suffixed string form (`16kb`) is what `body-parser`'s own `limit` option takes, so it is
+ * stored verbatim rather than converted to a byte count here - one fewer place for two numbers that
+ * are meant to be the same to drift apart.
+ */
+export const DEFAULT_JSON_BODY_LIMIT = '16kb';
+
+/**
  * Region assumed for phone numbers submitted in national format (`024 123 4567`)
  * when `PHONE_DEFAULT_REGION` is unset.
  *
@@ -414,6 +432,21 @@ export default function configuration() {
   return {
     nodeEnv: process.env.NODE_ENV ?? 'development',
     port: Number(process.env.PORT ?? 3000),
+
+    /**
+     * HTTP request-body limits.
+     *
+     * The JSON ceiling is explicit and configurable because the alternative - leaving
+     * `express.json()` at its implicit `100kb` default - is a limit nobody chose and nobody can
+     * find. `main.ts` hands this value to `app.useBodyParser('json', ...)`; the urlencoded, text
+     * and raw parsers are not registered at all, because every endpoint here speaks JSON (see
+     * `src/common/http/body-parser.ts`). `validation.schema.ts` rejects a value that is not a byte
+     * size, so `BODY_LIMIT_JSON=nope` fails the boot naming the variable rather than becoming a
+     * parser that throws on every request.
+     */
+    http: {
+      jsonBodyLimit: process.env.BODY_LIMIT_JSON?.trim() || DEFAULT_JSON_BODY_LIMIT,
+    },
 
     /**
      * Origins allowed to call the API from a browser, as a ready-to-use array.

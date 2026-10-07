@@ -467,4 +467,28 @@ describe('environment validation', () => {
   it('rejects an out-of-range SMTP_PORT, naming it', () => {
     expect(() => validate({ ...VALID_ENV, SMTP_PORT: '70000' })).toThrowError(/SMTP_PORT/);
   });
+
+  // The JSON body ceiling (Step 34 follow-up). Optional: unset, `configuration()` supplies the
+  // 16kb default. Supplied, it has to be a size `body-parser` can read, because a malformed value
+  // accepted here would otherwise throw at the *first request* - a live outage rather than a
+  // deploy-time error naming the variable.
+  describe('BODY_LIMIT_JSON', () => {
+    it('is optional, so the default in configuration.ts stands alone', () => {
+      expect(validate({ ...VALID_ENV }).BODY_LIMIT_JSON).toBeUndefined();
+    });
+
+    for (const value of ['16kb', '16KB', '1mb', '512b', '65536', '0.5mb']) {
+      it(`accepts ${JSON.stringify(value)}`, () => {
+        expect(validate({ ...VALID_ENV, BODY_LIMIT_JSON: value }).BODY_LIMIT_JSON).toBe(value);
+      });
+    }
+
+    for (const value of ['nope', '16 kilobytes', '-1', 'lots', '']) {
+      it(`rejects ${JSON.stringify(value)}, naming the variable`, () => {
+        expect(() => validate({ ...VALID_ENV, BODY_LIMIT_JSON: value })).toThrowError(
+          /BODY_LIMIT_JSON/,
+        );
+      });
+    }
+  });
 });

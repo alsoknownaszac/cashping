@@ -290,6 +290,13 @@ services:
       - key: ENABLE_SWAGGER
         value: 'true'
 
+      # The JSON request body ceiling is left at its default (`16kb`) rather than set
+      # here: the default is the value this environment wants, and an explicit line
+      # would only invite someone to raise it without the evidence `.env.example`
+      # records. Set `BODY_LIMIT_JSON` only if a future endpoint genuinely needs larger
+      # bodies - never to admit a request that is really a payload. A value that is not
+      # a byte size fails the boot, naming the variable.
+
       # No default, because a guess here is a browser that cannot reach the API:
       # a real frontend origin, or the list stays empty until somebody sets it.
       # `.env.example` records the shape the validator enforces (scheme, host,

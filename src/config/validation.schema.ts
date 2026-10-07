@@ -105,6 +105,20 @@ const CORS_ALLOWED_ORIGINS_PATTERN =
   /^\s*https?:\/\/[^\s,/:*]+(?::\d{1,5})?\s*(?:,\s*https?:\/\/[^\s,/:*]+(?::\d{1,5})?\s*)*$/;
 
 /**
+ * A body-parser size limit (`BODY_LIMIT_JSON`): a positive number with an optional unit -
+ * `16kb`, `1mb`, `512b`, `64` (bytes).
+ *
+ * Only the *shape* is checked here; whether the number is sane for this API is a judgement
+ * `.env.example` records, not something a regex should enforce (a deployment may legitimately
+ * want a larger ceiling than the 16kb default). What the pattern must catch is the value
+ * `body-parser` would choke on at the *first request* rather than at boot - `16 kilobytes`,
+ * `lots`, `-1` - because a limit that throws on every request is a live outage, whereas a value
+ * rejected here is a deploy-time error naming the variable. The unit is case-insensitive and may
+ * be separated by a space, exactly as `bytes` (body-parser's own parser) accepts it.
+ */
+const BYTE_SIZE_PATTERN = /^\d+(?:\.\d+)?\s*(?:b|kb|mb|gb|tb|pb)?$/i;
+
+/**
  * An AWS region, as used by `AWS_REGION` and inside a KMS key ARN: `eu-west-1`,
  * `us-east-1`, `ap-southeast-2`.
  *
@@ -237,6 +251,25 @@ export class EnvironmentVariables {
   @IsOptional()
   @IsBoolean()
   ENABLE_SWAGGER: boolean = true;
+
+  // --- Request body limit --------------------------------------------------
+  /**
+   * Largest JSON request body the API will parse (`app.useBodyParser('json', { limit })` in
+   * `main.ts`).
+   *
+   * Optional, and deliberately without a default here: `configuration()` owns the fallback
+   * (`DEFAULT_JSON_BODY_LIMIT`, `16kb`), so the ceiling is defined in exactly one place.
+   *
+   * A supplied value must be a body-parser size - a byte count (`65536`) or a count with a unit
+   * (`16kb`, `1mb`) - which is what `BYTE_SIZE_PATTERN` checks. The point is to fail the *boot*
+   * naming the variable, rather than to hand `body-parser` a string it rejects at the first
+   * request, which would be a live outage instead of a deploy-time error.
+   */
+  @IsOptional()
+  @Matches(BYTE_SIZE_PATTERN, {
+    message: 'BODY_LIMIT_JSON must be a byte size such as 16kb, 1mb or 65536',
+  })
+  BODY_LIMIT_JSON?: string;
 
   // --- Database ------------------------------------------------------------
   @IsUrl({ protocols: ['postgresql', 'postgres'], require_tld: false })

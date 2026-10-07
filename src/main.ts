@@ -1,9 +1,11 @@
 import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { type NestExpressApplication } from '@nestjs/platform-express';
 import * as Sentry from '@sentry/nestjs';
 import { Redis } from 'ioredis';
 import { AppModule } from './app.module.js';
 import { describeError, markBootStage, reportFatal } from './common/boot/boot-log.js';
+import { configureBodyParser } from './common/http/body-parser.js';
 import { configureCors } from './common/http/cors.js';
 import { GLOBAL_PREFIX } from './common/http/prefix.js';
 import { configureSecurityHeaders } from './common/http/security-headers.js';
@@ -185,7 +187,15 @@ async function bootstrap(): Promise<void> {
   // before it exits. A module that cannot be constructed - an unreachable
   // dependency, a KMS key that is not in the configured region - now reports
   // itself, rather than leaving an empty log and a port scan timing out.
-  const app = await NestFactory.create(AppModule, { abortOnError: false });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    abortOnError: false,
+    // Nest would otherwise register `express.json()` and `express.urlencoded()` at their own
+    // defaults - a silent 100 KB JSON limit and a urlencoded parser this API never uses. `false`
+    // registers neither, so the JSON parser `configureBodyParser` installs below is the *only*
+    // one, which is what makes its limit bind rather than sit behind a looser default (that
+    // function explains why the registration order matters).
+    bodyParser: false,
+  });
   markBootStage('Nest application created (module graph constructed)');
   // Lets onModuleDestroy close the Prisma pool on SIGTERM/SIGINT, instead of the
   // process being cut off with connections still open.
@@ -208,13 +218,21 @@ async function bootstrap(): Promise<void> {
   // ones CORS is not about (curl, healthchecks, server-to-server).
   configureSecurityHeaders(app);
 
+  // Step 34 follow-up: the explicit JSON body ceiling. Registered here - and only here - because
+  // the app was created with `bodyParser: false` above; see `configureBodyParser` for why that
+  // pairing is what makes the limit bind. The value is `BODY_LIMIT_JSON` (default 16kb), validated
+  // at boot.
+  configureBodyParser(app, config.http.jsonBodyLimit);
+
   // Frontend hand-off: let the dev servers call the API from a browser (explicit
   // origin list, never a wildcard - see `configureCors`) and serve the interactive
   // docs unless they have been switched off. Both read the same validated config
   // as everything else.
   configureCors(app, config.cors.allowedOrigins);
   const docsMounted = setupSwagger(app, config.swagger.enabled);
-  markBootStage('HTTP layer configured (global prefix, pipes, security headers, CORS, Swagger)');
+  markBootStage(
+    'HTTP layer configured (global prefix, pipes, security headers, body parsing, CORS, Swagger)',
+  );
 
   await verifyDependencies(app, config);
   markBootStage('dependencies verified (Postgres, Redis)');

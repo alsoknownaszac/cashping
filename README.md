@@ -122,6 +122,22 @@ it is no substitute for auth on an endpoint. A request with no `Origin` header a
 (curl, the container healthcheck, server-to-server) is not a CORS request and is passed
 through untouched.
 
+### Request body size limit
+
+The API parses JSON bodies up to a fixed ceiling - **`BODY_LIMIT_JSON`, default `16kb`** - and
+refuses anything larger with a **413** (`Payload Too Large`) before a controller, guard or database
+call runs. The limit is declared in `src/common/http/body-parser.ts` and applied in `main.ts` with
+`NestFactory.create(..., { bodyParser: false })` plus `app.useBodyParser('json', { limit })`, so
+there is no implicit Express default in play; no `urlencoded`, `text` or `raw` parser is registered,
+because every endpoint here speaks JSON.
+
+`16kb` is derived from the bodies the API actually accepts rather than picked round: the largest
+legitimate request across every endpoint is `POST /v1/auth/login/password` at ~408 bytes (a
+254-character email plus a 128-character password), so the ceiling is ~40x the biggest real body
+while being 6.25x tighter than the 100 KB the app silently ran with before. A value that is not a
+byte size (`BODY_LIMIT_JSON=nope`) fails startup naming the variable. Raise it here if a future
+endpoint genuinely needs larger bodies - not to let a request that is really a payload through.
+
 ### The auth flows a client implements
 
 `docs/frontend-auth-flow.md` is the client-side companion to this README: the register,
