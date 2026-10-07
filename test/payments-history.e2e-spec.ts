@@ -95,7 +95,7 @@ interface HistoryItem {
   amount: string;
   direction: string;
   recipientId: string;
-  counterparty: { id: string; handle: string | null };
+  counterparty: { id: string; handle: string | null; displayName: string | null };
   createdAt: string;
 }
 
@@ -785,8 +785,13 @@ describe('Payment history (e2e)', () => {
         expect(item.direction).toBe('sent');
         expect(item.recipientId).toBe(partner.userId);
         // The counterparty is the other account - the recipient here - and it carries the handle
-        // the partner actually claimed, joined and read back through the same query.
-        expect(item.counterparty).toEqual({ id: partner.userId, handle: partnerHandle });
+        // the partner actually claimed, joined and read back through the same query. The partner
+        // claimed no display name, so that field arrives as `null` rather than as a missing key.
+        expect(item.counterparty).toEqual({
+          id: partner.userId,
+          handle: partnerHandle,
+          displayName: null,
+        });
       }
 
       for (const item of received.items) {
@@ -794,7 +799,11 @@ describe('Payment history (e2e)', () => {
         expect(item.recipientId).toBe(viewer.userId);
         // On a `received` row the counterparty is the *sender*, which is the partner again - the
         // point of the field: a client labels both directions with the other account, never itself.
-        expect(item.counterparty).toEqual({ id: partner.userId, handle: partnerHandle });
+        expect(item.counterparty).toEqual({
+          id: partner.userId,
+          handle: partnerHandle,
+          displayName: null,
+        });
       }
 
       // `direction` is derived per caller from the row, so the same fifteen payments answer

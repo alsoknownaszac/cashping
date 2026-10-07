@@ -77,10 +77,12 @@ interface CreatedTransaction {
  *
  * `sender` and `recipient` are read so one row names the person the caller dealt with without a
  * second request per row (`counterpartyFor` picks the one that is not the caller). The `select`
- * keeps each to two fields - the id and the handle - for the same reason the list keeps to six:
- * what a page discloses is decided here, in one place, not by whatever a mapper later reaches for.
+ * keeps each to three fields - the id, the handle and the display name - for the same reason the
+ * list keeps to six: what a page discloses is decided here, in one place, not by whatever a mapper
+ * later reaches for. All three come from the *same* join, so fifty rows still cost one read and
+ * never fifty lookups into `users`.
  */
-const COUNTERPARTY_COLUMNS = { select: { id: true, handle: true } } as const;
+const COUNTERPARTY_COLUMNS = { select: { id: true, handle: true, displayName: true } } as const;
 
 const HISTORY_COLUMNS = {
   id: true,
@@ -101,12 +103,13 @@ const DETAIL_COLUMNS = {
 } as const;
 
 /**
- * One side of a row, as `COUNTERPARTY_COLUMNS` reads it: the id to resolve the account by, and
- * the handle to render until it is resolved (or instead, when there is none).
+ * One side of a row, as `COUNTERPARTY_COLUMNS` reads it: the id to resolve the account by, and the
+ * handle and display name to render it with until it is resolved (or instead, when there is none).
  */
 interface CounterpartyRow {
   readonly id: string;
   readonly handle: string | null;
+  readonly displayName: string | null;
 }
 
 /**
@@ -636,8 +639,10 @@ function toListItem(row: HistoryTransaction, userId: string): PaymentListItemDto
  * describe different accounts: `counterparty` is exactly the side `direction` names the caller
  * as not being on.
  *
- * `handle` is passed through as it is, including `null` - an account that has not claimed one is
- * not an error, and a client renders the id rather than a placeholder (`PaymentCounterpartyDto`).
+ * `handle` and `displayName` are passed through as they are, including `null` - an account that has
+ * claimed neither is not an error, and a client renders the id rather than a placeholder
+ * (`PaymentCounterpartyDto`). Both come off the same joined `User` row, which is what keeps this a
+ * projection of a read that already happened rather than a lookup per row.
  */
 function counterpartyFor(
   row: Pick<HistoryTransaction, 'senderId' | 'sender' | 'recipient'>,
@@ -645,5 +650,5 @@ function counterpartyFor(
 ): PaymentCounterpartyDto {
   const other = row.senderId === userId ? row.recipient : row.sender;
 
-  return { id: other.id, handle: other.handle };
+  return { id: other.id, handle: other.handle, displayName: other.displayName };
 }

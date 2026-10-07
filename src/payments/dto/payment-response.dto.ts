@@ -40,11 +40,12 @@ import { PaymentCounterpartyDto } from './payment-counterparty.dto.js';
  * the fewer rows that carry a machine reason, the fewer places it can be shown as if it were
  * written for a person.
  *
- * ## `counterparty`: the same two fields on both bodies
+ * ## `counterparty`: the same field on both bodies
  *
  * `counterparty` is the one field shared with `PaymentListItemDto` rather than being exclusive to
  * one of them, because the detail screen and the list label the person the same way. See
- * `PaymentCounterpartyDto` for why it carries an id and a handle and nothing richer.
+ * `PaymentCounterpartyDto` for why it carries an id, a handle and a display name and nothing
+ * richer.
  */
 export class PaymentResponseDto {
   @ApiProperty({

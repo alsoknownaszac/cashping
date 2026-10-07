@@ -534,10 +534,14 @@ describe('the unique index underneath the idempotency claim', () => {
  * that the two fields a list will not show are not even read.
  */
 
-/** One side of a row as the two reads select it: the id to resolve the account, and its handle. */
+/**
+ * One side of a row as the two reads select it: the id to resolve the account, and the two labels
+ * a row can be drawn with.
+ */
 interface Counterparty {
   id: string;
   handle: string | null;
+  displayName: string | null;
 }
 
 /** A `transactions` row, as the two reads select it. */
@@ -574,6 +578,18 @@ const HANDLES: Record<string, string> = {
   [RECIPIENT_ID]: 'kofi',
 };
 
+/**
+ * The display name each fixture account carries, keyed by id.
+ *
+ * A separate map from `HANDLES` because the two columns are nullable apart from each other: the
+ * "no handle" case below is one account that has claimed neither, and one test needs an account
+ * with a display name and no handle to show the fields do not travel together.
+ */
+const DISPLAY_NAMES: Record<string, string> = {
+  [SENDER.id]: 'Ama Mensah',
+  [RECIPIENT_ID]: 'Kofi Boateng',
+};
+
 function historyRow(overrides: Partial<HistoryRow> = {}): HistoryRow {
   const senderId = overrides.senderId ?? SENDER.id;
   const recipientId = overrides.recipientId ?? RECIPIENT_ID;
@@ -585,8 +601,16 @@ function historyRow(overrides: Partial<HistoryRow> = {}): HistoryRow {
     status: TransactionStatus.SUCCESSFUL,
     amount: '123456789012.1234567',
     createdAt: CREATED_AT,
-    sender: { id: senderId, handle: HANDLES[senderId] ?? null },
-    recipient: { id: recipientId, handle: HANDLES[recipientId] ?? null },
+    sender: {
+      id: senderId,
+      handle: HANDLES[senderId] ?? null,
+      displayName: DISPLAY_NAMES[senderId] ?? null,
+    },
+    recipient: {
+      id: recipientId,
+      handle: HANDLES[recipientId] ?? null,
+      displayName: DISPLAY_NAMES[recipientId] ?? null,
+    },
     ...overrides,
   };
 }
@@ -595,8 +619,8 @@ function detailedRow(overrides: Partial<DetailedRow> = {}): DetailedRow {
   return { ...historyRow(), failureReason: null, stellarTxHash: null, ...overrides };
 }
 
-/** The two fields the counterparty relations are narrowed to. */
-const COUNTERPARTY_SELECT = { select: { id: true, handle: true } } as const;
+/** The three fields the counterparty relations are narrowed to. */
+const COUNTERPARTY_SELECT = { select: { id: true, handle: true, displayName: true } } as const;
 
 /** The columns the list reads, in one place so the "not even read" assertion is one line. */
 const LIST_SELECT = {
@@ -741,6 +765,20 @@ describe('one payment, by id', () => {
     expect(response.stellarTxHash).toBe(TX_HASH);
   });
 
+  it('names the counterparty on one payment with the same three fields the list carries', async () => {
+    const harnessed = readHarness({ row: detailedRow() });
+
+    const response = await harnessed.service.findOne(SENDER.id, PAYMENT_ID);
+
+    // Same projection as a list row, because both bodies share one DTO: a detail screen and a list
+    // label the person identically, and the fields come off the row the read already joined.
+    expect(response.counterparty).toEqual({
+      id: RECIPIENT_ID,
+      handle: 'kofi',
+      displayName: 'Kofi Boateng',
+    });
+  });
+
   it('reaches no wallet, no allowance, no queue and no audit table', async () => {
     const harnessed = readHarness({ row: detailedRow() });
 
@@ -821,7 +859,7 @@ describe('a page of history', () => {
         amount: '123456789012.1234567',
         direction: 'sent',
         recipientId: RECIPIENT_ID,
-        counterparty: { id: RECIPIENT_ID, handle: 'kofi' },
+        counterparty: { id: RECIPIENT_ID, handle: 'kofi', displayName: 'Kofi Boateng' },
         createdAt: CREATED_AT.toISOString(),
       },
       {
@@ -830,24 +868,33 @@ describe('a page of history', () => {
         amount: '123456789012.1234567',
         direction: 'received',
         recipientId: SENDER.id,
-        counterparty: { id: RECIPIENT_ID, handle: 'kofi' },
+        counterparty: { id: RECIPIENT_ID, handle: 'kofi', displayName: 'Kofi Boateng' },
         createdAt: CREATED_AT.toISOString(),
       },
     ]);
   });
 
-  it('names the account the caller dealt with, and hands a missing handle back as null', async () => {
+  it('names the account the caller dealt with, and hands an unset label back as null', async () => {
     const harnessed = readHarness({
       rows: [
         // The caller sent this one: the counterparty is the *recipient*.
         historyRow({ id: 'sent', senderId: SENDER.id, recipientId: RECIPIENT_ID }),
-        // The caller received this one: the counterparty is the *sender*, and that account has not
-        // claimed a handle - which travels as `null` rather than being dropped or defaulted.
+        // The caller received this one: the counterparty is the *sender*, and that account has
+        // claimed neither a handle nor a display name - both travel as `null` rather than being
+        // dropped or defaulted to the id.
         historyRow({
           id: 'received',
           senderId: RECIPIENT_ID,
           recipientId: SENDER.id,
-          sender: { id: RECIPIENT_ID, handle: null },
+          sender: { id: RECIPIENT_ID, handle: null, displayName: null },
+        }),
+        // An account that set a display name and no handle: the two columns are nullable apart from
+        // each other, so neither may be derived from the other in the response.
+        historyRow({
+          id: 'half-named',
+          senderId: SENDER.id,
+          recipientId: RECIPIENT_ID,
+          recipient: { id: RECIPIENT_ID, handle: null, displayName: 'Kofi Boateng' },
         }),
       ],
     });
@@ -855,8 +902,9 @@ describe('a page of history', () => {
     const page = await harnessed.service.history(SENDER.id, {});
 
     expect(page.items.map((item) => item.counterparty)).toEqual([
-      { id: RECIPIENT_ID, handle: 'kofi' },
-      { id: RECIPIENT_ID, handle: null },
+      { id: RECIPIENT_ID, handle: 'kofi', displayName: 'Kofi Boateng' },
+      { id: RECIPIENT_ID, handle: null, displayName: null },
+      { id: RECIPIENT_ID, handle: null, displayName: 'Kofi Boateng' },
     ]);
   });
 
