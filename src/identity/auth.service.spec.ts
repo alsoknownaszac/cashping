@@ -80,6 +80,12 @@ interface FakeUser {
    * seeds it here.
    */
   stellarAccount: { id: string } | null;
+  /**
+   * The scrypt hash `PasswordService` writes (Step 34c), or `null` for an account that has never set
+   * a password - which is every account until one is set, and every Google-SSO account. `session`
+   * reads it to answer `hasPassword`, and the hash itself never reaches a response.
+   */
+  passwordHash: string | null;
 }
 
 /** The two tables `AuthService` touches, plus a log of the calls it made. */
@@ -183,6 +189,8 @@ class FakePrisma {
         status: UserStatus.PENDING_VERIFICATION,
         phoneVerifiedAt: null,
         transactionPinHash: args.data.transactionPinHash ?? null,
+        // Registration writes no password either: `POST /auth/password` sets one later, if ever.
+        passwordHash: null,
         // Registration writes no address (Step 34c): an address arrives later, at `POST /auth/email`.
         email: null,
         emailVerifiedAt: null,
@@ -624,6 +632,9 @@ function seedUser(prisma: FakePrisma, overrides: Partial<FakeUser> = {}): FakeUs
     // credential once `emailVerifiedAt` is set.
     email: null,
     emailVerifiedAt: null,
+    // No password until a test sets one - the state an OTP-only account is in, and what
+    // `hasPassword: false` reports.
+    passwordHash: null,
     // Step 19: no wallet until a provisioning writes one - the honest default for a seeded row.
     stellarAccount: null,
     ...overrides,
@@ -1443,6 +1454,7 @@ describe('AuthService.session', () => {
       handle: 'miriam_owusu',
       phoneVerifiedAt: new Date('2026-09-26T09:00:00.000Z'),
       transactionPinHash: 'scrypt$seeded',
+      passwordHash: 'scrypt$seeded-password',
       email: 'miriam@example.com',
       emailVerifiedAt: new Date('2026-09-27T09:00:00.000Z'),
       stellarAccount: { id: 'account-1' },
@@ -1460,12 +1472,16 @@ describe('AuthService.session', () => {
       onboarding: {
         hasWallet: true,
         hasPin: true,
+        hasPassword: true,
         hasEmail: true,
         emailVerified: true,
         phoneVerified: true,
       },
     });
     expect(prisma.calls).toEqual(['findUnique']);
+    // Booleans only, asserted rather than promised: the two credential columns this read selects to
+    // answer `hasPin` and `hasPassword` are nowhere in the body.
+    expect(JSON.stringify(response)).not.toContain('scrypt');
   });
 
   it('reports every onboarding step as not-done on a freshly verified row', async () => {
@@ -1477,10 +1493,28 @@ describe('AuthService.session', () => {
     expect(response.onboarding).toEqual({
       hasWallet: false,
       hasPin: false,
+      hasPassword: false,
       hasEmail: false,
       emailVerified: false,
       phoneVerified: true,
     });
+  });
+
+  it('answers whether a password exists, in a block of booleans and nothing else', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, {
+      id: 'user-9',
+      status: UserStatus.ACTIVE,
+      passwordHash: 'scrypt$n=1$salt$hash',
+    });
+
+    const response = await auth.session(caller);
+
+    expect(response.onboarding.hasPassword).toBe(true);
+    // The column decides one boolean and does not travel, and every other field is a boolean too -
+    // so the block is safe to log or cache, which is what "booleans only" buys.
+    expect(JSON.stringify(response)).not.toContain('scrypt');
+    expect(Object.values(response.onboarding).every((flag) => typeof flag === 'boolean')).toBe(true);
   });
 
   it('tells an attached email from a verified one, the way the columns do', async () => {

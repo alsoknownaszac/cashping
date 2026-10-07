@@ -773,15 +773,24 @@ export class AuthService {
    * those. The onboarding block is a *different* set of facts the guard deliberately does not
    * carry: that read is on the hot path of every authenticated request and stays narrow (id,
    * number, status, handle), while this endpoint is called once on launch and is the only place
-   * that needs a wallet's existence, a PIN's presence and the two verification instants. Reading
-   * them here, in one primary-key lookup, is cheaper than making every request pay for a join
-   * nine times in ten will not use.
+   * that needs a wallet's existence, a PIN's presence, a password's presence and the two
+   * verification instants. Reading them here, in one primary-key lookup, is cheaper than making
+   * every request pay for a join nine times in ten will not use.
+   *
+   * Every flag is `x != null` over one column and nothing else, so the block is booleans by
+   * construction. The two credential columns (`transactionPinHash`, `passwordHash`) are read to
+   * decide a `has*` and never travel: the block says whether a password exists, which is what a
+   * client needs to choose between "set one" and "change it", and holds no material that could be
+   * replayed. `passwordHash` is selected for exactly this one comparison.
    */
   async session(user: SessionUser): Promise<SessionResponseDto> {
     const onboarding = await this.prisma.user.findUnique({
       where: { id: user.id },
       select: {
         transactionPinHash: true,
+        // Read for `hasPassword` and nothing else: the boolean leaves, the hash does not, which is
+        // why this is a `select` of one column and not `include` of the whole row.
+        passwordHash: true,
         email: true,
         emailVerifiedAt: true,
         phoneVerifiedAt: true,
@@ -799,6 +808,7 @@ export class AuthService {
       onboarding: {
         hasWallet: onboarding?.stellarAccount != null,
         hasPin: onboarding?.transactionPinHash != null,
+        hasPassword: onboarding?.passwordHash != null,
         hasEmail: onboarding?.email != null,
         emailVerified: onboarding?.emailVerifiedAt != null,
         phoneVerified: onboarding?.phoneVerifiedAt != null,

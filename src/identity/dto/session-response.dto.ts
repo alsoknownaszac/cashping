@@ -6,8 +6,11 @@ import { UserStatus } from '../../generated/prisma/enums.js';
  *
  * A session and a set-up account are two different things, and the launch flow has to tell them
  * apart: an account can be `ACTIVE` - its phone number proved - and still have no wallet, no
- * transaction PIN and no email. Each field is one onboarding step the app can send the user to,
- * and all five are read fresh; none is in the access token, which carries only the user id.
+ * transaction PIN, no password and no email. Each field is one onboarding step the app can send the
+ * user to, and all six are read fresh; none is in the access token, which carries only the user id.
+ * Every one of them is a boolean about a credential or a verification, never the credential: this
+ * block is safe to log, cache and show, which is the point of answering "has one?" rather than
+ * "which one?".
  *
  * `hasEmail` and `emailVerified` are deliberately two fields rather than one: an address is
  * *attached* by `POST /auth/email` and only becomes a credential once a code proves it, so a
@@ -29,6 +32,13 @@ export class SessionOnboardingDto {
     example: true,
   })
   hasPin!: boolean;
+
+  @ApiProperty({
+    description:
+      'Whether a password is set. `false` for a Google-SSO account (Step 34d) and for an OTP-only account that never went on to set one - the two cases a "create a password" screen is for. Whether one exists, never what it is.',
+    example: false,
+  })
+  hasPassword!: boolean;
 
   @ApiProperty({
     description: 'Whether an email address is attached, whether or not a code has proved it.',
