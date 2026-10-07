@@ -143,13 +143,19 @@ class FakePrisma {
      * that column rather than scanning an `OR` across both (Step 34c).
      */
     findUnique: async (args: {
-      where: { id?: string; phoneNumber?: string; email?: string };
+      where: { id?: string; phoneNumber?: string; email?: string; handle?: string };
     }): Promise<FakeUser | null> => {
       this.calls.push('findUnique');
 
       // `session` reads by id, the two sign-in paths by their identifier (Step 34c).
       if (args.where.id !== undefined) {
         return [...this.users.values()].find((user) => user.id === args.where.id) ?? null;
+      }
+
+      // `resolveHandle` looks a handle up by the handle column - the availability courtesy check
+      // behind both registration and `changeHandle`.
+      if (args.where.handle !== undefined) {
+        return [...this.users.values()].find((user) => user.handle === args.where.handle) ?? null;
       }
 
       if (args.where.email !== undefined) {
@@ -440,6 +446,17 @@ class FakePinService {
     this.verified.push({ userId, pin });
 
     return this.verifyOutcome;
+  };
+
+  /** The reset writer (the forgot-PIN flow), which writes without proving the current PIN. */
+  readonly resetCalls: Array<{ userId: string; pin: string }> = [];
+
+  resetResult = new Date('2026-10-04T10:00:00.000Z');
+
+  reset = async (userId: string, pin: string): Promise<Date> => {
+    this.resetCalls.push({ userId, pin });
+
+    return this.resetResult;
   };
 }
 
@@ -1542,6 +1559,152 @@ describe('AuthService.register and the transaction PIN (Step 34a)', () => {
     // invents one: the columns the row already had are the columns it keeps.
     expect(prisma.users.size).toBe(1);
     expect(prisma.users.get(E164_NUMBER)?.transactionPinHash).toBe('scrypt$seeded');
+  });
+});
+
+describe('AuthService.changeHandle', () => {
+  /** The signed-in caller the endpoint receives, as `JwtStrategy` would have left it. */
+  const session: SessionUser = {
+    id: 'user-1',
+    phoneNumber: E164_NUMBER,
+    status: UserStatus.ACTIVE,
+    handle: 'ama_1',
+  };
+
+  it('writes the canonical handle and records the set with source change', async () => {
+    const { auth, prisma, audit } = createHarness();
+    const user = seedUser(prisma, { id: 'user-1', handle: 'ama_1' });
+
+    await expect(auth.changeHandle(session, { handle: '@New_Handle' })).resolves.toEqual({
+      handle: 'new_handle',
+    });
+
+    // The stored value is the canonical form, not the spelling that arrived.
+    expect(user.handle).toBe('new_handle');
+    // The same literal registration writes, told apart by `source` - which is the field the trail
+    // is read for.
+    expect(audit.entries).toEqual([
+      {
+        action: 'user.handle.set',
+        userId: 'user-1',
+        outcome: 'ok',
+        metadata: { handle: 'new_handle', source: 'change' },
+      },
+    ]);
+  });
+
+  it('accepts the handle the account already holds as a no-op', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, { id: 'user-1', handle: 'ama_1' });
+
+    await expect(auth.changeHandle(session, { handle: 'ama_1' })).resolves.toEqual({
+      handle: 'ama_1',
+    });
+  });
+
+  it('refuses a handle another account holds with a 409, writing nothing', async () => {
+    const { auth, prisma, audit } = createHarness();
+    seedUser(prisma, { id: 'user-2', phoneNumber: '+233200000002', handle: 'taken' });
+    seedUser(prisma, { id: 'user-1', handle: 'ama_1' });
+
+    const { status } = await captureHttpError(() =>
+      auth.changeHandle(session, { handle: 'taken' }),
+    );
+
+    expect(status).toBe(409);
+    expect(audit.entries).toEqual([]);
+  });
+
+  it('refuses a reserved handle with a 400 that names the rule', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, { id: 'user-1', handle: 'ama_1' });
+
+    const { status, message } = await captureHttpError(() =>
+      auth.changeHandle(session, { handle: 'support' }),
+    );
+
+    // A 400 rather than a 409: a reserved name cannot be freed, so waiting and retrying is not a
+    // thing the caller can do - it is the same class of answer as a bad character.
+    expect(status).toBe(400);
+    expect(message).toContain('reserved');
+  });
+});
+
+describe('AuthService.requestPinReset', () => {
+  it('sends a code and records the request when the number is an active account', async () => {
+    const { auth, prisma, otp, notifications, limiter, audit } = createHarness();
+    const user = seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+
+    const response = await auth.requestPinReset({ phoneNumber: E164_NUMBER });
+
+    expect(otp.issued).toEqual([user.id]);
+    expect(notifications.sent).toEqual([{ phoneNumber: E164_NUMBER, code: '654321' }]);
+    expect(limiter.consumed).toEqual([E164_NUMBER]);
+    expect(response).toEqual({
+      phoneNumber: E164_NUMBER,
+      expiresAt: otp.issueResult.expiresAt.toISOString(),
+      codeLength: 6,
+    });
+    expect(audit.entries).toEqual([
+      { action: 'auth.pin.reset.requested', userId: user.id, outcome: 'ok' },
+    ]);
+  });
+
+  it('is not an existence oracle: an unknown number gets the same shape and no send', async () => {
+    const { auth, otp, notifications, limiter, audit } = createHarness();
+
+    const response = await auth.requestPinReset({ phoneNumber: E164_NUMBER });
+
+    // Nothing was issued, sent, counted or recorded - the same "no code for an unknown number"
+    // rule the password reset follows - and the body is the same three fields either way.
+    expect(otp.issued).toEqual([]);
+    expect(notifications.sent).toEqual([]);
+    expect(limiter.consumed).toEqual([]);
+    expect(audit.entries).toEqual([]);
+    expect(response.phoneNumber).toBe(E164_NUMBER);
+    expect(typeof response.expiresAt).toBe('string');
+    expect(response.codeLength).toBe(6);
+  });
+});
+
+describe('AuthService.confirmPinReset', () => {
+  const dto = { phoneNumber: E164_NUMBER, code: '123456', pin: '1234' };
+
+  it('checks and spends the code, then writes the PIN and records the completion', async () => {
+    const { auth, prisma, otp, pins, audit } = createHarness();
+    const user = seedUser(prisma, { status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
+    pins.resetResult = new Date('2026-10-04T10:00:00.000Z');
+
+    const response = await auth.confirmPinReset(dto);
+
+    expect(otp.checked).toEqual([{ userId: user.id, code: '123456' }]);
+    // Spent before the write, so a double-tapped confirm cannot write twice.
+    expect(prisma.calls).toContain('consume');
+    expect(pins.resetCalls).toEqual([{ userId: user.id, pin: '1234' }]);
+    expect(response).toEqual({ pinSetAt: '2026-10-04T10:00:00.000Z' });
+    expect(audit.entries).toEqual([
+      { action: 'auth.pin.reset.completed', userId: user.id, outcome: 'ok' },
+    ]);
+  });
+
+  it('answers an unknown number with a 400, not a 404', async () => {
+    const { auth, pins } = createHarness();
+
+    const { status } = await captureHttpError(() => auth.confirmPinReset(dto));
+
+    // Whether the number exists is not something an unauthenticated reset endpoint should answer.
+    expect(status).toBe(400);
+    expect(pins.resetCalls).toEqual([]);
+  });
+
+  it('refuses a suspended account with a 403 before touching the code', async () => {
+    const { auth, prisma, pins } = createHarness();
+    seedUser(prisma, { status: UserStatus.SUSPENDED });
+
+    const { status } = await captureHttpError(() => auth.confirmPinReset(dto));
+
+    expect(status).toBe(403);
+    expect(pins.resetCalls).toEqual([]);
   });
 });
 

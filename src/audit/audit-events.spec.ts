@@ -27,7 +27,7 @@ describe('the action vocabulary', () => {
     expect(new Set(AUDIT_ACTIONS).size).toBe(AUDIT_ACTIONS.length);
   });
 
-  it('is the nineteen actions of Steps 32, 34a, 34b and 34c, and deliberately nothing else', () => {
+  it('is the twenty-one actions of Steps 32, 34a, 34b and 34c, and deliberately nothing else', () => {
     // Written out rather than counted, because adding one is a decision about what this table is
     // for, and a decision should have to touch this list - the same reason `AUDIT_ACTIONS` is a
     // union rather than a `string`.
@@ -38,6 +38,8 @@ describe('the action vocabulary', () => {
       'auth.pin.changed',
       'auth.pin.verified',
       'auth.pin.failed',
+      'auth.pin.reset.requested',
+      'auth.pin.reset.completed',
       'auth.password.set',
       'auth.password.changed',
       'auth.password.login',

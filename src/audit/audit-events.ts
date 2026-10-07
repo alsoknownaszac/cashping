@@ -34,9 +34,12 @@ export const AUDIT_ACTIONS = [
    */
   'auth.pin.set',
   /**
-   * The transaction PIN was replaced by a caller who proved the current one
-   * (`PinService.change`). The proof itself is not a second entry: setting the new PIN *is*
-   * the act this records.
+   * The transaction PIN was replaced, by proving the current one or by an SMS reset
+   * (`PinService.change`, `PinService.reset`). One literal for both writers, matching
+   * `auth.password.changed`: a change and a reset are the same fact - "the PIN in force was
+   * replaced" - and the proof that stood in for the old PIN has its own entry below
+   * (`auth.pin.reset.completed` for a reset; a change's proof *is* the write, so it is not a
+   * second entry).
    */
   'auth.pin.changed',
   /**
@@ -60,6 +63,20 @@ export const AUDIT_ACTIONS = [
    * their PIN" the same row, and the first of those is the one a lockout report is read for.
    */
   'auth.pin.failed',
+  /**
+   * A forgot-PIN reset was started for an account (`AuthService.requestPinReset`). Written only
+   * when the number resolved to an account: a request for an unknown number sends nothing and
+   * changes nothing, so there is no row to write - which is also why this entry is not an
+   * enumeration oracle despite the HTTP answer being identical either way.
+   */
+  'auth.pin.reset.requested',
+  /**
+   * A PIN reset was completed: the SMS code was accepted and a new PIN written
+   * (`AuthService.confirmPinReset`). The credential's change itself is `auth.pin.changed`; this
+   * entry is the *reset flow* finishing, which is what an operator asking "how did this account
+   * get a new PIN without knowing the old one" is actually asking.
+   */
+  'auth.pin.reset.completed',
   /**
    * The account password was written where there was none (Step 34b, `PasswordService.change`).
    *
@@ -118,9 +135,13 @@ export const AUDIT_ACTIONS = [
    */
   'auth.email.verified',
   /**
-   * A handle was claimed (`AuthService.register`). Registration is the only writer: there is no
-   * change-handle endpoint, which is why the checklist item reads "handle change" and the entry
-   * is named for the write that actually happens.
+   * A handle was set (`AuthService.register`, `AuthService.changeHandle`).
+   *
+   * Two writers, distinguished by `metadata.source`: registration (`registration` for a first
+   * claim and `resend` for the pending-account path) and the change endpoint (`PATCH /auth/handle`,
+   * `change`). One literal for both, for the same reason `auth.pin.changed` has one: "a handle was
+   * set" is one fact, and the source says which writer produced it. The checklist item reads
+   * "handle change" for the same reason - the write is the event.
    */
   'user.handle.set',
   /** A payment row was created and its submission queued (`PaymentsService.create`). */

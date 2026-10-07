@@ -42,7 +42,21 @@ const PROTECTED_GET_PATHS = new Set([
   `/${GLOBAL_PREFIX}/recipients/{id}`,
   `/${GLOBAL_PREFIX}/wallet/account`,
   `/${GLOBAL_PREFIX}/wallet/balance`,
+  // The deposits read is guarded like its two siblings: it is the caller's own wallet, so a
+  // tokenless request is a 401 and never a 200.
+  `/${GLOBAL_PREFIX}/wallet/deposits`,
 ]);
+
+/**
+ * The documented non-GET, non-POST methods that carry `JwtAuthGuard`, and therefore answer 401 to
+ * the tokenless request this file makes.
+ *
+ * Today that is exactly one route - `PATCH /auth/handle` - which is why the set exists at all: the
+ * loop below grew a `patch` branch when the handle-change endpoint arrived, and the failure it is
+ * here to turn red is the one the other two sets name - a guarded method answering as if it were
+ * unguarded (a 400 at the validation pipe, meaning the guard is not attached).
+ */
+const PROTECTED_PATCH_PATHS = new Set([`/${GLOBAL_PREFIX}/auth/handle`]);
 
 /**
  * The documented POSTs that carry `JwtAuthGuard`, and therefore answer 401 rather than the 400 an
@@ -126,6 +140,7 @@ describe('Frontend hand-off (e2e)', () => {
       `/${GLOBAL_PREFIX}`,
       `/${GLOBAL_PREFIX}/auth/email`,
       `/${GLOBAL_PREFIX}/auth/email/verify`,
+      `/${GLOBAL_PREFIX}/auth/handle`,
       `/${GLOBAL_PREFIX}/auth/login`,
       `/${GLOBAL_PREFIX}/auth/login/otp`,
       `/${GLOBAL_PREFIX}/auth/login/password`,
@@ -135,6 +150,8 @@ describe('Frontend hand-off (e2e)', () => {
       `/${GLOBAL_PREFIX}/auth/password/reset`,
       `/${GLOBAL_PREFIX}/auth/password/reset/confirm`,
       `/${GLOBAL_PREFIX}/auth/pin/change`,
+      `/${GLOBAL_PREFIX}/auth/pin/reset/confirm`,
+      `/${GLOBAL_PREFIX}/auth/pin/reset/request`,
       `/${GLOBAL_PREFIX}/auth/pin/verify`,
       `/${GLOBAL_PREFIX}/auth/refresh`,
       `/${GLOBAL_PREFIX}/auth/register`,
@@ -146,6 +163,7 @@ describe('Frontend hand-off (e2e)', () => {
       `/${GLOBAL_PREFIX}/recipients/{id}`,
       `/${GLOBAL_PREFIX}/wallet/account`,
       `/${GLOBAL_PREFIX}/wallet/balance`,
+      `/${GLOBAL_PREFIX}/wallet/deposits`,
     ]);
   });
 
@@ -186,7 +204,9 @@ describe('Frontend hand-off (e2e)', () => {
             ? request(app.getHttpServer()).get(path)
             : method === 'post'
               ? request(app.getHttpServer()).post(path)
-              : undefined;
+              : method === 'patch'
+                ? request(app.getHttpServer()).patch(path)
+                : undefined;
 
         if (call === undefined) {
           throw new Error(`${where} is documented, but this test cannot call that method`);
@@ -204,12 +224,18 @@ describe('Frontend hand-off (e2e)', () => {
           expect(response.status, `${where} should answer`).toBe(
             PROTECTED_GET_PATHS.has(path) ? 401 : 200,
           );
-        } else {
+        } else if (method === 'post') {
           // Routed, and either the body is refused (what the global validation pipe is for, and
           // proof it is wired into this app rather than only into `main.ts`) or the guard answers
           // first because this route is protected.
           expect(response.status, `${where} should answer`).toBe(
             PROTECTED_POST_PATHS.has(path) ? 401 : 400,
+          );
+        } else {
+          // Any other routed method (today just PATCH): guarded answers 401, and an unguarded one
+          // would answer 400 at the validation pipe. Same split as POST, a different set of names.
+          expect(response.status, `${where} should answer`).toBe(
+            PROTECTED_PATCH_PATHS.has(path) ? 401 : 400,
           );
         }
       }

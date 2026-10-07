@@ -1,4 +1,13 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Patch,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiCreatedResponse,
@@ -10,11 +19,14 @@ import {
 } from '@nestjs/swagger';
 import { ApiErrorResponses } from '../common/http/swagger.js';
 import { AuthService } from './auth.service.js';
+import { ChangeHandleDto } from './dto/change-handle.dto.js';
 import { ChangePasswordDto } from './dto/change-password.dto.js';
 import { ChangePinDto } from './dto/change-pin.dto.js';
 import { ConfirmPasswordResetDto } from './dto/confirm-password-reset.dto.js';
+import { ConfirmPinResetDto } from './dto/confirm-pin-reset.dto.js';
 import { EmailSetResponseDto } from './dto/email-set-response.dto.js';
 import { EmailVerifyResponseDto } from './dto/email-verify-response.dto.js';
+import { HandleResponseDto } from './dto/handle-response.dto.js';
 import { LoginCodeResponseDto } from './dto/login-code-response.dto.js';
 import { LoginDto, LoginResponseDto } from './dto/login.dto.js';
 import { LoginPasswordDto } from './dto/login-password.dto.js';
@@ -363,6 +375,48 @@ export class AuthController {
     return this.authService.session(user);
   }
 
+  @Patch('handle')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Set or change your handle',
+    description: [
+      'Claims a handle for the signed-in account, or replaces the one it already holds. The handle is the identifier another user types to send money, so it is the value `GET /v1/auth/session` reports and the one this response echoes back.',
+      '',
+      'The rules are the ones registration applies, from the same module: 3-20 characters of letters, digits and underscores, stored and matched lower-cased (so `@Miriam` is stored as `miriam`, and one account can hold what another tried to). A leading `@` is accepted and stripped.',
+      '',
+      'A handle another account already holds is a 409; a handle that can never be valid (too short, too long, a bad character, or a reserved name like `support`) is a 400 naming the rule that broke. Changing to the handle the account already has is accepted and changes nothing.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: HandleResponseDto,
+    description: 'The handle is now in force, canonical, and the old one no longer resolves.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description:
+        'The body is missing `handle`, or the handle is too short, too long, contains a character a handle may not, or is a reserved name. The message names the rule that broke.',
+    },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 409,
+      description: 'Another account already holds that handle. Try a different one.',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  changeHandle(
+    @CurrentUser() user: SessionUser,
+    @Body() dto: ChangeHandleDto,
+  ): Promise<HandleResponseDto> {
+    return this.authService.changeHandle(user, dto);
+  }
+
   @Post('pin/change')
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtAuthGuard)
@@ -614,6 +668,68 @@ export class AuthController {
   ])
   confirmPasswordReset(@Body() dto: ConfirmPasswordResetDto): Promise<PasswordSetResponseDto> {
     return this.authService.confirmPasswordReset(dto);
+  }
+
+  @Post('pin/reset/request')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: 'Start a PIN reset',
+    description: [
+      'Begins a forgot-PIN reset by texting a code to the number, reusing the OTP machinery (a reset code is an OTP with a different purpose, not a second code system). The PIN is the second factor in front of money, and this is the one way to replace it without knowing it - the phone number does the proving.',
+      '',
+      'Answers **202 whether or not the number belongs to an account**, and the body is the same either way - this endpoint must not be an existence oracle. A code is sent, and an audit row written, only when the number really resolves to an `ACTIVE` account.',
+    ].join('\n'),
+  })
+  @ApiResponse({
+    status: HttpStatus.ACCEPTED,
+    type: LoginCodeResponseDto,
+    description:
+      'A code was sent if the number belongs to an account. The response is identical either way.',
+  })
+  @ApiErrorResponses([
+    { status: 400, description: 'The number is not a valid phone number.' },
+    {
+      status: 429,
+      description:
+        'Too many codes have been requested for this number in the current window. The message says how long to wait.',
+    },
+    {
+      status: 503,
+      description: 'No code could be sent (SMS provider or the request counter is unreachable).',
+    },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  requestPinReset(@Body() dto: SubmittedPhoneNumberDto): Promise<LoginCodeResponseDto> {
+    return this.authService.requestPinReset(dto);
+  }
+
+  @Post('pin/reset/confirm')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Finish a PIN reset',
+    description: [
+      'Checks the reset code and writes the new PIN. The code is checked and spent exactly as it is at verification and sign-in - the same lifetime, attempt count and single-use rules - so a wrong or expired code is a 400 and an exhausted one is a 429.',
+      '',
+      'The code is spent before the new PIN is written, so a double-tapped confirm cannot write twice, and the new PIN clears any lockout: the account holder is here, holding the phone, which is what the reset is for.',
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: PinChangeResponseDto,
+    description: 'The code was accepted and the PIN is replaced.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description:
+        'The body failed validation, or the code is wrong, expired, or no reset is outstanding.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    { status: 409, description: 'That code has already been used.' },
+    { status: 429, description: 'Too many incorrect code attempts. Request a new one.' },
+    { status: 500, description: 'Unexpected failure, in the shared error shape.' },
+  ])
+  confirmPinReset(@Body() dto: ConfirmPinResetDto): Promise<PinChangeResponseDto> {
+    return this.authService.confirmPinReset(dto);
   }
 
   @Post('email')

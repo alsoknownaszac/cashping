@@ -196,6 +196,34 @@ export class PinService {
   }
 
   /**
+   * Writes a new PIN without proving the old one, for the forgot-PIN reset flow.
+   *
+   * The one path to a PIN that does not go through `change`, and it exists because a user who
+   * has *forgotten* their four digits has, by definition, nothing to prove to `change`: the
+   * proof that stands in for the old PIN is possession of the phone, established by the reset
+   * code the caller checked before reaching here. That is the same trade `PasswordService.set`
+   * makes for a forgotten password, and it is why this method is only ever called from
+   * `AuthService.confirmPinReset`, after the code was accepted and spent.
+   *
+   * `writePin` clears the attempt counter and any lock, which is right for the same reason it
+   * is on a change: a new PIN is a new credential, and the guesses made against the old one are
+   * not facts about this one. So a reset also lifts a lockout, which is the honest answer - the
+   * account holder is demonstrably here, holding the phone.
+   *
+   * The audit entry is `auth.pin.changed` rather than a literal of its own, matching the
+   * password precedent: "the PIN in force was replaced" is one fact whatever proof was
+   * accepted, and the proof - the reset code that was just spent - has its own entry in
+   * `AuthService.confirmPinReset` (`auth.pin.reset.completed`).
+   */
+  async reset(userId: string, pin: string): Promise<Date> {
+    const pinSetAt = await this.writePin(userId, pin);
+
+    await this.audit.log({ action: 'auth.pin.changed', userId, outcome: 'ok' });
+
+    return pinSetAt;
+  }
+
+  /**
    * The columns this service reads, or a 401 if the row is gone.
    *
    * `JwtStrategy` has already read the user for this request, so the only way to reach

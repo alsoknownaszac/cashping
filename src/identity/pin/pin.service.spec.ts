@@ -346,6 +346,50 @@ describe('PinService.change', () => {
   });
 });
 
+describe('PinService.reset', () => {
+  /**
+   * The forgot-PIN write: no current PIN to prove, because the reset code stood in for it. What
+   * this asserts is that it writes a fresh hash, clears the attempt state a forgotten PIN may be
+   * carrying - including a live lock - and records the change with the same literal a change uses.
+   */
+  it('replaces the PIN without proving the old one, and clears the lockout', async () => {
+    const { pins, prisma, audit } = createHarness();
+    const row = prisma.insert({
+      transactionPinHash: correctHash,
+      transactionPinAttempts: 4,
+      transactionPinLockedUntil: new Date(Date.now() + 60_000),
+    });
+
+    const pinSetAt = await pins.reset(USER_ID, WRONG_PIN);
+
+    expect(pinSetAt).toBeInstanceOf(Date);
+    expect(row.transactionPinHash).toMatch(/^scrypt\$/);
+    expect(row.transactionPinHash).not.toBe(correctHash);
+    // A reset lifts a lock and clears the counter: the holder is demonstrably here, holding the phone.
+    expect(row.transactionPinAttempts).toBe(0);
+    expect(row.transactionPinLockedUntil).toBeNull();
+    expect(audit.entries).toEqual([
+      { action: 'auth.pin.changed', userId: USER_ID, outcome: 'ok' },
+    ]);
+
+    // And the swap is real: the new PIN works, the old one no longer does.
+    await expect(pins.verify(USER_ID, WRONG_PIN)).resolves.toEqual({ ok: true });
+    await expect(pins.verify(USER_ID, PIN)).resolves.toMatchObject({ reason: 'invalid_pin' });
+  });
+
+  it('writes a PIN where there was none, the same as any other write', async () => {
+    const { pins, prisma, audit } = createHarness();
+    const row = prisma.insert();
+
+    await pins.reset(USER_ID, PIN);
+
+    expect(row.transactionPinHash).toMatch(/^scrypt\$/);
+    expect(audit.entries).toEqual([
+      { action: 'auth.pin.changed', userId: USER_ID, outcome: 'ok' },
+    ]);
+  });
+});
+
 describe('the hash never leaves the service', () => {
   it('returns no outcome carrying a hash, a salt or the PIN itself', async () => {
     const { pins, prisma } = createHarness();

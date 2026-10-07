@@ -29,7 +29,10 @@ import {
   AccountProvisioningService,
   type ProvisioningOutcome,
 } from '../wallet/provisioning/account-provisioning.service.js';
+import { type ChangeHandleDto } from './dto/change-handle.dto.js';
+import { type ConfirmPinResetDto } from './dto/confirm-pin-reset.dto.js';
 import { type ChangePinDto } from './dto/change-pin.dto.js';
+import { type HandleResponseDto } from './dto/handle-response.dto.js';
 import { hashSecret } from './credentials/secret-hash.js';
 import { type LoginCodeResponseDto } from './dto/login-code-response.dto.js';
 import { type LoginDto, type LoginResponseDto } from './dto/login.dto.js';
@@ -823,6 +826,43 @@ export class AuthService {
   }
 
   /**
+   * Sets or changes the account's handle (the "handle change" endpoint).
+   *
+   * The same `resolveHandle` registration uses, so the shape rules and the availability check
+   * cannot differ between claiming a handle at signup and changing it here - a handle typed on
+   * this screen is refused with exactly the message signup would have given. `user.id` is passed
+   * as the current owner, so re-submitting the handle the account already holds is a no-op
+   * rather than a conflict with itself.
+   *
+   * The write can still lose a race with a concurrent claim of the same handle on another
+   * account - the courtesy lookup above cannot see it - and the unique index is what decides, so
+   * the `P2002` is turned into the same 409 a lost race at registration produces
+   * (`toRegistrationConflict`).
+   *
+   * One audit entry, `user.handle.set`, with `metadata.source: 'change'`: the same literal
+   * registration writes, because "a handle was set" is one fact and `source` is how the writers
+   * are told apart in the trail.
+   */
+  async changeHandle(user: SessionUser, dto: ChangeHandleDto): Promise<HandleResponseDto> {
+    const handle = await this.resolveHandle(dto.handle, user.id);
+
+    try {
+      await this.prisma.user.update({ where: { id: user.id }, data: { handle } });
+    } catch (error) {
+      throw this.toRegistrationConflict(error, handle);
+    }
+
+    await this.audit.log({
+      action: 'user.handle.set',
+      userId: user.id,
+      outcome: 'ok',
+      metadata: { handle, source: 'change' },
+    });
+
+    return { handle };
+  }
+
+  /**
    * Sets the transaction PIN, or changes it by proving the current one (Step 34a).
    *
    * The three failures are mapped apart on purpose. A missing `currentPin` and a wrong one
@@ -1105,6 +1145,93 @@ export class AuthService {
     });
 
     return { passwordSetAt: passwordSetAt.toISOString() };
+  }
+
+  /**
+   * Starts a forgot-PIN reset by texting a code.
+   *
+   * The same shape and the same guarantee as `requestPasswordReset`: 202 whether or not the
+   * number belongs to an account, and a byte-identical body either way, so this endpoint is not
+   * an existence oracle. The reset reuses the OTP machinery - a reset code is an OTP with a
+   * different purpose, not a second code system - so its lifetime, attempt count and single-use
+   * rules are the ones every other code already has, and the send is counted only when it really
+   * happens (an unknown number spends no allowance).
+   *
+   * The PIN cannot be *proved* by someone who has forgotten it, so the phone number is the whole
+   * of the proof here: whoever can read the code is taken to be the account holder, exactly as
+   * the password reset already assumes.
+   */
+  async requestPinReset(dto: SubmittedPhoneNumberDto): Promise<LoginCodeResponseDto> {
+    const phoneNumber = this.normalize(dto.phoneNumber);
+    const codeLength = this.config.getOrThrow<number>('otp.codeLength');
+    const ttlMinutes = this.config.getOrThrow<number>('otp.ttlMinutes');
+
+    const user = await this.prisma.user.findUnique({ where: { phoneNumber } });
+
+    if (user !== null && user.status === UserStatus.ACTIVE) {
+      await this.assertWithinRequestLimit(phoneNumber);
+
+      const { code, expiresAt } = await this.otp.issue(user.id);
+
+      await this.sendOtp(phoneNumber, code);
+
+      await this.audit.log({
+        action: 'auth.pin.reset.requested',
+        userId: user.id,
+        outcome: 'ok',
+      });
+
+      return { phoneNumber, expiresAt: expiresAt.toISOString(), codeLength };
+    }
+
+    return {
+      phoneNumber,
+      expiresAt: new Date(Date.now() + ttlMinutes * 60_000).toISOString(),
+      codeLength,
+    };
+  }
+
+  /**
+   * Finishes a forgot-PIN reset: checks the code and writes the new PIN.
+   *
+   * The code is checked and spent exactly as it is at verification, sign-in and the password
+   * reset - the same `checkCode`/`consumeCode` pair - so its rules cannot drift from the rest of
+   * the app, and it is spent *before* the PIN is written so a double-tapped confirm cannot write
+   * twice: the second call fails the compare-and-set and changes nothing.
+   *
+   * The write itself is `PinService.reset`, the one path to a PIN that proves the old one was not
+   * needed because possession of the phone was proved instead.
+   */
+  async confirmPinReset(dto: ConfirmPinResetDto): Promise<PinChangeResponseDto> {
+    const phoneNumber = this.normalize(dto.phoneNumber);
+
+    const user = await this.prisma.user.findUnique({ where: { phoneNumber } });
+
+    if (user === null) {
+      // The same 400 a live code lookup would give, rather than a 404: whether the number
+      // exists is not something an unauthenticated reset endpoint should answer.
+      throw new BadRequestException(
+        'No verification code is outstanding for this number. Request a new one.',
+      );
+    }
+
+    if (user.status === UserStatus.SUSPENDED) {
+      throw new ForbiddenException('This account is suspended. Contact support.');
+    }
+
+    const outcome = await this.checkCode(user.id, dto.code);
+
+    await this.consumeCode(this.prisma, outcome.otpId, new Date());
+
+    const pinSetAt = await this.pins.reset(user.id, dto.pin);
+
+    await this.audit.log({
+      action: 'auth.pin.reset.completed',
+      userId: user.id,
+      outcome: 'ok',
+    });
+
+    return { pinSetAt: pinSetAt.toISOString() };
   }
 
   /**
