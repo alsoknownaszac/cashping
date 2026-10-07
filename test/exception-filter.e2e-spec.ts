@@ -134,17 +134,19 @@ describe('AllExceptionsFilter (e2e)', () => {
     expect(res.body.message).toMatch(/klingon/i);
   });
 
-  it('answers a specific 4xx for a non-gzip body declared as Content-Encoding: gzip', async () => {
+  it('answers 400 with a clear message for a non-gzip body declared as Content-Encoding: gzip', async () => {
     const res = await request(app.getHttpServer())
       .post(`${BASE}/echo`)
       .set('Content-Type', 'application/json')
       .set('Content-Encoding', 'gzip')
-      .send('not gzip');
+      .send('not gzip')
+      .expect(400);
 
-    expect([400, 415]).toContain(res.status);
-    expect(res.body.statusCode).toBe(res.status);
-    expect(res.body.message).not.toBe('Internal server error');
-    expect(res.body.message).toMatch(/check|gzip|encoding|decompress/i);
+    expect(res.body.statusCode).toBe(400);
+    expect(res.body.error).toBe('Bad Request');
+    expect(res.body.message).toBe(
+      'Request body could not be decompressed (Content-Encoding: gzip)',
+    );
   });
 
   it('answers 400 for a malformed JSON body and says JSON', async () => {
@@ -213,5 +215,4 @@ describe('AllExceptionsFilter (e2e)', () => {
 
     expect(res.body).toEqual({ ok: true, body: { amount: '1' } });
   });
-
 });

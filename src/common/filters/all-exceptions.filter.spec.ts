@@ -18,8 +18,11 @@ vi.mock('@sentry/nestjs', () => ({
 /**
  * Stands in for the Express response + HTTP adapter, recording what the filter
  * writes so assertions can be made on the payload rather than on a live server.
+ *
+ * `headers` stands in for the request headers the filter reads - so far only the
+ * `Content-Encoding` it names in a decompression message.
  */
-function createFixture() {
+function createFixture(headers: Record<string, string> = {}) {
   const response = { marker: 'response' };
   const reply = vi.fn();
   const httpAdapterHost = {
@@ -32,7 +35,7 @@ function createFixture() {
 
   const host = {
     switchToHttp: () => ({
-      getRequest: () => ({}),
+      getRequest: () => ({ headers }),
       getResponse: () => response,
     }),
   } as unknown as ArgumentsHost;
@@ -233,6 +236,65 @@ describe('AllExceptionsFilter', () => {
     expect(body.message).toContain('closed the connection');
   });
 
+  // A decompression failure, shaped as body-parser actually produces it: zlib's
+  // error re-wrapped with `createError(400, err)`, which keeps the `code` and
+  // leaves `type` unset. The message is fixed, and never zlib's own wording.
+  it('names the encoding when a body cannot be decompressed', () => {
+    const { filter, host, reply } = createFixture({ 'content-encoding': 'gzip' });
+    const error = Object.assign(new Error('incorrect header check'), {
+      status: 400,
+      statusCode: 400,
+      code: 'Z_DATA_ERROR',
+      errno: -3,
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(400);
+    expect(body.error).toBe('Bad Request');
+    expect(body.message).toBe('Request body could not be decompressed (Content-Encoding: gzip)');
+    expect(JSON.stringify(body)).not.toContain('incorrect header check');
+  });
+
+  it('names the encoding the caller declared, not a hard-coded gzip', () => {
+    const { filter, host, reply } = createFixture({ 'content-encoding': 'deflate' });
+    const error = Object.assign(new Error('incorrect header check'), {
+      status: 400,
+      statusCode: 400,
+      code: 'Z_DATA_ERROR',
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(400);
+    expect(body.message).toBe('Request body could not be decompressed (Content-Encoding: deflate)');
+  });
+
+  it('recognises brotli code as a decompression failure too', () => {
+    const { filter, host, reply } = createFixture({ 'content-encoding': 'br' });
+    const error = Object.assign(new Error('Decompression failed'), {
+      status: 400,
+      statusCode: 400,
+      code: 'ERR__ERROR_FORMAT_PADDING_2',
+      errno: -15,
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(400);
+    expect(body.message).toBe('Request body could not be decompressed (Content-Encoding: br)');
+    expect(JSON.stringify(body)).not.toContain('Decompression failed');
+  });
+
   it('answers a Content-Length mismatch with 400', () => {
     const { filter, host, reply } = createFixture();
     const error = Object.assign(new Error('request size did not match content length'), {
@@ -251,8 +313,9 @@ describe('AllExceptionsFilter', () => {
   });
 
   it('uses the error message for a 4xx that marked itself safe to show', () => {
-    // The bad-gzip case: a decompress failure is wrapped by http-errors as a 400
-    // with `expose: true` and no `type`, so its own message is all we have.
+    // A 4xx that is none of the named types: http-errors marked it safe to show
+    // (`expose: true`) and gave it no `type`, and it carries no decompression code,
+    // so its own message is all we have.
     const { filter, host, reply } = createFixture();
     const error = Object.assign(new Error('incorrect header check'), {
       status: 400,
@@ -331,5 +394,4 @@ describe('AllExceptionsFilter', () => {
     expect(errorLog).toHaveBeenCalledTimes(1);
     expect(Sentry.captureException).toHaveBeenCalledTimes(1);
   });
-
 });

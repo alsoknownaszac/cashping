@@ -45,6 +45,12 @@ interface RequestError extends Error {
   encoding?: string;
   /** The `charset` that was refused (`charset.unsupported`). */
   charset?: string;
+  /**
+   * zlib's own failure code when a declared `Content-Encoding` could not be
+   * decompressed (`Z_DATA_ERROR`, `Z_BUF_ERROR`, or brotli's `ERR__ERROR_*`).
+   * Present only on that one error, which carries no `type`.
+   */
+  code?: string;
 }
 
 /**
@@ -80,7 +86,8 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const context = host.switchToHttp();
     const request = context.getRequest();
 
-    const statusCode = resolveStatus(exception);
+    const contentEncoding = requestContentEncoding(request);
+    const statusCode = resolveStatus(exception, contentEncoding);
 
     const method = httpAdapter.getRequestMethod(request);
     const path = httpAdapter.getRequestUrl(request);
@@ -101,7 +108,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
 
     httpAdapter.reply(
       context.getResponse(),
-      this.toErrorBody(exception, statusCode, path),
+      this.toErrorBody(exception, statusCode, path, contentEncoding),
       statusCode,
     );
   }
@@ -113,7 +120,12 @@ export class AllExceptionsFilter implements ExceptionFilter {
    * `HttpException` keeps the shape Nest gave it, and a client-side error that is
    * not one (body-parser and friends) is described from its own fields.
    */
-  private toErrorBody(exception: unknown, statusCode: number, path: string): ErrorResponseBody {
+  private toErrorBody(
+    exception: unknown,
+    statusCode: number,
+    path: string,
+    contentEncoding: string | undefined,
+  ): ErrorResponseBody {
     const timestamp = new Date().toISOString();
 
     // Genuine server faults, and anything we cannot attribute to the caller, get
@@ -159,7 +171,8 @@ export class AllExceptionsFilter implements ExceptionFilter {
     return {
       statusCode,
       error: reason,
-      message: mapClientError(exception)?.message ?? exposedMessage(exception) ?? reason,
+      message:
+        mapClientError(exception, contentEncoding)?.message ?? exposedMessage(exception) ?? reason,
       path,
       timestamp,
     };
@@ -177,13 +190,16 @@ export class AllExceptionsFilter implements ExceptionFilter {
  * Step 3 is what keeps a 413/415 from body-parser - an error Nest's own adapter
  * leaves untouched because it is neither a `SyntaxError` nor an `HttpException` -
  * from being reported as a server fault.
+ *
+ * The request's `Content-Encoding` is carried through only so `mapClientError` can
+ * name it in a decompression message; a decompression failure is a 400 either way.
  */
-function resolveStatus(exception: unknown): number {
+function resolveStatus(exception: unknown, contentEncoding: string | undefined): number {
   if (exception instanceof HttpException) {
     return exception.getStatus();
   }
 
-  const mapped = mapClientError(exception);
+  const mapped = mapClientError(exception, contentEncoding);
   if (mapped) {
     return mapped.statusCode;
   }
@@ -200,13 +216,29 @@ function resolveStatus(exception: unknown): number {
  * Describes the body-parsing (and other `http-errors`) mistakes we can name, so
  * the caller is told exactly what was wrong instead of a bare status.
  *
+ * A failed decompression is the one such mistake with no `type` of its own (see
+ * `isDecompressionFailure`); it is named from the request's `Content-Encoding`.
+ *
  * Returns `null` for anything else, leaving the caller to fall back to the
  * error's own message or its status reason phrase.
  */
-function mapClientError(exception: unknown): { statusCode: number; message: string } | null {
+function mapClientError(
+  exception: unknown,
+  contentEncoding: string | undefined,
+): { statusCode: number; message: string } | null {
   const error = exception as RequestError;
 
-  if (error === null || typeof error !== 'object' || typeof error.type !== 'string') {
+  if (error === null || typeof error !== 'object') {
+    return null;
+  }
+
+  // The one body-parser mistake with no `type` of its own: a body it could not
+  // decompress. zlib's `code` survives the wrap, so that is what names it.
+  if (isDecompressionFailure(error)) {
+    return { statusCode: 400, message: decompressionMessage(contentEncoding) };
+  }
+
+  if (typeof error.type !== 'string') {
     return null;
   }
 
@@ -252,6 +284,55 @@ function tooLargeMessage(error: RequestError): string {
     : 'Request body too large';
 }
 
+/**
+ * Whether an error is a body that could not be decompressed.
+ *
+ * body-parser inflates the body through zlib before parsing it, so a body it
+ * cannot inflate surfaces zlib's own error; body-parser then re-wraps that with
+ * `createError(400, err)`, which keeps the `code` but adds no `type`. The code is
+ * therefore the only thing that identifies it: `Z_DATA_ERROR` / `Z_BUF_ERROR` for
+ * gzip and deflate, and brotli's own `ERR__ERROR_*` for `br`. Every other
+ * body-parser mistake carries a `type` instead, so none of them is caught here.
+ */
+function isDecompressionFailure(error: RequestError): boolean {
+  return (
+    typeof error.code === 'string' &&
+    (/^Z_[A-Z_]*ERROR$/.test(error.code) || error.code.startsWith('ERR__ERROR_'))
+  );
+}
+
+/**
+ * The message for a body that could not be decompressed, naming the encoding the
+ * caller declared.
+ *
+ * zlib's own wording - "incorrect header check", "invalid block type" - describes
+ * nothing to the sender and is never echoed; the request's own `Content-Encoding`
+ * is what does.
+ */
+function decompressionMessage(contentEncoding: string | undefined): string {
+  return `Request body could not be decompressed (Content-Encoding: ${
+    contentEncoding ?? 'unknown'
+  })`;
+}
+
+/**
+ * The `Content-Encoding` a request declared, lower-cased, when there is one.
+ *
+ * Read from the request rather than the error because the failure that needs it
+ * carries no `encoding` of its own. Express lower-cases header names, so the key
+ * is always `content-encoding`; the value is lower-cased here to match the token
+ * body-parser itself switches on when it picks a decompression stream.
+ */
+function requestContentEncoding(request: unknown): string | undefined {
+  if (request === null || typeof request !== 'object') {
+    return undefined;
+  }
+
+  const value = (request as { headers?: Record<string, unknown> }).headers?.['content-encoding'];
+
+  return typeof value === 'string' && value.length > 0 ? value.toLowerCase() : undefined;
+}
+
 /** The numeric `status`/`statusCode` an arbitrary error carries, if any. */
 function numericStatus(exception: unknown): number | undefined {
   if (exception === null || typeof exception !== 'object') {
@@ -294,4 +375,3 @@ function describeType(exception: unknown): string {
 
   return exception instanceof Error ? exception.name : 'unknown';
 }
-
