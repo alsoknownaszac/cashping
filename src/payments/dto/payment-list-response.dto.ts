@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { TransactionStatus } from '../../generated/prisma/enums.js';
+import { PaymentCounterpartyDto } from './payment-counterparty.dto.js';
 
 /**
  * One payment in a page of history.
@@ -9,10 +10,11 @@ import { TransactionStatus } from '../../generated/prisma/enums.js';
  * deliberately absent here - see that DTO's docblock for the argument, which is a disclosure one
  * as much as a size one.
  *
- * `recipientId` is the only party on the row, and on a `received` item it is the caller. It is
- * here rather than a "counterparty" field because the id is what the row holds: the account a
- * caller wants to name on the screen (the person they paid, or the person who paid them) is
- * resolved through `GET /v1/recipients/:id`, which is the directory's job and not history's.
+ * `recipientId` is the account being paid, and on a `received` item it is the caller - it is what
+ * the row holds, not who to show. The person to render is `counterparty`, the party other than
+ * the caller, read with the row so two sides of one payment label themselves without a request
+ * each. See `PaymentCounterpartyDto` for what it carries and why it is not resolved through the
+ * directory here.
  */
 export class PaymentListItemDto {
   @ApiProperty({
@@ -49,6 +51,13 @@ export class PaymentListItemDto {
     example: '0f8fad5b-d9cb-469f-a165-70867728950e',
   })
   recipientId!: string;
+
+  @ApiProperty({
+    description:
+      'The party other than the caller - the account the money moved with, and what a row is labelled by.',
+    type: PaymentCounterpartyDto,
+  })
+  counterparty!: PaymentCounterpartyDto;
 
   @ApiProperty({
     description: 'When the row was written, as an ISO-8601 instant. The order of the list.',

@@ -534,6 +534,12 @@ describe('the unique index underneath the idempotency claim', () => {
  * that the two fields a list will not show are not even read.
  */
 
+/** One side of a row as the two reads select it: the id to resolve the account, and its handle. */
+interface Counterparty {
+  id: string;
+  handle: string | null;
+}
+
 /** A `transactions` row, as the two reads select it. */
 interface HistoryRow {
   id: string;
@@ -543,6 +549,8 @@ interface HistoryRow {
   /** A decimal string: what `Amount.fromDatabase` accepts, and what the driver's `Decimal` reduces to. */
   amount: string;
   createdAt: Date;
+  sender: Counterparty;
+  recipient: Counterparty;
 }
 
 /** The same row plus the two columns only the detail read selects. */
@@ -554,14 +562,31 @@ interface DetailedRow extends HistoryRow {
 const PAYMENT_ID = '6d1f3c9e-4a11-4f6b-9d1e-2b3c4d5e6f70';
 const TX_HASH = 'e9da1c48bdfaeacd13eb05d1fff82eee4d61d77f0faa467c9d539955bf36ec0d';
 
+/**
+ * The handle each fixture account carries, keyed by id.
+ *
+ * A map rather than two names inlined into `historyRow`, because the same two accounts appear on
+ * *both* sides of the rows below - a `received` row's sender is the `sent` row's recipient - and a
+ * row built from the ids has to name whichever account actually lands in each column.
+ */
+const HANDLES: Record<string, string> = {
+  [SENDER.id]: 'ama',
+  [RECIPIENT_ID]: 'kofi',
+};
+
 function historyRow(overrides: Partial<HistoryRow> = {}): HistoryRow {
+  const senderId = overrides.senderId ?? SENDER.id;
+  const recipientId = overrides.recipientId ?? RECIPIENT_ID;
+
   return {
     id: PAYMENT_ID,
-    senderId: SENDER.id,
-    recipientId: RECIPIENT_ID,
+    senderId,
+    recipientId,
     status: TransactionStatus.SUCCESSFUL,
     amount: '123456789012.1234567',
     createdAt: CREATED_AT,
+    sender: { id: senderId, handle: HANDLES[senderId] ?? null },
+    recipient: { id: recipientId, handle: HANDLES[recipientId] ?? null },
     ...overrides,
   };
 }
@@ -569,6 +594,9 @@ function historyRow(overrides: Partial<HistoryRow> = {}): HistoryRow {
 function detailedRow(overrides: Partial<DetailedRow> = {}): DetailedRow {
   return { ...historyRow(), failureReason: null, stellarTxHash: null, ...overrides };
 }
+
+/** The two fields the counterparty relations are narrowed to. */
+const COUNTERPARTY_SELECT = { select: { id: true, handle: true } } as const;
 
 /** The columns the list reads, in one place so the "not even read" assertion is one line. */
 const LIST_SELECT = {
@@ -578,6 +606,8 @@ const LIST_SELECT = {
   status: true,
   amount: true,
   createdAt: true,
+  sender: COUNTERPARTY_SELECT,
+  recipient: COUNTERPARTY_SELECT,
 } as const;
 
 /** What the detail read adds. */
@@ -791,6 +821,7 @@ describe('a page of history', () => {
         amount: '123456789012.1234567',
         direction: 'sent',
         recipientId: RECIPIENT_ID,
+        counterparty: { id: RECIPIENT_ID, handle: 'kofi' },
         createdAt: CREATED_AT.toISOString(),
       },
       {
@@ -799,8 +830,33 @@ describe('a page of history', () => {
         amount: '123456789012.1234567',
         direction: 'received',
         recipientId: SENDER.id,
+        counterparty: { id: RECIPIENT_ID, handle: 'kofi' },
         createdAt: CREATED_AT.toISOString(),
       },
+    ]);
+  });
+
+  it('names the account the caller dealt with, and hands a missing handle back as null', async () => {
+    const harnessed = readHarness({
+      rows: [
+        // The caller sent this one: the counterparty is the *recipient*.
+        historyRow({ id: 'sent', senderId: SENDER.id, recipientId: RECIPIENT_ID }),
+        // The caller received this one: the counterparty is the *sender*, and that account has not
+        // claimed a handle - which travels as `null` rather than being dropped or defaulted.
+        historyRow({
+          id: 'received',
+          senderId: RECIPIENT_ID,
+          recipientId: SENDER.id,
+          sender: { id: RECIPIENT_ID, handle: null },
+        }),
+      ],
+    });
+
+    const page = await harnessed.service.history(SENDER.id, {});
+
+    expect(page.items.map((item) => item.counterparty)).toEqual([
+      { id: RECIPIENT_ID, handle: 'kofi' },
+      { id: RECIPIENT_ID, handle: null },
     ]);
   });
 

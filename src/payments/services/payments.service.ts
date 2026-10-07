@@ -15,6 +15,7 @@ import { BalancesService } from '../../wallet/balances/balances.service.js';
 import { type CreatePaymentDto } from '../dto/create-payment.dto.js';
 import { type ListPaymentsQueryDto } from '../dto/list-payments.dto.js';
 import { PaymentCreatedResponseDto } from '../dto/payment-created-response.dto.js';
+import { PaymentCounterpartyDto } from '../dto/payment-counterparty.dto.js';
 import { PaymentListItemDto, PaymentListResponseDto } from '../dto/payment-list-response.dto.js';
 import { PaymentResponseDto } from '../dto/payment-response.dto.js';
 import {
@@ -73,7 +74,14 @@ interface CreatedTransaction {
  * `senderId` is read and never rendered. It is what `directionFor` needs to answer "sent or
  * received" for the caller, and on a row the caller sent it is the caller's own id - so it is not
  * a disclosure, it is the field the answer is derived from.
+ *
+ * `sender` and `recipient` are read so one row names the person the caller dealt with without a
+ * second request per row (`counterpartyFor` picks the one that is not the caller). The `select`
+ * keeps each to two fields - the id and the handle - for the same reason the list keeps to six:
+ * what a page discloses is decided here, in one place, not by whatever a mapper later reaches for.
  */
+const COUNTERPARTY_COLUMNS = { select: { id: true, handle: true } } as const;
+
 const HISTORY_COLUMNS = {
   id: true,
   senderId: true,
@@ -81,6 +89,8 @@ const HISTORY_COLUMNS = {
   status: true,
   amount: true,
   createdAt: true,
+  sender: COUNTERPARTY_COLUMNS,
+  recipient: COUNTERPARTY_COLUMNS,
 } as const;
 
 /** What the detail read adds: the two fields worth reading one payment for. See `PaymentResponseDto`. */
@@ -91,11 +101,23 @@ const DETAIL_COLUMNS = {
 } as const;
 
 /**
+ * One side of a row, as `COUNTERPARTY_COLUMNS` reads it: the id to resolve the account by, and
+ * the handle to render until it is resolved (or instead, when there is none).
+ */
+interface CounterpartyRow {
+  readonly id: string;
+  readonly handle: string | null;
+}
+
+/**
  * One history row, as much of it as a response needs.
  *
  * `amount` is typed structurally (`toString`) rather than as Prisma's `Decimal`, the same way
  * `CreatedTransaction` types it: this file reads the column back, and how the driver spells a
  * `numeric` is `common/money`'s business, not this module's.
+ *
+ * `sender` and `recipient` are the two parties as the `User` relation returns them; which one a
+ * response shows is `counterpartyFor`'s decision, made per caller.
  */
 interface HistoryTransaction {
   readonly id: string;
@@ -104,6 +126,8 @@ interface HistoryTransaction {
   readonly status: TransactionStatus;
   readonly amount: { toString(): string };
   readonly createdAt: Date;
+  readonly sender: CounterpartyRow;
+  readonly recipient: CounterpartyRow;
 }
 
 /** A history row plus the two fields only `GET /v1/payments/:id` reads. */
@@ -353,6 +377,7 @@ export class PaymentsService {
       amount: Amount.fromDatabase(row.amount).toString(),
       direction: directionFor(row, userId),
       recipientId: row.recipientId,
+      counterparty: counterpartyFor(row, userId),
       createdAt: row.createdAt.toISOString(),
       // `null` stays `null` rather than being dropped, so a client can switch on presence.
       failureReason: row.failureReason,
@@ -596,6 +621,29 @@ function toListItem(row: HistoryTransaction, userId: string): PaymentListItemDto
     amount: Amount.fromDatabase(row.amount).toString(),
     direction: directionFor(row, userId),
     recipientId: row.recipientId,
+    counterparty: counterpartyFor(row, userId),
     createdAt: row.createdAt.toISOString(),
   };
+}
+
+/**
+ * The party on a row that is not the caller, as a label.
+ *
+ * The id is what the row already holds on one side and the caller holds on the other, so
+ * "the other account" is decided here once, from `senderId`, rather than by every client that
+ * would otherwise have to know that a `received` payment's counterparty is its *sender*. It is
+ * the same branch `directionFor` takes, read from the same field, so the two fields cannot
+ * describe different accounts: `counterparty` is exactly the side `direction` names the caller
+ * as not being on.
+ *
+ * `handle` is passed through as it is, including `null` - an account that has not claimed one is
+ * not an error, and a client renders the id rather than a placeholder (`PaymentCounterpartyDto`).
+ */
+function counterpartyFor(
+  row: Pick<HistoryTransaction, 'senderId' | 'sender' | 'recipient'>,
+  userId: string,
+): PaymentCounterpartyDto {
+  const other = row.senderId === userId ? row.recipient : row.sender;
+
+  return { id: other.id, handle: other.handle };
 }

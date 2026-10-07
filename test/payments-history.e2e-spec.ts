@@ -95,6 +95,7 @@ interface HistoryItem {
   amount: string;
   direction: string;
   recipientId: string;
+  counterparty: { id: string; handle: string | null };
   createdAt: string;
 }
 
@@ -308,6 +309,9 @@ describe('Payment history (e2e)', () => {
    */
   let tiedPaymentId = '';
 
+  /** The partner's handle as it was claimed, so a `counterparty` assertion can name the real value. */
+  let partnerHandle = '';
+
   /** Everything a registered account leaves behind, so `afterAll` can remove exactly that. */
   const numbersWritten: string[] = [];
   const claimedHandles: string[] = [];
@@ -460,6 +464,7 @@ describe('Payment history (e2e)', () => {
       unrelated: `${prefix}u`,
     };
     claimedHandles.push(...Object.values(handles));
+    partnerHandle = handles.partner;
 
     const numbers = {
       viewer: freshLocalNumber(),
@@ -647,6 +652,7 @@ describe('Payment history (e2e)', () => {
       for (const item of body.items) {
         expect(Object.keys(item).sort()).toEqual([
           'amount',
+          'counterparty',
           'createdAt',
           'direction',
           'id',
@@ -778,11 +784,17 @@ describe('Payment history (e2e)', () => {
       for (const item of sent.items) {
         expect(item.direction).toBe('sent');
         expect(item.recipientId).toBe(partner.userId);
+        // The counterparty is the other account - the recipient here - and it carries the handle
+        // the partner actually claimed, joined and read back through the same query.
+        expect(item.counterparty).toEqual({ id: partner.userId, handle: partnerHandle });
       }
 
       for (const item of received.items) {
         expect(item.direction).toBe('received');
         expect(item.recipientId).toBe(viewer.userId);
+        // On a `received` row the counterparty is the *sender*, which is the partner again - the
+        // point of the field: a client labels both directions with the other account, never itself.
+        expect(item.counterparty).toEqual({ id: partner.userId, handle: partnerHandle });
       }
 
       // `direction` is derived per caller from the row, so the same fifteen payments answer

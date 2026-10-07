@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { TransactionStatus } from '../../generated/prisma/enums.js';
+import { PaymentCounterpartyDto } from './payment-counterparty.dto.js';
 
 /**
  * 200 body of `GET /v1/payments/:id` (Step 30): one payment, as one of its two parties sees it.
@@ -38,6 +39,12 @@ import { TransactionStatus } from '../../generated/prisma/enums.js';
  * fields a list actually sorts and renders. That is a disclosure decision as well as a size one:
  * the fewer rows that carry a machine reason, the fewer places it can be shown as if it were
  * written for a person.
+ *
+ * ## `counterparty`: the same two fields on both bodies
+ *
+ * `counterparty` is the one field shared with `PaymentListItemDto` rather than being exclusive to
+ * one of them, because the detail screen and the list label the person the same way. See
+ * `PaymentCounterpartyDto` for why it carries an id and a handle and nothing richer.
  */
 export class PaymentResponseDto {
   @ApiProperty({
@@ -78,6 +85,13 @@ export class PaymentResponseDto {
     example: '0f8fad5b-d9cb-469f-a165-70867728950e',
   })
   recipientId!: string;
+
+  @ApiProperty({
+    description:
+      'The party other than the caller - the recipient on a `sent` payment, the sender on a `received` one.',
+    type: PaymentCounterpartyDto,
+  })
+  counterparty!: PaymentCounterpartyDto;
 
   @ApiProperty({
     description: 'When the row was written, as an ISO-8601 instant. The value history is ordered by.',
