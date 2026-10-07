@@ -16,6 +16,12 @@ import {
   type SubmittedTransaction,
 } from './transaction-submitter.js';
 import {
+  STELLAR_PAYMENTS_LOOKUP,
+  type IncomingPaymentPage,
+  type StellarPaymentsLookup,
+  type StellarPaymentsLookupOptions,
+} from './payments-lookup.js';
+import {
   STELLAR_TRANSACTION_LOOKUP,
   type StellarTransactionLookup,
   type TransactionLookupResult,
@@ -90,6 +96,8 @@ export class StellarService {
     private readonly submitter: StellarTransactionSubmitter,
     @Inject(STELLAR_TRANSACTION_LOOKUP)
     private readonly transactions: StellarTransactionLookup,
+    @Inject(STELLAR_PAYMENTS_LOOKUP)
+    private readonly payments: StellarPaymentsLookup,
   ) {
     // Read and validated once, at construction: boot fails on a bad
     // `STELLAR_NETWORK`, not the first payment of the day.
@@ -218,5 +226,25 @@ export class StellarService {
    */
   lookupTransaction(hash: string): Promise<TransactionLookupResult> {
     return this.transactions.lookup(hash);
+  }
+
+  /**
+   * The payments Horizon reports arriving at an account, newest first (`GET /v1/wallet/deposits`).
+   *
+   * The fourth read through the same one door, and here for the same reason as the third: this
+   * class owns the only Horizon clients in the app, and "what was paid into this wallet" is a
+   * question about Stellar that every caller should have to ask in the same vocabulary. It takes
+   * no lock and no passphrase - listing payments consumes no sequence number and signs nothing -
+   * so it is safe to call while a build is in flight for the same account.
+   *
+   * Resolves for every outcome Horizon gave (an account with no payments is an empty page), and
+   * rejects with `StellarPaymentsLookupError` only when Horizon could not be asked - which the
+   * caller maps to a 503 rather than to an empty wallet.
+   */
+  listIncomingPayments(
+    accountId: string,
+    options: StellarPaymentsLookupOptions,
+  ): Promise<IncomingPaymentPage> {
+    return this.payments.listIncoming(accountId, options);
   }
 }

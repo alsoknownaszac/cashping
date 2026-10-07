@@ -40,6 +40,7 @@ import {
   HorizonAccountSource,
   createHorizonServer,
 } from './../src/wallet/stellar/horizon-account-source.js';
+import { HorizonPaymentsLookup } from './../src/wallet/stellar/horizon-payments-lookup.js';
 import {
   HorizonTransactionLookup,
   transactionCodeOf,
@@ -715,6 +716,9 @@ describe.skipIf(!STELLAR)('the submission job, against Testnet (Step 27)', () =>
       // below - but the service under test takes it, and passing a fake would make this file's
       // `StellarService` a different object from the one the app builds.
       new HorizonTransactionLookup(config, createHorizonServer),
+      // The fourth port, on the same terms: this run never reads deposits, but `WalletModule`
+      // supplies it, so the service under test is built exactly as the app builds it.
+      new HorizonPaymentsLookup(config, createHorizonServer),
     );
 
     custody = new SeedCustodyService(new KmsKeyWrapper(config, createKmsClient), stellar);

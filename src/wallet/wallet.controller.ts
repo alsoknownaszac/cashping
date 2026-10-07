@@ -1,12 +1,15 @@
-import { Controller, Get, UseGuards } from '@nestjs/common';
+import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ApiErrorResponses } from '../common/http/swagger.js';
 import { CurrentUser } from '../identity/jwt/current-user.decorator.js';
 import { JwtAuthGuard } from '../identity/jwt/jwt-auth.guard.js';
 import { type SessionUser } from '../identity/token/token.service.js';
 import { BalancesService } from './balances/balances.service.js';
+import { DepositsService } from './deposits/deposits.service.js';
 import { AccountResponseDto } from './dto/account-response.dto.js';
 import { BalanceResponseDto } from './dto/balance-response.dto.js';
+import { DepositListResponseDto } from './dto/deposit-response.dto.js';
+import { ListDepositsQueryDto } from './dto/list-deposits.dto.js';
 
 /**
  * The wallet over HTTP (Step 20): `GET /v1/wallet/account` and `GET /v1/wallet/balance`.
@@ -48,7 +51,10 @@ import { BalanceResponseDto } from './dto/balance-response.dto.js';
 @ApiTags('wallet')
 @Controller('wallet')
 export class WalletController {
-  constructor(private readonly balances: BalancesService) {}
+  constructor(
+    private readonly balances: BalancesService,
+    private readonly deposits: DepositsService,
+  ) {}
 
   @Get('account')
   @UseGuards(JwtAuthGuard)
@@ -132,5 +138,51 @@ export class WalletController {
   ])
   balance(@CurrentUser() user: SessionUser): Promise<BalanceResponseDto> {
     return this.balances.balanceFor(user.id);
+  }
+
+  @Get('deposits')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Money paid into your wallet',
+    description: [
+      "The USDC payments Horizon reports arriving at the caller's own Stellar account, newest first - read from the network on this request, exactly like `/balance`, and never from a stored copy.",
+      '',
+      '`items` is a page ordered by Horizon, and `nextCursor` is the token for the page after it: pass it back as `?cursor=` to walk to older deposits. `null` means this was the last page. `limit` defaults to 20 and is capped at 50.',
+      '',
+      "Only this deployment's USDC is reported - a payment in another asset (XLM, or `USDC` from a different issuer) is not money the product moves and is filtered out. `from` is the sender's Stellar account, which may not be a CashPing user.",
+    ].join('\n'),
+  })
+  @ApiOkResponse({
+    type: DepositListResponseDto,
+    description: 'One page of incoming USDC, newest first.',
+  })
+  @ApiErrorResponses([
+    {
+      status: 400,
+      description: '`limit` is not a whole number, or `cursor` was sent empty.',
+    },
+    {
+      status: 401,
+      description:
+        'No `Authorization: Bearer <token>` header, or the token is expired, malformed, or not one this API signed. Refresh, then sign in again if that fails.',
+    },
+    { status: 403, description: 'The account is suspended.' },
+    {
+      status: 404,
+      description:
+        'No Stellar account has been provisioned for this user, so there is no wallet to report deposits for.',
+    },
+    {
+      status: 503,
+      description:
+        'Horizon could not be reached, so the deposits are unknown rather than empty. Retry shortly.',
+    },
+  ])
+  listDeposits(
+    @CurrentUser() user: SessionUser,
+    @Query() query: ListDepositsQueryDto,
+  ): Promise<DepositListResponseDto> {
+    return this.deposits.listFor(user.id, query);
   }
 }

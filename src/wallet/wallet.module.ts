@@ -3,6 +3,7 @@ import { AuditModule } from '../audit/audit.module.js';
 import { AuditService } from '../audit/audit.service.js';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { BalancesService } from './balances/balances.service.js';
+import { DepositsService } from './deposits/deposits.service.js';
 import { AuditedKeyWrapper } from './custody/audited-key-wrapper.js';
 import { KEY_WRAPPER } from './custody/key-wrapper.js';
 import { KMS_CLIENT_FACTORY, KmsKeyWrapper, createKmsClient } from './custody/kms-key-wrapper.js';
@@ -17,8 +18,10 @@ import {
   HorizonAccountSource,
   createHorizonServer,
 } from './stellar/horizon-account-source.js';
+import { HorizonPaymentsLookup } from './stellar/horizon-payments-lookup.js';
 import { HorizonTransactionSubmitter } from './stellar/horizon-transaction-submitter.js';
 import { HorizonTransactionLookup } from './stellar/horizon-transaction-lookup.js';
+import { STELLAR_PAYMENTS_LOOKUP } from './stellar/payments-lookup.js';
 import { StellarService } from './stellar/stellar.service.js';
 import { STELLAR_TRANSACTION_SUBMITTER } from './stellar/transaction-submitter.js';
 import { STELLAR_TRANSACTION_LOOKUP } from './stellar/transaction-lookup.js';
@@ -143,6 +146,13 @@ import { WalletController } from './wallet.controller.js';
      * the only thing in the app that knows a `Horizon.Server` exists.
      */
     { provide: STELLAR_TRANSACTION_LOOKUP, useClass: HorizonTransactionLookup },
+    /**
+     * The fourth Horizon port: the deposits read (`GET /v1/wallet/deposits`). A token for the
+     * same reason as the three above it - the fake its spec hangs off it is what lets the paging
+     * and the incoming-only filter be exercised without the network, while `StellarService` stays
+     * the only thing in the app that knows a `Horizon.Server` exists.
+     */
+    { provide: STELLAR_PAYMENTS_LOOKUP, useClass: HorizonPaymentsLookup },
     SeedCustodyService,
     /**
      * Two providers where Step 18 had one, and the split *is* the audit.
@@ -165,6 +175,7 @@ import { WalletController } from './wallet.controller.js';
     { provide: ACCOUNT_FUNDER, useClass: FriendbotFunder },
     AccountProvisioningService,
     BalancesService,
+    DepositsService,
   ],
   // `verifyOtp` is the only consumer, and it is in `IdentityModule`.
   exports: [

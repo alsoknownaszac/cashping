@@ -16,6 +16,7 @@ import {
   type StellarAccountSource,
   type StellarBalanceLine,
 } from './account-source.js';
+import type { IncomingPaymentPage, StellarPaymentsLookup } from './payments-lookup.js';
 import { StellarAccountSession } from './stellar-account-session.js';
 import { StellarService } from './stellar.service.js';
 import type { StellarTransactionSubmitter, SubmittedTransaction } from './transaction-submitter.js';
@@ -196,11 +197,26 @@ class RecordingLookup implements StellarTransactionLookup {
 
 const UNUSED_LOOKUP = new RecordingLookup();
 
+/**
+ * The payments lookup the cycles below never depend on - the fourth Horizon port, injected the
+ * same way the third is: real, so the constructor is exercised with the five collaborators
+ * `WalletModule` supplies, and silent, because what this file tests is the lock and the
+ * pass-through. The port's own mapping is `horizon-payments-lookup.spec.ts`'s subject.
+ */
+class RecordingPayments implements StellarPaymentsLookup {
+  async listIncoming(): Promise<IncomingPaymentPage> {
+    return { payments: [], nextCursor: null };
+  }
+}
+
+const UNUSED_PAYMENTS = new RecordingPayments();
+
 function createService(
   horizon: StellarAccountSource,
   network = 'TESTNET',
   submitter: StellarTransactionSubmitter = UNUSED_SUBMITTER,
   lookup: StellarTransactionLookup = UNUSED_LOOKUP,
+  payments: StellarPaymentsLookup = UNUSED_PAYMENTS,
 ): StellarService {
   const config = {
     getOrThrow: (key: string) => {
@@ -217,7 +233,7 @@ function createService(
     },
   } as unknown as ConfigService;
 
-  return new StellarService(config, horizon, submitter, lookup);
+  return new StellarService(config, horizon, submitter, lookup, payments);
 }
 
 function payment(amount = '1'): xdr.Operation {

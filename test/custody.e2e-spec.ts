@@ -107,6 +107,15 @@ function serviceWith(overrides: Record<string, string | undefined> = {}): SeedCu
         throw new Error('custody never looks a transaction up: this spec has no Horizon');
       },
     },
+    {
+      /**
+       * The fourth port (`GET /v1/wallet/deposits`), on the same terms again: custody never reads
+       * deposits, so a call would mean this spec wandered somewhere it has no Horizon to wander to.
+       */
+      listIncoming: () => {
+        throw new Error('custody never lists payments: this spec has no Horizon');
+      },
+    },
   );
 
   return new SeedCustodyService(wrapperWith(overrides), stellar);
