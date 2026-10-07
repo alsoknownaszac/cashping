@@ -2,6 +2,7 @@ import { type ConfigService } from '@nestjs/config';
 import { describe, expect, it } from 'vitest';
 import { MailtrapEmailSender } from './email/mailtrap-email.sender.js';
 import { ResendEmailSender } from './email/resend-email.sender.js';
+import { SendgridEmailSender } from './email/sendgrid-email.sender.js';
 import { SmtpEmailSender } from './email/smtp-email.sender.js';
 import { createEmailSender } from './notifications.module.js';
 
@@ -10,9 +11,9 @@ import { createEmailSender } from './notifications.module.js';
  *
  * `createEmailSender` is the one place the senders are told apart, so this pins the rule that
  * matters most to production: an unset `EMAIL_SENDER` - and any value other than the literal
- * `mailtrap` or `smtp` - binds Resend, and only those two literals bind the sandbox and the SMTP
- * relay. Constructing a sender reads no credentials and opens no connection, so nothing here
- * touches the network.
+ * `mailtrap`, `smtp` or `sendgrid` - binds Resend, and only those three literals bind the
+ * sandbox, the SMTP relay and the SendGrid relay. Constructing a sender reads no credentials and
+ * opens no connection, so nothing here touches the network.
  */
 function config(sender: string | undefined): ConfigService {
   return {
@@ -35,6 +36,10 @@ describe('createEmailSender', () => {
 
   it("binds the SMTP relay when EMAIL_SENDER='smtp'", () => {
     expect(createEmailSender(config('smtp'))).toBeInstanceOf(SmtpEmailSender);
+  });
+
+  it("binds the SendGrid relay when EMAIL_SENDER='sendgrid'", () => {
+    expect(createEmailSender(config('sendgrid'))).toBeInstanceOf(SendgridEmailSender);
   });
 
   it('binds Resend for any other value, so an unexpected string cannot select the sandbox', () => {

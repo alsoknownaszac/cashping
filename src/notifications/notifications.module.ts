@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { EMAIL_SENDER, type EmailSender } from './email/email-sender.js';
 import { MailtrapEmailSender } from './email/mailtrap-email.sender.js';
 import { ResendEmailSender } from './email/resend-email.sender.js';
+import { SendgridEmailSender } from './email/sendgrid-email.sender.js';
 import { SmtpEmailSender } from './email/smtp-email.sender.js';
 import { NotificationsService } from './notifications.service.js';
 import { AfricasTalkingSmsSender } from './sms/africas-talking-sms.sender.js';
@@ -14,14 +15,15 @@ import { SMS_SENDER } from './sms/sms-sender.js';
  *
  * A function rather than a second `useClass`, because the choice is now data: `resend` - the
  * default, and the value a deployment uses - sends real mail, `mailtrap` hands it to a local
- * Email-Testing sandbox, and `smtp` sends it through a real relay (staging's Gmail, typically).
- * All three are constructed from the same injected `ConfigService`, so this is the one place the
- * providers are told apart and the one place a further one would be added. Exported so a spec can
- * assert the selection without booting the app.
+ * Email-Testing sandbox, `smtp` sends it through a real relay (staging's Gmail, typically), and
+ * `sendgrid` sends it through SendGrid's own relay. All four are constructed from the same
+ * injected `ConfigService`, so this is the one place the providers are told apart and the one
+ * place a further one would be added. Exported so a spec can assert the selection without
+ * booting the app.
  *
  * `email.sender` defaults to `'resend'` in `configuration()`, and the validation schema refuses
- * `mailtrap` when `NODE_ENV=production`, so a deployment is Resend or a real SMTP relay whether or
- * not the variable is set - never the sandbox.
+ * `mailtrap` when `NODE_ENV=production`, so a deployment is Resend or a real SMTP relay whether
+ * or not the variable is set - never the sandbox.
  */
 export function createEmailSender(config: ConfigService): EmailSender {
   switch (config.get<string>('email.sender')) {
@@ -29,6 +31,8 @@ export function createEmailSender(config: ConfigService): EmailSender {
       return new MailtrapEmailSender(config);
     case 'smtp':
       return new SmtpEmailSender(config);
+    case 'sendgrid':
+      return new SendgridEmailSender(config);
     default:
       return new ResendEmailSender(config);
   }
@@ -54,8 +58,9 @@ export function createEmailSender(config: ConfigService): EmailSender {
     // Step 34c: the email seam. Bound here and nowhere else. `ResendEmailSender` speaks Resend's
     // HTTP API and reads `notifications.resend.apiKey`; `MailtrapEmailSender` speaks SMTP and
     // reads `notifications.mailtrap.*`; `SmtpEmailSender` speaks SMTP and reads
-    // `notifications.smtp.*`. See `DEFAULT_EMAIL_FROM` for why the default from-address is
-    // Resend's shared test one.
+    // `notifications.smtp.*`; `SendgridEmailSender` speaks SMTP against a fixed endpoint and reads
+    // only `notifications.sendgrid.apiKey`. See `DEFAULT_EMAIL_FROM` for why the default
+    // from-address is Resend's shared test one.
     {
       provide: EMAIL_SENDER,
       inject: [ConfigService],

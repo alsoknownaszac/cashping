@@ -544,9 +544,10 @@ export default function configuration() {
        *
        * `'resend'` (the default) sends real mail through Resend; `'mailtrap'` hands every message
        * to a Mailtrap Email-Testing sandbox and is refused when `NODE_ENV=production` by the
-       * validation schema; `'smtp'` sends through a real SMTP relay (see `notifications.smtp`),
-       * which staging uses to reach arbitrary inboxes. Read in `createEmailSender`, the one place
-       * the senders are chosen between.
+       * validation schema; `'smtp'` sends through a real SMTP relay (see `notifications.smtp`) and
+       * `'sendgrid'` through SendGrid's own relay (see `notifications.sendgrid`), which staging
+       * uses to reach arbitrary inboxes. Read in `createEmailSender`, the one place the senders are
+       * chosen between.
        */
       sender: process.env.EMAIL_SENDER ?? 'resend',
     },
@@ -574,7 +575,7 @@ export default function configuration() {
       ttlSeconds: IDEMPOTENCY_TTL_SECONDS,
     },
 
-    /** Outbound providers: SMS via Africa's Talking and email via Resend, Mailtrap or SMTP. */
+    /** Outbound providers: SMS via Africa's Talking and email via Resend, Mailtrap, SMTP or SendGrid. */
     notifications: {
       africasTalking: {
         apiKey: process.env.AFRICASTALKING_API_KEY as string,
@@ -633,6 +634,22 @@ export default function configuration() {
         port: process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined,
         username: process.env.SMTP_USERNAME,
         password: process.env.SMTP_PASSWORD,
+      },
+      /**
+       * Outbound email via SendGrid's SMTP relay, behind `EMAIL_SENDER` (Step 34c follow-up).
+       * Selected with `EMAIL_SENDER=sendgrid`, which a staging or development environment uses to
+       * reach arbitrary external inboxes from a *single-sender-verified* address - SendGrid
+       * confirms one from-address by email link, so nothing here needs a sending domain or the
+       * SPF/DKIM records a verified Resend domain would.
+       *
+       * Only the API key is configuration. SendGrid's relay host (`smtp.sendgrid.net`), its port
+       * (587) and the literal `apikey` username are the same for every account, so
+       * `SendgridEmailSender` holds them rather than reading them from here - there is no host an
+       * operator could mistype or repoint. Left unset, the key stays `undefined` and the sender
+       * reports it missing at send time; Resend, Mailtrap and the generic SMTP relay need none of it.
+       */
+      sendgrid: {
+        apiKey: process.env.SENDGRID_API_KEY,
       },
     },
 

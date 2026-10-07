@@ -37,19 +37,22 @@ export enum StellarNetwork {
  * Providers the `EMAIL_SENDER` binding can choose between (Step 34c follow-up).
  *
  * `Resend` is the real sender a deployment uses by default; `Mailtrap` is the local
- * Email-Testing sandbox; `Smtp` is any real SMTP relay (Gmail, a corporate server) for an
- * environment that has to reach arbitrary external inboxes without a verified Resend domain.
- * The three are an enum rather than a free string so a typo (`Mailtrap`, `mailtrap `) is a
- * boot error naming `EMAIL_SENDER`, not a silent fall-through to Resend.
+ * Email-Testing sandbox; `Smtp` is any real SMTP relay (Gmail, a corporate server); and
+ * `Sendgrid` is SendGrid's own SMTP relay, whose host, port and `apikey` username are pinned
+ * inside `SendgridEmailSender` so an environment can reach arbitrary inboxes from a
+ * single-sender-verified address with no domain and no DNS. The four are an enum rather than a
+ * free string so a typo (`Mailtrap`, `mailtrap `) is a boot error naming `EMAIL_SENDER`, not a
+ * silent fall-through to Resend.
  *
- * `Mailtrap` and `Smtp` are deliberately separate values rather than one "SMTP" name: the
- * guard below refuses the *sandbox* in production while allowing a real relay, and that
- * distinction is only expressible if the sandbox keeps its own name.
+ * `Mailtrap` and the real relays (`Smtp`, `Sendgrid`) are deliberately separate values rather
+ * than one "SMTP" name: the guard below refuses the *sandbox* in production while allowing a
+ * real relay, and that distinction is only expressible if the sandbox keeps its own name.
  */
 export enum EmailProvider {
   Resend = 'resend',
   Mailtrap = 'mailtrap',
   Smtp = 'smtp',
+  Sendgrid = 'sendgrid',
 }
 
 /**
@@ -313,10 +316,11 @@ export class EnvironmentVariables {
    * Optional; `configuration()` defaults it to `resend`, so production needs no value and gets
    * the real provider. `mailtrap` routes mail to the Mailtrap Email-Testing sandbox for local
    * development - see `assertEmailSenderIsUsable` for why it is refused in production. `smtp`
-   * sends through a real SMTP relay (Gmail, a corporate server), which a staging environment
-   * uses to reach arbitrary inboxes without verifying a domain in Resend; it is a real sender,
-   * so the guard leaves it alone. Missing credentials are not checked here; the sender reports
-   * them at send time (see `MailtrapEmailSender`, `SmtpEmailSender`).
+   * sends through a real SMTP relay (Gmail, a corporate server) and `sendgrid` through
+   * SendGrid's own relay; both are senders a staging environment uses to reach arbitrary
+   * inboxes without verifying a domain in Resend, and both are real senders, so the guard
+   * leaves them alone. Missing credentials are not checked here; the sender reports them at
+   * send time (see `MailtrapEmailSender`, `SmtpEmailSender`, `SendgridEmailSender`).
    */
   @IsOptional()
   @IsEnum(EmailProvider)
@@ -366,6 +370,19 @@ export class EnvironmentVariables {
 
   @IsOptional()
   SMTP_PASSWORD?: string;
+
+  /**
+   * SendGrid's API key, read only when `EMAIL_SENDER=sendgrid` (see `SendgridEmailSender`).
+   *
+   * Optional, like the SMTP group and for the same reason: `sendgrid` is opt-in (production
+   * defaults to Resend), and refusing to boot because the key is unset would be worse than a
+   * send failing with a reason naming it. SendGrid's relay authenticates with the literal
+   * username `apikey` and this key as the password, so the key is the only secret the sender
+   * needs - the host, the port and the username are fixed facts about SendGrid and live in the
+   * sender rather than in configuration.
+   */
+  @IsOptional()
+  SENDGRID_API_KEY?: string;
 
   // --- Error reporting (Sentry) --------------------------------------------
   @IsUrl({ require_tld: false })

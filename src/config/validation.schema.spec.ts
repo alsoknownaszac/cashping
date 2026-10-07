@@ -435,6 +435,22 @@ describe('environment validation', () => {
     expect(result.NODE_ENV).toBe(NodeEnvironment.Production);
   });
 
+  it('accepts the SendGrid relay in production, because it delivers real mail', () => {
+    const result = validate({ ...VALID_ENV, NODE_ENV: 'production', EMAIL_SENDER: 'sendgrid' });
+
+    expect(result.EMAIL_SENDER).toBe(EmailProvider.Sendgrid);
+    expect(result.NODE_ENV).toBe(NodeEnvironment.Production);
+  });
+
+  it('accepts the SendGrid relay with no API key, so a boot is not refused over a missing secret', () => {
+    // The key is optional like the SMTP group: `SendgridEmailSender` reports it missing at send
+    // time rather than at boot.
+    const result = validate({ ...VALID_ENV, EMAIL_SENDER: 'sendgrid' });
+
+    expect(result.EMAIL_SENDER).toBe(EmailProvider.Sendgrid);
+    expect(result.SENDGRID_API_KEY).toBeUndefined();
+  });
+
   it('accepts Resend in production', () => {
     expect(
       validate({ ...VALID_ENV, NODE_ENV: 'production', EMAIL_SENDER: 'resend' }).EMAIL_SENDER,
