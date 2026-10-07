@@ -99,7 +99,7 @@ thing that has to happen. In the Render Dashboard: **New → Blueprint**, point 
 the file and offers the three resources — `cashping-staging-db`, `cashping-staging-kv` and the API
 `cashping-staging`, all `plan: free`, region `frankfurt`.
 
-**It will prompt for the eight `sync: false` values.** That is expected on a fresh sync — they are
+**It will prompt for the nine `sync: false` values.** That is expected on a fresh sync — they are
 the values no file can carry — and they are the only part a person supplies:
 
 | Key | What to have ready |
@@ -112,16 +112,19 @@ the values no file can carry — and they are the only part a person supplies:
 | `AWS_ACCESS_KEY_ID` | Credentials for the custody principal — exactly the three actions the code calls (`kms:GenerateDataKey`, `kms:Decrypt`, `kms:DescribeKey`), on that one key ARN and nothing broader. `README.md` → *What the KMS credentials are allowed to do* has the policy, and says why leaving `DescribeKey` out loses the boot probe rather than narrowing the policy. |
 | `AWS_SECRET_ACCESS_KEY` | The secret half of that pair. |
 | `AWS_KMS_KEY_ID` | The key's ARN, bare id, or `alias/…`. **It has to be a key in `AWS_REGION`**: KMS keys are regional, and a key from another region answers `NotFoundException`, which reads like a deleted key. |
+| `STELLAR_USDC_ISSUER` | The USDC issuer for this network. For staging that is the self-issued Testnet keypair in `docs/environment-switching.md` §6b (`GD7LC7…`), **not** Circle's Testnet issuer: the app can never mint, so on-demand test USDC needs an issuer whose secret the operator holds. It is `sync: false` so no Testnet issuer is ever committed to `render.yaml`. A trustline is on-chain, so set it **before the first registration**. |
 
-Three things are deliberately *not* on that list, and each is a decision rather than an omission:
+Two things are deliberately *not* on that list, and each is a decision rather than an omission:
 
 `JWT_SECRET` is `generateValue: true`, so Render generates it on the first sync and keeps it from
 then on. `AWS_ENDPOINT_URL` is absent and must stay absent, because `NODE_ENV=production` makes the
 validator refuse to boot when it is set — custody aimed at a non-AWS endpoint while `AWS_KMS_KEY_ID`
 still names an AWS key is a different trust boundary, and the guard firing on a misconfigured staging
-is the guard working. And `STELLAR_USDC_ISSUER` is a literal in the file (`render.yaml:372`) rather
-than one of the prompts: it is Circle's Testnet issuer, which is why (c) can fund a wallet from the
-public faucet without changing anything in the deployment.
+is the guard working.
+
+> The full staging↔production matrix — every value that differs, the USDC issuer explained in three
+> parts, and what must never be reused as-is — is `docs/environment-switching.md`. This section is the
+> setup half (getting staging running); that document is the teardown half (going to production).
 
 **Two cautions that come with the `AWS_*` values.** The principal should hold exactly the three
 actions the custody code calls, and no key administration — the policy is in `README.md` → *What the
@@ -141,9 +144,11 @@ provisioned Testnet account is funded with XLM by the friendbot and given a USDC
 not a broken one. A payment of a positive amount from an empty wallet is a **409**, which is correct
 behaviour and not a deployment finding.
 
-Circle's own faucet dispenses exactly the asset this deployment is already configured for, so the
-baseline needs no change to `render.yaml` at all. It is the one step in this section that a person
-must do in a browser, because it sits behind reCAPTCHA:
+Circle's own faucet dispenses exactly the asset a deployment *still pointed at Circle's Testnet
+issuer* — `.env.example`'s default — expects, so for such a deployment the baseline needs no config
+change at all. Staging now points at the self-issued issuer of §6b, so the faucet does **not** serve
+it; staging mints its own. It is the one step in this section that a person must do in a browser,
+because the faucet sits behind reCAPTCHA:
 
 1. Read the sender's address off the API — `GET $BASE/v1/wallet/account` → `publicKey` (a `G…`).
 2. Open <https://faucet.circle.com/>, leave the asset on **USDC**, and choose **Stellar Testnet** from
@@ -152,8 +157,9 @@ must do in a browser, because it sits behind reCAPTCHA:
 3. Confirm it arrived with a **fresh** `GET $BASE/v1/wallet/balance`. The balance is read from Horizon
    on every call rather than cached, so a number that has changed cannot be a stale one.
 
-That sends from `GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`, the issuer already
-committed at `render.yaml:372`. Two things to watch, both of which look like other failures:
+That sends from `GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5`, Circle's Testnet
+issuer — the asset a deployment that has *not* switched to a self-issued one (§6b) is configured
+for. Two things to watch, both of which look like other failures:
 
 - **Fund after provisioning, never before.** The faucet pays USDC *to* the address, and a Stellar
   payment to an account that has not trusted the issuer fails on the *sender's* transaction
@@ -171,7 +177,11 @@ to the sender with a payment *from* the issuer. It runs the same code path — t
 constant and only the issuer is configuration (`usdc-trustline.ts`) — with two costs worth naming: it
 stops proving that the real Circle asset is what lands, and the issuer has to be changed **before the
 first registration**, because a trustline is on-chain and a wallet provisioned against the old issuer
-has a line the new configuration will not match (reconciliation compares that identity back).
+has a line the new configuration will not match (reconciliation compares that identity back). A keypair
+for exactly this has since been created for staging —
+`GD7LC7NGLRLX23Z6PWGVSYD6WYLHH27AMLEKQUMELCZG3I2KIIQVYKHL` (its secret is outside the repo); see
+`docs/environment-switching.md` §6 for that issuer, and §6c for why the *mainnet* issuer is a value
+that does not exist in this repository yet and must be looked up on the day, never copied from here.
 
 **Record which of the two you used.** "The payment failed on balance" and "the payment failed" are
 easy to confuse in a report.
