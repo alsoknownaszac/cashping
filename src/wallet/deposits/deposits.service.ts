@@ -48,6 +48,20 @@ const HORIZON_UNAVAILABLE =
  * are dropped: they are not deposits the product can act on, and reporting them would make a
  * client decide, row by row, whether the money is the money.
  *
+ * ## A payment this app moved is not also a deposit
+ *
+ * A Cashping-to-Cashping transfer *is* a real Stellar payment, so Horizon reports it arriving at
+ * the recipient's account - and the recipient already has it on `GET /v1/payments` as a received
+ * payment, named by the sender's handle and dated from the same ledger. Left alone, the app would
+ * count that money twice on two screens a client reads side by side. So a deposit whose
+ * transaction hash this app recorded creating for the caller is suppressed here: what is left is
+ * money that arrived from *outside*, which is exactly the money this endpoint has no counterparty
+ * to name and `GET /v1/payments` cannot show.
+ *
+ * The hash is the join, and it is exact. `transactions.stellar_tx_hash` is written before the
+ * signed transaction is handed to Horizon and is unique, so it identifies one transaction the app
+ * built - a transfer the app did not create has no row to match and is never suppressed.
+ *
  * ## The three states, and why none is an error
  *
  * - **No row** -> `404`. The same "no wallet yet" answer `BalancesService` gives; the client is
@@ -85,9 +99,15 @@ export class DepositsService {
 
     const page = await this.read(account.publicKey, query);
 
+    const deposits = page.payments.filter((payment) => isAsset(payment, asset));
+    const recorded = await this.recordedHashes(userId, deposits);
+
     return {
       asset,
-      items: page.payments.filter((payment) => isAsset(payment, asset)).map(toItem),
+      items: deposits.filter((payment) => !recorded.has(payment.transactionHash)).map(toItem),
+      // Horizon's own cursor, taken *before* the suppression above: paging follows the ledger page,
+      // not the visible rows, so a suppressed deposit is neither fetched again on the next call nor
+      // able to shift a newer one out of view.
       nextCursor: page.nextCursor,
     };
   }
@@ -133,6 +153,43 @@ export class DepositsService {
 
       throw cause;
     }
+  }
+
+  /**
+   * The hashes on this page that this app is the one that moved the money for.
+   *
+   * The set of `transactions.stellar_tx_hash` values among `deposits`' hashes that belong to a
+   * payment this app recorded *for the caller*. Those are the incoming payments that are already
+   * on `GET /v1/payments` for the same user, so they are the ones this endpoint suppresses: an
+   * internal transfer is a received payment, and the history endpoint is where a received payment
+   * is reported.
+   *
+   * Scoping the query to the caller is what makes that an argument rather than a coincidence: a
+   * row is only suppressed because the caller is one of its two parties, which is the reason the
+   * caller can already see it elsewhere. Only the hashes that survived the asset filter are asked
+   * about, because a native or foreign-asset payment is being dropped anyway and is not worth a
+   * row, and the `in` list is bounded by the page size - at most one page's worth of hashes, on the
+   * unique index, per request.
+   */
+  private async recordedHashes(
+    userId: string,
+    deposits: readonly IncomingStellarPayment[],
+  ): Promise<ReadonlySet<string>> {
+    if (deposits.length === 0) {
+      return new Set();
+    }
+
+    const rows = await this.prisma.transaction.findMany({
+      where: {
+        stellarTxHash: { in: deposits.map((payment) => payment.transactionHash) },
+        OR: [{ senderId: userId }, { recipientId: userId }],
+      },
+      select: { stellarTxHash: true },
+    });
+
+    // The column is nullable in the schema, so the guard is for the type rather than for a case
+    // that can reach here: a row selected by `stellarTxHash: { in: [...] }` always has one.
+    return new Set(rows.flatMap((row) => (row.stellarTxHash === null ? [] : [row.stellarTxHash])));
   }
 }
 
