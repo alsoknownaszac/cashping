@@ -1,8 +1,14 @@
-import { BadRequestException, NotFoundException, type ArgumentsHost } from '@nestjs/common';
-import { InternalServerErrorException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+  type ArgumentsHost,
+} from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import * as Sentry from '@sentry/nestjs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AllExceptionsFilter, type ErrorResponseBody } from './all-exceptions.filter.js';
 
 vi.mock('@sentry/nestjs', () => ({
@@ -47,6 +53,10 @@ function captured(reply: ReturnType<typeof vi.fn>): {
 describe('AllExceptionsFilter', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('passes an HttpException message through with its status code', () => {
@@ -123,4 +133,203 @@ describe('AllExceptionsFilter', () => {
 
     expect(Sentry.captureException).not.toHaveBeenCalled();
   });
+
+  // The class of bug this filter used to have: a client-side error from Express's
+  // body parser is not an `HttpException`, so it was floored to a 500. Each error
+  // below is built the way `http-errors` builds it - the shape was captured from a
+  // real request, not guessed.
+
+  it('answers an over-limit body with 413 and the ceiling it broke', () => {
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new Error('request entity too large'), {
+      status: 413,
+      statusCode: 413,
+      type: 'entity.too.large',
+      limit: 102400,
+      length: 200009,
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(413);
+    expect(body.statusCode).toBe(413);
+    expect(body.error).toBe('Payload Too Large');
+    expect(body.message).toContain('too large');
+    expect(body.message).toContain('limit 102400');
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it('answers a bad charset with 415 and names the charset', () => {
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new Error('unsupported charset "KLINGON"'), {
+      status: 415,
+      statusCode: 415,
+      type: 'charset.unsupported',
+      charset: 'klingon',
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(415);
+    expect(body.error).toBe('Unsupported Media Type');
+    expect(body.message).toContain('klingon');
+  });
+
+  it('answers an unsupported content encoding with 415 and names the encoding', () => {
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new Error('unsupported content encoding "snappy"'), {
+      status: 415,
+      statusCode: 415,
+      type: 'encoding.unsupported',
+      encoding: 'snappy',
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(415);
+    expect(body.message).toContain('snappy');
+  });
+
+  it('answers a broken JSON body with 400', () => {
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new SyntaxError('Unexpected token'), {
+      status: 400,
+      statusCode: 400,
+      type: 'entity.parse.failed',
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(400);
+    expect(body.message).toBe('Request body is not valid JSON');
+  });
+
+  it('answers an aborted request with 400', () => {
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new Error('request aborted'), {
+      status: 400,
+      statusCode: 400,
+      type: 'request.aborted',
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(400);
+    expect(body.message).toContain('closed the connection');
+  });
+
+  it('answers a Content-Length mismatch with 400', () => {
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new Error('request size did not match content length'), {
+      status: 400,
+      statusCode: 400,
+      type: 'request.size.invalid',
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(400);
+    expect(body.message).toContain('Content-Length');
+  });
+
+  it('uses the error message for a 4xx that marked itself safe to show', () => {
+    // The bad-gzip case: a decompress failure is wrapped by http-errors as a 400
+    // with `expose: true` and no `type`, so its own message is all we have.
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new Error('incorrect header check'), {
+      status: 400,
+      expose: true,
+    });
+
+    filter.catch(error, host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(400);
+    expect(body.error).toBe('Bad Request');
+    expect(body.message).toBe('incorrect header check');
+  });
+
+  it('returns any other 4xx status instead of flooring it to 500', () => {
+    const { filter, host, reply } = createFixture();
+
+    filter.catch(Object.assign(new Error('teapot'), { status: 418 }), host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(418);
+    expect(body.statusCode).toBe(418);
+    expect(body.error).toBe("I'm a Teapot");
+  });
+
+  it('never leaks a client error message it was not told to expose', () => {
+    const { filter, host, reply } = createFixture();
+    const error = Object.assign(new Error('internal db name'), { status: 400, expose: false });
+
+    filter.catch(error, host);
+
+    const { body } = captured(reply);
+
+    expect(JSON.stringify(body)).not.toContain('internal db name');
+  });
+
+  it('keeps a 403 behaving exactly as before', () => {
+    const { filter, host, reply } = createFixture();
+
+    filter.catch(new ForbiddenException('not allowed'), host);
+
+    const { body, statusCode } = captured(reply);
+
+    expect(statusCode).toBe(403);
+    expect(body.error).toBe('Forbidden');
+    expect(body.message).toBe('not allowed');
+  });
+
+  it('logs a 4xx at warn (short, naming the type) and never at error', () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const errorLog = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const { filter, host } = createFixture();
+
+    filter.catch(
+      Object.assign(new Error('request entity too large'), {
+        status: 413,
+        type: 'entity.too.large',
+      }),
+      host,
+    );
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('413');
+    expect(warn.mock.calls[0][0]).toContain('entity.too.large');
+    expect(errorLog).not.toHaveBeenCalled();
+  });
+
+  it('logs a 5xx at error and reports it', () => {
+    const errorLog = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const { filter, host } = createFixture();
+
+    filter.catch(new Error('boom'), host);
+
+    expect(errorLog).toHaveBeenCalledTimes(1);
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
+  });
+
 });
