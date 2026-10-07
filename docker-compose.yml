@@ -24,6 +24,43 @@ services:
       # off unless a value is supplied explicitly. Set ENABLE_SWAGGER=true in
       # ./.env when the docs are wanted in the stack.
       ENABLE_SWAGGER: ${ENABLE_SWAGGER:-false}
+      # Step 34c. `RESEND_API_KEY` is required by the Step 4 env schema and has no
+      # default in the code, so this line is why the container can boot at all: with
+      # it absent `validate` refuses to start with "RESEND_API_KEY should not be
+      # empty" - the same treatment `AFRICASTALKING_API_KEY` gets further down. It is
+      # a placeholder rather than an empty fallback because an *empty* value is
+      # refused too; `compose` picks the real one up from ./.env when there is one.
+      RESEND_API_KEY: ${RESEND_API_KEY:-local-compose-placeholder-key}
+      # Which `EmailSender` the stack binds and the address mail goes out from. Both
+      # are optional in the schema and both have defaults in the code, so the
+      # fallbacks are exactly those defaults; forwarding them is what lets ./.env
+      # choose the provider for the container the way it does on the host (`smtp`
+      # for Gmail or `sendgrid`, say, which is what makes `docker compose up` able
+      # to deliver a real OTP). `mailtrap` is still refused here on purpose: this
+      # service runs NODE_ENV=production, which is the whole point of that guard.
+      #
+      # The two fallbacks are a matched pair - Resend's shared test address is the
+      # only from-address that works with the default `resend` sender - so a stack
+      # that switches to SendGrid sets both: EMAIL_SENDER=sendgrid and EMAIL_FROM to
+      # the address verified under SendGrid's Single Sender Verification (SendGrid's
+      # host, port and `apikey` username are fixed in the code, so the API key below
+      # is the only other thing it needs).
+      EMAIL_SENDER: ${EMAIL_SENDER:-resend}
+      EMAIL_FROM: ${EMAIL_FROM:-Cashping <onboarding@resend.dev>}
+      # The relay credentials, read only when the matching sender is selected. An
+      # empty fallback is right for the string settings - the senders read an empty
+      # value as "not configured" and name what is missing at send time rather than
+      # failing the boot - but `SMTP_PORT` is coerced to a number before validation
+      # and the schema refuses the `0` an empty string becomes, so it keeps a real
+      # port. Mailtrap's host and port are absent on purpose: unlike SMTP's, those
+      # two have defaults in the code.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAILTRAP_USERNAME: ${MAILTRAP_USERNAME:-}
+      MAILTRAP_PASSWORD: ${MAILTRAP_PASSWORD:-}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
       # Everything below is required by the Step 4 env schema. Values fall back
       # to placeholders so `docker compose up` works on a fresh clone with no
       # .env; Compose picks the real values up from ./.env when it exists.

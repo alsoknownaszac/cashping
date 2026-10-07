@@ -333,24 +333,39 @@ services:
         sync: false
 
       # --- Email provider (staging) ------------------------------------------
-      # Staging sends verification and receipt email through a real SMTP relay (Gmail
-      # over an app password) instead of Resend's shared test address, so a code
-      # reaches an arbitrary external inbox without a domain verified in Resend.
-      # `smtp` is a real sender, so - unlike `mailtrap` - the boot-time guard allows it
-      # with `NODE_ENV=production` above. Production leaves `EMAIL_SENDER` unset and
-      # therefore keeps Resend; this value lives only in staging.
+      # Staging sends verification and receipt email through Brevo's SMTP relay
+      # instead of Resend, so a code reaches an arbitrary external inbox from a
+      # *single-sender-verified* address: Brevo confirms one from-address by an
+      # email link, so nothing here needs a sending domain or the SPF/DKIM records a
+      # verified Resend domain would. `smtp` is a real sender, so - unlike `mailtrap` -
+      # the boot-time guard allows it with `NODE_ENV=production` above. The *default*
+      # (an unset `EMAIL_SENDER`) is `resend`, so a production deploy keeps Resend and
+      # only this file opts a staging environment into the relay; nothing reaches Brevo
+      # by accident.
       #
-      # Unlike `mailtrap`, none of the SMTP settings has a default: there is no "the"
-      # SMTP server, so an incomplete group fails the send with a reason naming what is
-      # missing rather than connecting somewhere nobody chose. Host and port are not
-      # secrets; the account and its app password are, so they are prompted for on the
-      # first sync.
+      # Port 2525, deliberately: it is a non-standard SMTP port that hosting platforms
+      # do not block the way they sometimes block 25/465/587, so the relay is reachable
+      # from Render whatever the network policy. `SmtpEmailSender` upgrades 2525 with
+      # STARTTLS - only 465 is implicit TLS. Host and port are the same for every Brevo
+      # account, so they are plain values here; the username (the Brevo login email) and
+      # the password (the generated *SMTP key*, not the API key) are secrets and are
+      # prompted for. `EMAIL_FROM` must be the exact address verified as a sender in
+      # Brevo, or the relay refuses every message - so it is prompted for rather than
+      # guessed.
+      #
+      # One Brevo setting matters and is *not* in this file: Security -> Authorized IPs.
+      # With "Block unknown IP addresses" on, the relay answers `525 5.7.1 Unauthorized
+      # IP address` for every login - the key and sender are fine, the source is not.
+      # Render's outbound IPs are dynamic, so whitelisting them is not durable; leave the
+      # block off (or on "Automatic authorization") and any egress IP is accepted.
       - key: EMAIL_SENDER
         value: smtp
+      - key: EMAIL_FROM
+        sync: false
       - key: SMTP_HOST
-        value: smtp.gmail.com
+        value: smtp-relay.brevo.com
       - key: SMTP_PORT
-        value: '465'
+        value: "2525"
       - key: SMTP_USERNAME
         sync: false
       - key: SMTP_PASSWORD
