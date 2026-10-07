@@ -879,6 +879,17 @@ describe('Registration, verification and sessions (e2e)', () => {
       phoneNumber: e164,
       status: UserStatus.ACTIVE,
       handle: null,
+      // The onboarding block, read fresh: the number was proved at verify (so `phoneVerified`)
+      // and the registration carried a PIN, while nothing has attached an email and the
+      // provisioning here is the recording stub - it writes no `stellar_accounts` row, so
+      // `hasWallet` is honestly `false`.
+      onboarding: {
+        hasWallet: false,
+        hasPin: true,
+        hasEmail: false,
+        emailVerified: false,
+        phoneVerified: true,
+      },
     });
   });
 

@@ -782,19 +782,43 @@ export class AuthService {
   }
 
   /**
-   * Reports who the caller is (Step 16).
+   * Reports who the caller is, and how far through onboarding they have got (Step 16; the
+   * onboarding block was added when the frontend needed it to choose its next screen).
    *
-   * The row `JwtStrategy` has just read, mapped to the wire. It takes the user rather
-   * than an id because the read has already happened by the time a handler runs: asking
-   * the database again here would be a second answer to a question that was just
-   * answered, and the two could disagree under a concurrent update.
+   * The four identity fields come from the row `JwtStrategy` has just read - no second read for
+   * those. The onboarding block is a *different* set of facts the guard deliberately does not
+   * carry: that read is on the hot path of every authenticated request and stays narrow (id,
+   * number, status, handle), while this endpoint is called once on launch and is the only place
+   * that needs a wallet's existence, a PIN's presence and the two verification instants. Reading
+   * them here, in one primary-key lookup, is cheaper than making every request pay for a join
+   * nine times in ten will not use.
    */
-  session(user: SessionUser): SessionResponseDto {
+  async session(user: SessionUser): Promise<SessionResponseDto> {
+    const onboarding = await this.prisma.user.findUnique({
+      where: { id: user.id },
+      select: {
+        transactionPinHash: true,
+        email: true,
+        emailVerifiedAt: true,
+        phoneVerifiedAt: true,
+        stellarAccount: { select: { id: true } },
+      },
+    });
+
     return {
       userId: user.id,
       phoneNumber: user.phoneNumber,
       status: user.status,
       handle: user.handle,
+      // Every flag is `false` if the row is gone between the guard's read and this one: a session
+      // whose account has just been deleted is not a session to invent onboarding facts for.
+      onboarding: {
+        hasWallet: onboarding?.stellarAccount != null,
+        hasPin: onboarding?.transactionPinHash != null,
+        hasEmail: onboarding?.email != null,
+        emailVerified: onboarding?.emailVerifiedAt != null,
+        phoneVerified: onboarding?.phoneVerifiedAt != null,
+      },
     };
   }
 

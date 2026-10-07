@@ -357,9 +357,9 @@ export class AuthController {
     { status: 403, description: 'The account is suspended.' },
     { status: 500, description: 'Unexpected failure, in the shared error shape.' },
   ])
-  session(@CurrentUser() user: SessionUser): SessionResponseDto {
-    // Synchronous, unlike every other handler here: `JwtStrategy` has already read
-    // the row, so there is nothing left to await.
+  async session(@CurrentUser() user: SessionUser): Promise<SessionResponseDto> {
+    // Unlike the other reads here, this one goes back to the database: the onboarding block
+    // needs facts `JwtStrategy` deliberately does not read. See `AuthService.session`.
     return this.authService.session(user);
   }
 

@@ -2,6 +2,56 @@ import { ApiProperty } from '@nestjs/swagger';
 import { UserStatus } from '../../generated/prisma/enums.js';
 
 /**
+ * How far past sign-in a user has got, so the client can pick the next screen.
+ *
+ * A session and a set-up account are two different things, and the launch flow has to tell them
+ * apart: an account can be `ACTIVE` - its phone number proved - and still have no wallet, no
+ * transaction PIN and no email. Each field is one onboarding step the app can send the user to,
+ * and all five are read fresh; none is in the access token, which carries only the user id.
+ *
+ * `hasEmail` and `emailVerified` are deliberately two fields rather than one: an address is
+ * *attached* by `POST /auth/email` and only becomes a credential once a code proves it, so a
+ * screen offering "add an email" has to behave differently from one offering "confirm it".
+ *
+ * Declared before `SessionResponseDto`, which names it as a property type.
+ */
+export class SessionOnboardingDto {
+  @ApiProperty({
+    description:
+      'Whether the account has a Stellar wallet. `false` after a provisioning that did not finish, which the client can retry.',
+    example: true,
+  })
+  hasWallet!: boolean;
+
+  @ApiProperty({
+    description:
+      'Whether a transaction PIN is set. `false` for an account that has never set one, including a Google-SSO account (Step 34d) before it chooses one.',
+    example: true,
+  })
+  hasPin!: boolean;
+
+  @ApiProperty({
+    description: 'Whether an email address is attached, whether or not a code has proved it.',
+    example: true,
+  })
+  hasEmail!: boolean;
+
+  @ApiProperty({
+    description:
+      'Whether the attached email has been proved by a code. Always `false` when `hasEmail` is `false`.',
+    example: true,
+  })
+  emailVerified!: boolean;
+
+  @ApiProperty({
+    description:
+      'Whether the phone number behind the account was proved. `true` for every session this endpoint answers for.',
+    example: true,
+  })
+  phoneVerified!: boolean;
+}
+
+/**
  * 200 body of `GET /v1/auth/session` (Step 16): who this access token belongs to.
  *
  * The endpoint a client calls on every launch with the access token it has stored.
@@ -42,4 +92,11 @@ export class SessionResponseDto {
     type: String,
   })
   handle!: string | null;
+
+  @ApiProperty({
+    description: 'How far the account is through onboarding - what the client shows next.',
+    type: SessionOnboardingDto,
+  })
+  onboarding!: SessionOnboardingDto;
 }
+

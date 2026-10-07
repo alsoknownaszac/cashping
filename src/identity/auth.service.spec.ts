@@ -74,6 +74,12 @@ interface FakeUser {
    */
   email: string | null;
   emailVerifiedAt: Date | null;
+  /**
+   * The wallet row a completed provisioning writes (Step 19). `null` is what the session endpoint
+   * reads as `hasWallet: false`; this fake never provisions one, so a test that wants a wallet
+   * seeds it here.
+   */
+  stellarAccount: { id: string } | null;
 }
 
 /** The two tables `AuthService` touches, plus a log of the calls it made. */
@@ -137,9 +143,14 @@ class FakePrisma {
      * that column rather than scanning an `OR` across both (Step 34c).
      */
     findUnique: async (args: {
-      where: { phoneNumber?: string; email?: string };
+      where: { id?: string; phoneNumber?: string; email?: string };
     }): Promise<FakeUser | null> => {
       this.calls.push('findUnique');
+
+      // `session` reads by id, the two sign-in paths by their identifier (Step 34c).
+      if (args.where.id !== undefined) {
+        return [...this.users.values()].find((user) => user.id === args.where.id) ?? null;
+      }
 
       if (args.where.email !== undefined) {
         const email = args.where.email;
@@ -169,6 +180,8 @@ class FakePrisma {
         // Registration writes no address (Step 34c): an address arrives later, at `POST /auth/email`.
         email: null,
         emailVerifiedAt: null,
+        // Registration does not provision the wallet (Step 19 does, on verification).
+        stellarAccount: null,
       };
 
       this.users.set(user.phoneNumber, user);
@@ -594,6 +607,8 @@ function seedUser(prisma: FakePrisma, overrides: Partial<FakeUser> = {}): FakeUs
     // credential once `emailVerifiedAt` is set.
     email: null,
     emailVerifiedAt: null,
+    // Step 19: no wallet until a provisioning writes one - the honest default for a seeded row.
+    stellarAccount: null,
     ...overrides,
   };
 
@@ -1395,37 +1410,82 @@ describe('AuthService.logout', () => {
 });
 
 describe('AuthService.session', () => {
-  it('maps the row the guard read, without querying anything', () => {
-    const { auth, prisma } = createHarness();
+  /** The signed-in caller the endpoint receives, as `JwtStrategy` would have left it. */
+  const caller: SessionUser = {
+    id: 'user-9',
+    phoneNumber: E164_NUMBER,
+    status: UserStatus.ACTIVE,
+    handle: 'miriam_owusu',
+  };
 
-    const response = auth.session({
+  it('maps the guard row, and reports every onboarding step as done', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, {
       id: 'user-9',
-      phoneNumber: E164_NUMBER,
       status: UserStatus.ACTIVE,
       handle: 'miriam_owusu',
+      phoneVerifiedAt: new Date('2026-09-26T09:00:00.000Z'),
+      transactionPinHash: 'scrypt$seeded',
+      email: 'miriam@example.com',
+      emailVerifiedAt: new Date('2026-09-27T09:00:00.000Z'),
+      stellarAccount: { id: 'account-1' },
     });
 
+    const response = await auth.session(caller);
+
+    // The identity half is the guard's row; the onboarding half is one targeted read, because
+    // the wallet's existence and the PIN/email/phone facts are not on that row.
     expect(response).toEqual({
       userId: 'user-9',
       phoneNumber: E164_NUMBER,
       status: UserStatus.ACTIVE,
       handle: 'miriam_owusu',
+      onboarding: {
+        hasWallet: true,
+        hasPin: true,
+        hasEmail: true,
+        emailVerified: true,
+        phoneVerified: true,
+      },
     });
-    // The read already happened in `JwtStrategy`: asking again here would be a second
-    // answer to a question that was just answered, and the two could disagree under a
-    // concurrent update.
-    expect(prisma.calls).toEqual([]);
+    expect(prisma.calls).toEqual(['findUnique']);
   });
 
-  it('reports a null handle rather than omitting it, so the client can render a blank name', () => {
-    const { auth } = createHarness();
+  it('reports every onboarding step as not-done on a freshly verified row', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, { id: 'user-9', status: UserStatus.ACTIVE, phoneVerifiedAt: new Date() });
 
-    const response = auth.session({
-      id: 'user-9',
-      phoneNumber: E164_NUMBER,
-      status: UserStatus.ACTIVE,
-      handle: null,
+    const response = await auth.session(caller);
+
+    expect(response.onboarding).toEqual({
+      hasWallet: false,
+      hasPin: false,
+      hasEmail: false,
+      emailVerified: false,
+      phoneVerified: true,
     });
+  });
+
+  it('tells an attached email from a verified one, the way the columns do', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, {
+      id: 'user-9',
+      status: UserStatus.ACTIVE,
+      email: 'miriam@example.com',
+      emailVerifiedAt: null,
+    });
+
+    const response = await auth.session(caller);
+
+    expect(response.onboarding.hasEmail).toBe(true);
+    expect(response.onboarding.emailVerified).toBe(false);
+  });
+
+  it('reports a null handle rather than omitting it, so the client can render a blank name', async () => {
+    const { auth, prisma } = createHarness();
+    seedUser(prisma, { id: 'user-9', status: UserStatus.ACTIVE, handle: null });
+
+    const response = await auth.session({ ...caller, handle: null });
 
     expect(response).toHaveProperty('handle', null);
   });
