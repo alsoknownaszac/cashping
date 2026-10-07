@@ -8,8 +8,10 @@ import { StepUpModule } from '../identity/pin/step-up.module.js';
 import { WalletModule } from '../wallet/wallet.module.js';
 import { PaymentsController } from './controllers/payments.controller.js';
 import { RecipientsController } from './controllers/recipients.controller.js';
+import { HandlesController } from './controllers/handles.controller.js';
 import { PaymentsQueueModule } from './jobs/payments-queue.module.js';
 import { PaymentsService } from './services/payments.service.js';
+import { HandlesService } from './services/handles.service.js';
 import { RecipientLookupRateLimiter } from './services/recipient-lookup-rate-limiter.service.js';
 import { RecipientsService } from './services/recipients.service.js';
 
@@ -81,12 +83,20 @@ import { RecipientsService } from './services/recipients.service.js';
  * module has learned what a PIN is, and `PaymentsService` least of all: it never sees a token, a
  * header or a credential, because `StepUpAuthGuard` is the only thing that knows, and it refuses
  * the request before the service is reached.
+ *
+ * The handle availability check (`HandlesController`, `HandlesService`) is the directory's third
+ * reader. It answers a question a payment form asks - "is this name free for someone to be paid
+ * at" - from the same `PrismaModule` users table and the same `RecipientLookupRateLimiter`
+ * allowance the two recipient routes spend, and it takes its rules from `handle.ts` as a file, the
+ * same edge this module already has into identity. It moves no money, which is why it sits here
+ * with the other reads rather than needing anything this module does not already import.
  */
 @Module({
   imports: [AuditModule, PrismaModule, RedisModule, WalletModule, PaymentsQueueModule, StepUpModule],
-  controllers: [RecipientsController, PaymentsController],
+  controllers: [RecipientsController, HandlesController, PaymentsController],
   providers: [
     RecipientsService,
+    HandlesService,
     RecipientLookupRateLimiter,
     PaymentsService,
     IdempotencyInterceptor,

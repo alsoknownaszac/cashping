@@ -67,12 +67,8 @@ import {
   type EmailVerifyRefusal,
 } from './email/email.service.js';
 import { PasswordService, type PasswordChangeRefusal } from './password/password.service.js';
-import {
-  HANDLE_MAX_LENGTH,
-  HANDLE_MIN_LENGTH,
-  InvalidHandleError,
-  assertHandleAllowed,
-} from './handle/handle.js';
+import { InvalidHandleError, assertHandleAllowed } from './handle/handle.js';
+import { handleRejectionMessage } from './handle/handle-rejection.js';
 import {
   OtpRateLimitExceededError,
   OtpRateLimitUnavailableError,
@@ -492,33 +488,18 @@ export class AuthService {
    * a taken handle can be freed, a reserved one never will be, so waiting and
    * retrying is not a thing the caller can do - it is the same class of answer as a
    * bad character, not a conflict to resolve.
+   *
+   * The sentences themselves come from `handleRejectionMessage`, shared with the
+   * availability check, because both refuse a handle for the same reasons and a
+   * broken rule has to read the same on both screens. What stays here is the one
+   * thing this caller decides: that every reason is a 400.
    */
   private toHandleRejection(error: unknown, input: string): Error {
     if (!(error instanceof InvalidHandleError)) {
       return error instanceof Error ? error : new Error(String(error));
     }
 
-    switch (error.problem) {
-      case 'too_short':
-        return new BadRequestException(
-          `A handle needs at least ${HANDLE_MIN_LENGTH} characters. "${input}" has ${error.handle.length}.`,
-        );
-
-      case 'too_long':
-        return new BadRequestException(
-          `A handle can be at most ${HANDLE_MAX_LENGTH} characters. "${input}" has ${error.handle.length}.`,
-        );
-
-      case 'characters':
-        return new BadRequestException(
-          'A handle can only contain letters, digits and underscores, like "miriam_owusu".',
-        );
-
-      case 'reserved':
-        return new BadRequestException(
-          `"@${error.handle}" is reserved by Cashping. Please choose another handle.`,
-        );
-    }
+    return new BadRequestException(handleRejectionMessage(error.problem, input, error.handle));
   }
 
   /**
