@@ -402,18 +402,33 @@ services:
         sync: false
 
       # --- Stellar -----------------------------------------------------------
-      # Three literal values, because none of them is a secret and all three have
-      # to agree: the network, the Horizon endpoint that serves it, and the USDC
-      # issuer that exists on it. The issuer is a *key* rather than a code -
-      # `USDC:GBBD...` and `USDC:GDHU...` are two different assets that happen to
-      # share a code - so the one below is Circle's Testnet issuer, the value
-      # `.env.example` ships. A PUBLIC deployment sets the mainnet issuer here
-      # and funds new accounts from a treasury instead of a faucet, which is why
+      # The network and its Horizon endpoint are literal values, because neither
+      # is a secret and the two have to agree. The USDC *issuer* is deliberately
+      # NOT set here: it is a `sync: false` value entered in the Render
+      # dashboard (see docs/environment-switching.md §6). The issuer is a *key*
+      # rather than a code - `USDC:GBBD...` and `USDC:GDHU...` are two different
+      # assets that happen to share a code - so it is the one Stellar value a
+      # deployment can get quietly wrong, and keeping it out of this file is what
+      # stops a Testnet issuer being carried into production by accident.
+      #
+      # Staging's issuer (docs/environment-switching.md §6b) is a throwaway
+      # Testnet keypair created so staging can mint test USDC on demand: the app
+      # itself can never mint, because no issuer secret lives in the backend. Its
+      # secret is held outside this repository, and its public key is entered in
+      # the dashboard rather than committed here.
+      #
+      # A production deploy sets Circle's *mainnet* issuer in the dashboard as
+      # well - looked up from Circle's official docs on the day and never copied
+      # from a Testnet value (§6c). And because a trustline is on-chain, the
+      # issuer has to be set BEFORE any account is registered, or the wallet
+      # keeps a line the new configuration will not match.
+      #
       # `STELLAR_FRIENDBOT_URL` is left at its default: on Testnet the default is
-      # Stellar's own faucet and there is nothing to configure.
+      # Stellar's own faucet. A production deployment funds new accounts from a
+      # treasury instead and must NOT leave a faucet here (§7).
       - key: STELLAR_NETWORK
         value: TESTNET
       - key: STELLAR_HORIZON_URL
         value: https://horizon-testnet.stellar.org
       - key: STELLAR_USDC_ISSUER
-        value: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
+        sync: false
